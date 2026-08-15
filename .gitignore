@@ -1,0 +1,14 @@
+node_modules
+dist
+.vercel
+playwright-report
+test-results
+.DS_Store
+*.log
+
+# Local App.jsx backups
+src/App.backup*
+src/App_backup*
+src/App.before*
+src/App.vite-backup*
+src/App.wrong-*

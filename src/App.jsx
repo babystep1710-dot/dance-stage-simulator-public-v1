@@ -4450,6 +4450,9 @@ function buildFormationExportModel({
   trajectoryMode,
   performerDisplayScale,
   showMusicTime, // Export音楽位置・音源内時間 v1：Export Centerの「音源内時間を表示」チェックボックスの値
+  stageAppearance, // Export舞台色反映 v1：Projectごとの舞台外観（floorColor/backdropColor）。
+  // performerDisplayScaleと同じ考え方で、Project全体の値をExport Modelにもそのまま含める
+  // （getStageAppearance()側で既にfallback済みの値がここへ渡ってくる想定）。
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
@@ -4500,6 +4503,9 @@ function buildFormationExportModel({
       : [],
     placements: slide.placements || {},
     transitionPaths,
+    // Export舞台色反映 v1：未指定（呼び出し元が省略した場合）でも安全に黒へフォールバックする
+    // （既存getStageAppearance()と同じdefault値。ここで新しい判定ロジックは作らない）。
+    stageAppearance: stageAppearance || DEFAULT_STAGE_APPEARANCE,
   };
 }
 
@@ -4527,6 +4533,7 @@ function buildFormationExportModels({
   trajectoryMode,
   performerDisplayScale,
   showMusicTime, // Export音楽位置・音源内時間 v1：buildFormationExportModelへそのまま伝播するだけ
+  stageAppearance, // Export舞台色反映 v1：buildFormationExportModelへそのまま伝播するだけ
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -4550,6 +4557,7 @@ function buildFormationExportModels({
         trajectoryMode,
         performerDisplayScale,
         showMusicTime,
+        stageAppearance,
       })
     )
     .filter((m) => m !== null);
@@ -4788,6 +4796,15 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   const showWaitingAreas = !!(options && options.showWaitingAreas);
   const { x: stageAreaX, y: stageAreaY, w: stageAreaW, h: stageAreaH } = stageAreaRect;
 
+  // Export舞台色反映 v1・E章：平面図Exportは編集画面のTopViewと同じ考え方で、floorColorだけを
+  // 舞台床へ反映する（backdropColorは編集画面のTopView自体が使っていないため、Exportにも
+  // 追加しない＝編集画面とExportの見た目を揃える方針）。明色床でもグリッド・目盛り・
+  // センターラインが読めるよう、TopViewと全く同じgetStageFloorContrastColors()を再利用する
+  // （新しい明度判定ロジックは作らない）。
+  const exportFloorColorKey = (model.stageAppearance && model.stageAppearance.floorColor) || "black";
+  const exportFloorFill = stageAppearanceColorHex(exportFloorColorKey);
+  const exportFloorContrast = getStageFloorContrastColors(exportFloorColorKey);
+
   // 6・7・9章：出演者の配置によらず、常にステージ本体全体が収まる一定の画角にする。
   // PART I（原因報告・詳細は完了レポート参照）：showWaitingAreasがtrueの時だけzonesを
   // bounds計算へ含めることで、待機エリア（袖・舞台奥）が実際にCanvasの描画/クリップ範囲の
@@ -4843,15 +4860,15 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   }
 
   // 描画順3：舞台本体
-  ctx.fillStyle = THEME.stageFloor;
+  ctx.fillStyle = exportFloorFill;
   ctx.fillRect(stageLeftPx, stageTopPx, stageRightPx - stageLeftPx, stageBottomPx - stageTopPx);
-  ctx.strokeStyle = THEME.gridLine;
+  ctx.strokeStyle = exportFloorContrast.gridLine;
   ctx.lineWidth = 2;
   ctx.strokeRect(stageLeftPx, stageTopPx, stageRightPx - stageLeftPx, stageBottomPx - stageTopPx);
 
   // 描画順4・5：縦grid・横grid（PART A・4・5・6章：TopViewと同じ「ステージ本体の
   // 整数マス位置すべて」を対象にする。出演者より目立たないTHEME.gridLineHalfを使う）。
-  ctx.strokeStyle = THEME.gridLineHalf;
+  ctx.strokeStyle = exportFloorContrast.gridLineHalf;
   ctx.lineWidth = 1;
   for (let x = -halfW; x <= halfW; x += 1) {
     ctx.beginPath();
@@ -4873,21 +4890,21 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   computeWidthAxisTickValues(halfW).forEach((v) => {
     const tx = toX(v);
     const isCenter = v === 0;
-    ctx.strokeStyle = isCenter ? THEME.accent : THEME.textDim;
+    ctx.strokeStyle = isCenter ? THEME.accent : exportFloorContrast.tickText;
     ctx.lineWidth = isCenter ? 1.6 : 1;
     ctx.beginPath();
     ctx.moveTo(tx, stageBottomPx);
     ctx.lineTo(tx, stageBottomPx + 8);
     ctx.stroke();
-    ctx.fillStyle = isCenter ? THEME.accent : THEME.textDim;
+    ctx.fillStyle = isCenter ? THEME.accent : exportFloorContrast.tickText;
     ctx.font = isCenter ? "bold 12px sans-serif" : "12px sans-serif";
     ctx.textAlign = "center";
     ctx.fillText(String(Math.abs(v)), tx, stageBottomPx + 12);
   });
 
   // 奥行き方向の目盛り（PART A・3章：既存実装を維持。舞台前端=0という座標定義そのまま）。
-  ctx.strokeStyle = THEME.textDim;
-  ctx.fillStyle = THEME.textDim;
+  ctx.strokeStyle = exportFloorContrast.tickText;
+  ctx.fillStyle = exportFloorContrast.tickText;
   ctx.font = "12px sans-serif";
   ctx.lineWidth = 1;
   ctx.textBaseline = "middle";
@@ -4909,7 +4926,7 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   });
 
   // 描画順6：センターライン（x=0）。通常gridより少し分かりやすく（7章）。
-  ctx.strokeStyle = THEME.textDim;
+  ctx.strokeStyle = exportFloorContrast.tickText;
   ctx.globalAlpha = 0.6;
   ctx.lineWidth = 1.2;
   ctx.beginPath();
@@ -5136,13 +5153,34 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   const stageBackLeft = project(-halfW, model.stage.depth);
   const stageBackRight = project(halfW, model.stage.depth);
 
+  // Export舞台色反映 v1・F章：floorColorは舞台の台形床面へ、backdropColorは俯瞰Export
+  // Canvasの「舞台周囲・背景」に相当する領域（＝このrendererのクリップ矩形stageAreaRect）へ
+  // 反映する。物理的な壁オブジェクトは追加せず、OverheadAudienceView（編集画面）と同じ
+  // 「最背面の背景矩形」という考え方をそのままCanvasへ持ち込む。ヘッダー部分（構成番号・
+  // 構成名・音楽位置）はこのrendererの外側（renderFormationExportToCanvas側）で別途
+  // THEME.bg背景の上に描かれるため、ここでは影響しない。
+  const exportFloorColorKey = (model.stageAppearance && model.stageAppearance.floorColor) || "black";
+  const exportBackdropColorKey = (model.stageAppearance && model.stageAppearance.backdropColor) || "black";
+  const exportFloorFill = stageAppearanceColorHex(exportFloorColorKey);
+  const exportBackdropFill = stageAppearanceColorHex(exportBackdropColorKey);
+  // G章：backdropColorが白・ベージュ等の明色でも「下手」「上手」・補助線・目盛りが読めるよう、
+  // OverheadAudienceView（編集画面）が使っているのと同じgetStageFloorContrastColors()を
+  // そのまま再利用する（Export専用の新しいテーマ判定は作らない）。
+  const exportBackdropContrast = getStageFloorContrastColors(exportBackdropColorKey);
+
   ctx.save();
   ctx.beginPath();
   ctx.rect(stageAreaX, stageAreaY, stageAreaW, stageAreaH);
   ctx.clip();
 
+  // 描画順0（新規）：舞台周囲・背景（backdropColor）。ステージ床より先に、クリップ矩形全体を
+  // 塗りつぶす。既存の投影計算・画角・出演者位置・待機エリア・目盛り・舞台台形・ラベルの
+  // 座標計算には一切手を加えていない（F章の方針）。
+  ctx.fillStyle = exportBackdropFill;
+  ctx.fillRect(stageAreaX, stageAreaY, stageAreaW, stageAreaH);
+
   // 描画順1：ステージ床（台形＝奥ほど狭い）。OverheadAudienceViewのpolygonと同じ4頂点。
-  ctx.fillStyle = THEME.stageFloor;
+  ctx.fillStyle = exportFloorFill;
   ctx.strokeStyle = THEME.gridLine;
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -5154,8 +5192,9 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   ctx.fill();
   ctx.stroke();
 
-  // 下手／上手ラベル（OverheadAudienceViewと同じステージ前端の位置）。
-  ctx.fillStyle = THEME.textDim;
+  // 下手／上手ラベル（OverheadAudienceViewと同じステージ前端の位置）。背景色に応じた
+  // コントラスト調整済みの色を使う（G章）。
+  ctx.fillStyle = exportBackdropContrast.tickText;
   ctx.font = "16px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
@@ -9119,6 +9158,7 @@ export default function App() {
         trajectoryMode: exportTrajectoryMode,
         performerDisplayScale,
         showMusicTime: exportShowMusicTime,
+        stageAppearance,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");

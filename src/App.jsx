@@ -129,6 +129,92 @@ function getPerformerNameScale(displayScale) {
   return 1;
 }
 
+// ------------------------------------------------------------------
+// Lighting v0・PART K：Projectごとの舞台外観設定（床／壁色）
+// ------------------------------------------------------------------
+// work.project.stageAppearanceとして保存する、Project全体で1つだけの設定。
+// getProjectBpm(work)・getPerformerDisplayScale(work)と全く同じ「optional field + fallback」の
+// 考え方（既存Projectへ一括migrationしない）で、未設定・不正値は必ずdefault（黒／黒）へ
+// フォールバックする。照明そのものではなく舞台環境の設定のため、Lighting機能のON/OFFとは
+// 独立して常に有効（Lighting OFFの状態でも床・壁の色は設定できる）。
+const STAGE_APPEARANCE_COLOR_PRESETS = {
+  black: "#1a1720", // 既定値。THEME.stageFloorと同じ色にすることで、選択時の見た目を変えない
+  darkGray: "#2e2b33",
+  gray: "#4a4650",
+  white: "#e8e4da",
+  beige: "#cfc3a8",
+  brown: "#5b4636", // 少し濃いめのフローリングのイメージ
+};
+const STAGE_APPEARANCE_COLOR_KEYS = Object.keys(STAGE_APPEARANCE_COLOR_PRESETS);
+const DEFAULT_STAGE_APPEARANCE = { floorColor: "black", backdropColor: "black" };
+// 床・壁のプリセット名（UI表示用ラベル）。内部値（key）自体は変更しない。
+const STAGE_APPEARANCE_COLOR_LABELS = {
+  black: "黒",
+  darkGray: "濃いグレー",
+  gray: "グレー",
+  white: "白",
+  beige: "ベージュ",
+  brown: "茶色",
+};
+
+function getStageAppearance(work) {
+  const raw = work && work.project && work.project.stageAppearance;
+  const floorColor = raw && STAGE_APPEARANCE_COLOR_KEYS.includes(raw.floorColor) ? raw.floorColor : DEFAULT_STAGE_APPEARANCE.floorColor;
+  const backdropColor =
+    raw && STAGE_APPEARANCE_COLOR_KEYS.includes(raw.backdropColor) ? raw.backdropColor : DEFAULT_STAGE_APPEARANCE.backdropColor;
+  return { floorColor, backdropColor };
+}
+
+// 床色プリセットのキーからHEX値を取り出す（不正値は黒にフォールバック）。
+function stageAppearanceColorHex(colorKey) {
+  return STAGE_APPEARANCE_COLOR_PRESETS[colorKey] || STAGE_APPEARANCE_COLOR_PRESETS.black;
+}
+
+// 白／ベージュ等の明るい床色を選んでも、グリッド・センターライン・目盛り・出演者名が
+// 読めるよう、床の明度に応じてグリッド線・文字色を切り替えるためのhelper（K章末尾の要件）。
+// 明るい床（white/beige/gray）では暗い線・文字、暗い床（black/darkGray/brown）では
+// 従来通り明るい線・文字を返す。既存THEME.gridLine等の値自体は変更せず、ここでは
+// 「床色に応じてどちらの配色を使うか」だけを判定する。
+const STAGE_APPEARANCE_LIGHT_FLOORS = new Set(["white", "beige", "gray"]);
+function getStageFloorContrastColors(floorColorKey) {
+  if (STAGE_APPEARANCE_LIGHT_FLOORS.has(floorColorKey)) {
+    return {
+      gridLine: "rgba(30,26,20,0.38)",
+      gridLineHalf: "rgba(30,26,20,0.22)",
+      tickText: "rgba(30,26,20,0.65)",
+    };
+  }
+  return { gridLine: THEME.gridLine, gridLineHalf: THEME.gridLineHalf, tickText: THEME.textDim };
+}
+
+// ------------------------------------------------------------------
+// Lighting v0・PART L：Lighting機能全体のON/OFF
+// ------------------------------------------------------------------
+// work.project.lightingEnabledとして保存する、Project全体で1つだけのbooleanフラグ。
+// 既存Projectには存在しないフィールドのため、未設定（undefined）は必ずfalseへフォールバックする
+// （＝これまで通り「ダンス構成だけを作るアプリ」として使える状態を維持する＝L章）。
+function getLightingEnabled(work) {
+  return !!(work && work.project && work.project.lightingEnabled === true);
+}
+
+// ------------------------------------------------------------------
+// Lighting v0・PART N：Lighting Scene（Formationごとに0〜1個）
+// ------------------------------------------------------------------
+// work.lightingScenesとして保存する配列。スキーマ：{ id, slideId, enabled, note }
+// （将来のPART T拡張でareas/beamsを追加する想定だが、v0では持たない）。
+// FormationとLightingは別レイヤーとして維持するため、slide側（slide.lighting等）へは
+// 一切フィールドを追加しない。Lighting側からslideIdを参照する片方向参照とする（N章）。
+// 未設定（既存Project・旧Backup）は必ず空配列へフォールバックする。
+function getLightingScenes(work) {
+  return work && Array.isArray(work.lightingScenes) ? work.lightingScenes : [];
+}
+
+// 指定したslideIdに対応するLighting Sceneを1件だけ探す（無ければnull）。
+// Formation 1つにつきScene 0〜1個、という v0 の制約を前提にした単純なfind。
+function findLightingSceneBySlideId(lightingScenes, slideId) {
+  return (lightingScenes || []).find((sc) => sc && sc.slideId === slideId) || null;
+}
+
 // BPM値を許容範囲（MIN_BPM〜MAX_BPM）へ収める。小数BPM（将来の音源解析・手動修正用）にも
 // 対応できるよう、整数への丸めは行わずNumberのまま扱う。
 function clampBpm(bpm) {
@@ -1275,6 +1361,10 @@ function createInitialWork() {
     currentSlideIndex: 0,
     transitionCounts: {}, // { [移動元スライドのid]: カウント数 }。未設定時はDEFAULT_TRANSITION_COUNTSにフォールバックする
     transitionPaths: {}, // { [移動元スライドのid]: { [performerId]: {type:"linear"} | {type:"curve", waypoint:{x,y}} } }。未設定時は直線にフォールバックする
+    // Lighting v0・N章：Formation側（slide）へは一切フィールドを追加せず、Lighting Scene側から
+    // slideIdを参照する片方向参照。新規Projectは常に[]から始まる（既存Projectはoptional field
+    // なので、getLightingScenes()のfallbackにより自動的に[]として扱われる＝migration不要）。
+    lightingScenes: [],
     project: {
       bpm: DEFAULT_BPM,
       musicSections: [createDefaultMusicSection(DEFAULT_BPM)],
@@ -1284,6 +1374,10 @@ function createInitialWork() {
       musicAsset: null,
       // 出演者表示サイズ v1・PART T：新規Projectのdefaultは「大」。
       performerDisplayScale: PERFORMER_DISPLAY_SCALE_LARGE,
+      // Lighting v0・K章：新規Projectの舞台外観defaultは床・壁とも黒。
+      stageAppearance: { ...DEFAULT_STAGE_APPEARANCE },
+      // Lighting v0・L章：新規Projectは常にLighting機能OFFから始まる。
+      lightingEnabled: false,
     },
   };
 }
@@ -2460,6 +2554,46 @@ function reconcileTransitionCounts(transitionCounts, oldSlides, newSlides) {
   return next;
 }
 
+// ------------------------------------------------------------------
+// Lighting v0・PART R：Formation削除・並べ替えに追従するLighting Scene reconcile
+// ------------------------------------------------------------------
+// reconcileTransitionCounts/reconcileTransitionPathsと同じ考え方（「新しいslides配列に
+// 実際に存在するslideIdだけを残す」）で、削除されたslideIdを参照する孤児Sceneを除去する。
+// 並べ替え（moveSlide）はslideId自体を変更しないため、この関数を通しても対応関係は
+// そのまま維持される（indexではなく必ずslideIdで判定するため＝R章の要件）。
+function reconcileLightingScenes(lightingScenes, newSlides) {
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  if (scenes.length === 0) return scenes;
+  const aliveIds = new Set(newSlides.map((s) => s.id));
+  const next = scenes.filter((sc) => sc && aliveIds.has(sc.slideId));
+  return next.length === scenes.length ? scenes : next;
+}
+
+// ------------------------------------------------------------------
+// Lighting v0・PART Q：同一Project内Formationコピー時のLighting Scene複製
+// ------------------------------------------------------------------
+// 「同一Project内でFormationをコピーした場合、Lighting Sceneが存在すればSceneもコピーする」
+// （Q章）を実現するpure helper。コピー元slideId（oldSlideId）に対応するSceneが存在する場合だけ、
+// 新しいid・新しいslideId（newSlideId）を発行して追加する。enabled/noteは引き継ぐ。
+// Project間コピー（insertCrossProjectPastedSlide・performerIdMapありのinsertBulkPastedSlidesIntoWork）
+// からは意図的に呼ばない＝Lighting Sceneをコピーしない（Q章「Project間コピー」の方針）。
+function copyLightingSceneForSlideCopy(lightingScenes, oldSlideId, newSlideId) {
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  const source = findLightingSceneBySlideId(scenes, oldSlideId);
+  if (!source) return scenes;
+  const newScene = { id: makeId("lighting"), slideId: newSlideId, enabled: !!source.enabled, note: typeof source.note === "string" ? source.note : "" };
+  return [...scenes, newScene];
+}
+
+// 複数構成一括コピー（同一Project内のみ）用の複数版。oldSlideIds/newSlideIdsは同じ並び順の配列。
+function copyLightingScenesForSlidesCopy(lightingScenes, oldSlideIds, newSlideIds) {
+  let scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  for (let i = 0; i < oldSlideIds.length; i++) {
+    scenes = copyLightingSceneForSlideCopy(scenes, oldSlideIds[i], newSlideIds[i]);
+  }
+  return scenes;
+}
+
 // 構成一覧v2・第2段階①：「あるslideのdeep copyを、指定したafterIndexの直後へ挿入する」という、
 // duplicateSlideAt・pasteCopiedSlide（Ctrl+C/Ctrl+V）・pasteSlideAfterIndex（構成一覧の
 // 「ここに貼り付け」）の3箇所で全く同じ形をしていた変換を、1つのpure関数へ切り出したもの
@@ -3300,6 +3434,9 @@ const TopView = forwardRef(function TopView(
     transitionPaths,
     waypointHandle,
     onWaypointDrag,
+    // Lighting v0・K章：Projectごとの舞台外観（床色）。未指定時は既存の黒（THEME.stageFloorと
+    // 同じ色）にフォールバックし、既存の見た目を一切変えない後方互換設計にする。
+    floorColorKey = "black",
   },
   ref
 ) {
@@ -3307,6 +3444,12 @@ const TopView = forwardRef(function TopView(
   const viewGroupRef = useRef(null);
   const [rectSelectBox, setRectSelectBox] = useState(null);
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  // Lighting v0・K章：床色の実際のHEX値と、その明度に応じたグリッド線・目盛り文字色。
+  // 白／ベージュ等の明るい床でもグリッド・センターライン・目盛り・出演者名が読めるよう、
+  // getStageFloorContrastColorsが自動的に暗い配色へ切り替える。
+  const floorFillColor = stageAppearanceColorHex(floorColorKey);
+  const floorContrast = getStageFloorContrastColors(floorColorKey);
 
   const halfW = stage.width / 2;
   const stageWcm = stage.width * UNIT_CM;
@@ -3711,8 +3854,8 @@ const TopView = forwardRef(function TopView(
             y={stageTopPx}
             width={stageRightPx - stageLeftPx}
             height={stageBottomPx - stageTopPx}
-            fill={THEME.stageFloor}
-            stroke={THEME.gridLine}
+            fill={floorFillColor}
+            stroke={floorContrast.gridLine}
             strokeWidth={2}
           />
           {/* グリッド */}
@@ -3723,7 +3866,7 @@ const TopView = forwardRef(function TopView(
               y1={l.y1}
               x2={l.x2}
               y2={l.y2}
-              stroke={l.whole ? THEME.gridLine : THEME.gridLineHalf}
+              stroke={l.whole ? floorContrast.gridLine : floorContrast.gridLineHalf}
               strokeWidth={l.whole ? 1.2 : 0.7}
             />
           ))}
@@ -3748,13 +3891,13 @@ const TopView = forwardRef(function TopView(
                   y1={stageBottomPx}
                   x2={t.screenX}
                   y2={stageBottomPx + 8}
-                  stroke={t.isCenter ? THEME.accent : THEME.textDim}
+                  stroke={t.isCenter ? THEME.accent : floorContrast.tickText}
                   strokeWidth={t.isCenter ? 1.6 : 1}
                 />
                 <text
                   x={t.screenX}
                   y={stageBottomPx + 21}
-                  fill={t.isCenter ? THEME.accent : THEME.textDim}
+                  fill={t.isCenter ? THEME.accent : floorContrast.tickText}
                   fontSize={12}
                   fontWeight={t.isCenter ? "bold" : "normal"}
                   textAnchor="middle"
@@ -5572,6 +5715,11 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     height,
     locked,
     transitionPaths,
+    // Lighting v0・K章：Projectごとの舞台外観（床色）。TopViewと同じフォールバック方針。
+    floorColorKey = "black",
+    // Lighting UI整理 v1・H章：俯瞰客席ビューの「舞台の周囲・背景」に反映する壁・背景色。
+    // 物理的な壁オブジェクトは追加せず、viewBox全体を覆う背景矩形の色として扱う。
+    backdropColorKey = "black",
   },
   ref
 ) {
@@ -5579,6 +5727,12 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   const viewGroupRef = useRef(null);
   const halfW = stage.width / 2;
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const floorFillColor = stageAppearanceColorHex(floorColorKey);
+  const backdropFillColor = stageAppearanceColorHex(backdropColorKey);
+  // Lighting UI整理 v1・J章：backdropColorが白・ベージュ等の明色でも「下手」「上手」表示や
+  // 前端の目印線が読めるよう、既存getStageFloorContrastColors（床色向けに作った「明色なら
+  // 暗い配色へ切り替える」判定）をそのまま再利用する。新しいテーマシステムは作らない。
+  const backdropContrast = getStageFloorContrastColors(backdropColorKey);
 
   // 待機エリアの出演者を表示するかどうか（範囲外＝警告対象は常に表示する）
   const visiblePerformers = useMemo(
@@ -5778,6 +5932,12 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
       onPointerLeave={handlePointerUp}
       onPointerCancel={handlePointerUp}
     >
+      {/* Lighting UI整理 v1・H章：俯瞰客席ビューの「舞台の周囲・背景」。viewGroupRef（ズーム・
+          パンのtransformがかかるレイヤー）の外側・最背面に置き、viewBox全体（bounds.totalW/
+          totalH）を常に覆うことで、ズーム・パン操作に関わらず常にキャンバス全体を塗りつぶす。
+          既存のレイアウト・遠近感・出演者描画・ステージ床（floorColor）には一切影響しない。
+          「壁」という物理オブジェクトは追加せず、単純な背景矩形の色として扱う（I章の方針通り）。 */}
+      <rect x={0} y={0} width={bounds.totalW} height={bounds.totalH} fill={backdropFillColor} pointerEvents="none" />
       <g ref={viewGroupRef} transform={groupTransform}>
         {/* 背景レイヤー（操作対象外）：ステージ床・縁の線・下手/上手ラベル。平面図と同じ方針で
             pointerEvents="none" + userSelect:noneにし、クリック／文字選択の対象にならないようにする
@@ -5787,15 +5947,15 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
           {/* ステージ床（台形＝奥ほど狭い） */}
           <polygon
             points={`${stageFrontLeft.sx},${stageFrontLeft.sy} ${stageFrontRight.sx},${stageFrontRight.sy} ${stageBackRight.sx},${stageBackRight.sy} ${stageBackLeft.sx},${stageBackLeft.sy}`}
-            fill={THEME.stageFloor}
+            fill={floorFillColor}
             stroke={THEME.gridLine}
             strokeWidth={2}
           />
 
-          <line x1={stageFrontLeft.sx} y1={stageFrontLeft.sy} x2={stageFrontLeft.sx} y2={stageFrontLeft.sy - 20} stroke={THEME.textDim} strokeWidth={1.5} />
-          <line x1={stageFrontRight.sx} y1={stageFrontRight.sy} x2={stageFrontRight.sx} y2={stageFrontRight.sy - 20} stroke={THEME.textDim} strokeWidth={1.5} />
-          <text x={stageFrontLeft.sx} y={stageFrontLeft.sy + 26} fill={THEME.textDim} fontSize={16} textAnchor="middle">下手</text>
-          <text x={stageFrontRight.sx} y={stageFrontRight.sy + 26} fill={THEME.textDim} fontSize={16} textAnchor="middle">上手</text>
+          <line x1={stageFrontLeft.sx} y1={stageFrontLeft.sy} x2={stageFrontLeft.sx} y2={stageFrontLeft.sy - 20} stroke={backdropContrast.tickText} strokeWidth={1.5} />
+          <line x1={stageFrontRight.sx} y1={stageFrontRight.sy} x2={stageFrontRight.sx} y2={stageFrontRight.sy - 20} stroke={backdropContrast.tickText} strokeWidth={1.5} />
+          <text x={stageFrontLeft.sx} y={stageFrontLeft.sy + 26} fill={backdropContrast.tickText} fontSize={16} textAnchor="middle">下手</text>
+          <text x={stageFrontRight.sx} y={stageFrontRight.sy + 26} fill={backdropContrast.tickText} fontSize={16} textAnchor="middle">上手</text>
         </g>
 
         {/* UI Stability & Bottom Navigation v1・PART D・E-1・E-5：Stage Guideのgrid
@@ -6154,6 +6314,12 @@ export default function App() {
   // getMusicSections()が必ず最低1件を返すため、以降のUIはこの配列だけを見ればよい（15章）。
   const musicSections = getMusicSections(work);
 
+  // Lighting v0：舞台外観（床／壁色）・Lighting機能ON/OFF・Lighting Scene一覧。
+  // いずれもoptional field + fallback（K・L・N章）で、既存Projectでも未設定のまま安全に読める。
+  const stageAppearance = getStageAppearance(work);
+  const lightingEnabled = getLightingEnabled(work);
+  const lightingScenes = getLightingScenes(work);
+
   // 選択状態はUI専用のstate（performers / slides には保存しない＝履歴の対象外）。
   // 複数選択に対応するため配列で保持し、単独選択・従来動作は selectedPerformer 等の
   // 派生値（selectedIds.length === 1 のときだけ有効）で表現する。
@@ -6184,6 +6350,11 @@ export default function App() {
   const [showBackstage, setShowBackstage] = useState(true);
   // 俯瞰客席ビューで待機中の出演者も表示するかどうか
   const [showWaitingInOverhead, setShowWaitingInOverhead] = useState(false);
+  // Lighting v0・M章：「Lighting表示ON/OFF」は作品データではなく一時的なUI state。
+  // Lighting機能そのもののON/OFF（work.project.lightingEnabled）とは別物で、
+  // 「照明データは残すが舞台上の照明表示だけ一時的に消す」ためのもの。今回はまだArea/Beamを
+  // 描画しないため実際の表示への影響はほぼ無いが、将来の描画基盤として用意しておく。
+  const [showLighting, setShowLighting] = useState(true);
   // 「？ 操作方法」パネルの開閉状態。表示のON/OFFだけの一時的なUI stateであり、
   // 作品データ（work）には含めないため履歴（Undo/Redo）の対象外。初期状態は閉じておく。
   const [helpOpen, setHelpOpen] = useState(false);
@@ -6192,6 +6363,10 @@ export default function App() {
   // work（Undo/Redo対象）には含めない（21章）。PC・タブレットでの初期状態はどちらも開いた状態（20章）。
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(true);
   const [slideSettingsOpen, setSlideSettingsOpen] = useState(true);
+  // Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層の独立グループとして
+  // 「照明の設定」を新設する。開閉状態の管理方法は既存2グループと完全に同じ（work対象外・
+  // 初期状態は開いた状態）。
+  const [lightingSettingsOpen, setLightingSettingsOpen] = useState(true);
   // 各設定パネル内の「説明を見る」開閉状態（PART E・新規）。こちらも作品データではないため
   // Undo/Redo対象外（26章）。パネルが増えてもuseStateを増やさずに済むよう、キー付きの
   // 1つのオブジェクトstateへまとめてある（例：keepCounts, musicAnchor, musicSection）。
@@ -6929,6 +7104,9 @@ export default function App() {
 
   const currentSlide = slides[currentSlideIndex];
   const placements = currentSlide.placements;
+
+  // Lighting v0・O章：現在のFormationに対応するLighting Scene（0〜1個）。
+  const currentLightingScene = findLightingSceneBySlideId(lightingScenes, currentSlide.id);
 
   // ステージ下部に表示する「現在の順番 / 全構成数　構成名」用のラベル。
   // 桁数はslides.lengthに合わせて自動調整し、最低2桁でゼロ埋めする（100構成以上でも自然に3桁になる）。
@@ -7994,12 +8172,16 @@ export default function App() {
         // reconcileTransitionCountsによって自動的に既定値（DEFAULT_TRANSITION_COUNTS）へフォールバックする。
         const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
         const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+        // Lighting v0・R章：削除されたslideIdを参照するLighting Sceneも同じcommitWorkで削除し、
+        // 孤児Sceneを残さない。
+        const nextLightingScenes = reconcileLightingScenes(getLightingScenes(prev), nextSlides);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          lightingScenes: nextLightingScenes,
         };
       });
     },
@@ -8048,12 +8230,15 @@ export default function App() {
         const nextCurrentSlideIndex = resolveCurrentSlideIndexAfterBulkDelete(prev.slides, prev.currentSlideIndex, nextSlides, idSet);
         const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
         const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+        // Lighting v0・R章：一括削除でも同様に孤児Sceneを残さない。
+        const nextLightingScenes = reconcileLightingScenes(getLightingScenes(prev), nextSlides);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextCurrentSlideIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          lightingScenes: nextLightingScenes,
         };
       });
     },
@@ -8074,7 +8259,7 @@ export default function App() {
       commitWork((prev) => {
         if (index < 0 || index >= prev.slides.length) return prev;
         const src = prev.slides[index];
-        const { nextSlides, nextTransitionCounts, nextTransitionPaths } = insertSlideCopyAfter(
+        const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId } = insertSlideCopyAfter(
           prev.slides,
           prev.transitionCounts,
           prev.transitionPaths,
@@ -8082,12 +8267,16 @@ export default function App() {
           index
         );
         const nextCurrentIndex = prev.currentSlideIndex > index ? prev.currentSlideIndex + 1 : prev.currentSlideIndex;
+        // Lighting v0・Q章：同一Project内の複製のため、コピー元にLighting Sceneがあれば
+        // 新しいid・slideIdで複製する（Project間コピーではないため常にコピー対象）。
+        const nextLightingScenes = copyLightingSceneForSlideCopy(getLightingScenes(prev), src.id, newSlideId);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          lightingScenes: nextLightingScenes,
         };
       });
     },
@@ -8296,12 +8485,20 @@ export default function App() {
           afterIndex
         );
         const nextCurrentIndex = newSlideIds.length > 0 ? nextSlides.findIndex((s) => s.id === newSlideIds[0]) : -1;
+        // Lighting v0・Q章：同一Project内一括コピー（performerIdMap===null）の場合だけ
+        // Lighting Sceneも一緒に複製する。Project間一括コピー（performerIdMapがMap）では
+        // 意図的にコピーしない（Q章「Project間コピー」の方針）。
+        const nextLightingScenes =
+          performerIdMap == null
+            ? copyLightingScenesForSlidesCopy(getLightingScenes(prev), sourceSlides.map((s) => s.id), newSlideIds)
+            : getLightingScenes(prev);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextCurrentIndex === -1 ? prev.currentSlideIndex : nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          lightingScenes: nextLightingScenes,
         };
       });
     },
@@ -8451,12 +8648,15 @@ export default function App() {
         insertAt
       );
       const nextCurrentIndex = nextSlides.findIndex((s) => s.id === newSlideId);
+      // Lighting v0・Q章：同一Project内貼り付けのため、コピー元にSceneがあれば複製する。
+      const nextLightingScenes = copyLightingSceneForSlideCopy(getLightingScenes(prev), latestClip.slide.id, newSlideId);
       return {
         ...prev,
         slides: nextSlides,
         currentSlideIndex: nextCurrentIndex === -1 ? prev.currentSlideIndex : nextCurrentIndex,
         transitionCounts: nextTransitionCounts,
         transitionPaths: nextTransitionPaths,
+        lightingScenes: nextLightingScenes,
       };
     });
   }, [
@@ -8562,12 +8762,15 @@ export default function App() {
         );
         pastedSlideId = newSlideId;
         const nextCurrentIndex = prev.currentSlideIndex > targetIndex ? prev.currentSlideIndex + 1 : prev.currentSlideIndex;
+        // Lighting v0・Q章：常に同一Project内コピーのため、Sceneがあれば複製する。
+        const nextLightingScenes = copyLightingSceneForSlideCopy(getLightingScenes(prev), src.id, newSlideId);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          lightingScenes: nextLightingScenes,
         };
       });
       // PART C：実際に挿入できた場合だけ、新しいslideを約1秒強調する（guard節等で
@@ -9133,6 +9336,90 @@ export default function App() {
     const clamped = clamp(Math.round(d), DEPTH_MIN, DEPTH_MAX);
     updateWorkLive((prev) => ({ ...prev, stage: { ...prev.stage, depth: clamped } }));
   }, [updateWorkLive]);
+
+  // ---- Lighting v0・K章：舞台外観（床／壁色）。ボタン選択のみのUIのため即コミット ----
+  const setFloorColorCommit = useCallback(
+    (colorKey) => {
+      if (!STAGE_APPEARANCE_COLOR_KEYS.includes(colorKey)) return;
+      commitWork((prev) => {
+        const current = getStageAppearance(prev);
+        if (current.floorColor === colorKey) return prev;
+        return { ...prev, project: { ...(prev.project || {}), stageAppearance: { ...current, floorColor: colorKey } } };
+      });
+    },
+    [commitWork]
+  );
+  const setBackdropColorCommit = useCallback(
+    (colorKey) => {
+      if (!STAGE_APPEARANCE_COLOR_KEYS.includes(colorKey)) return;
+      commitWork((prev) => {
+        const current = getStageAppearance(prev);
+        if (current.backdropColor === colorKey) return prev;
+        return { ...prev, project: { ...(prev.project || {}), stageAppearance: { ...current, backdropColor: colorKey } } };
+      });
+    },
+    [commitWork]
+  );
+
+  // ---- Lighting v0・L章：Lighting機能全体のON/OFF ----
+  const setLightingEnabledCommit = useCallback(
+    (next) => {
+      commitWork((prev) => ({ ...prev, project: { ...(prev.project || {}), lightingEnabled: !!next } }));
+    },
+    [commitWork]
+  );
+
+  // ---- Lighting v0・O章：現在のFormation（slides[currentSlideIndex]）にLighting Sceneを
+  // 1件作成する。既にSceneが存在する場合は何もしない（Formation 1つにつき0〜1個＝v0の制約）。
+  const addLightingSceneForCurrentSlide = useCallback(() => {
+    commitWork((prev) => {
+      const slide = prev.slides[prev.currentSlideIndex];
+      if (!slide) return prev;
+      const scenes = getLightingScenes(prev);
+      if (findLightingSceneBySlideId(scenes, slide.id)) return prev; // 既に存在＝何もしない
+      const newScene = { id: makeId("lighting"), slideId: slide.id, enabled: true, note: "" };
+      return { ...prev, lightingScenes: [...scenes, newScene] };
+    });
+  }, [commitWork]);
+
+  // 指定したSceneを削除する（O章「この構成の照明設定を削除」）。
+  const deleteLightingScene = useCallback(
+    (sceneId) => {
+      commitWork((prev) => {
+        const scenes = getLightingScenes(prev);
+        const next = scenes.filter((sc) => sc.id !== sceneId);
+        if (next.length === scenes.length) return prev;
+        return { ...prev, lightingScenes: next };
+      });
+    },
+    [commitWork]
+  );
+
+  // SceneのON/OFF切替。ボタン操作のため即コミット。
+  const setLightingSceneEnabledCommit = useCallback(
+    (sceneId, enabled) => {
+      commitWork((prev) => {
+        const scenes = getLightingScenes(prev);
+        const next = scenes.map((sc) => (sc.id === sceneId ? { ...sc, enabled: !!enabled } : sc));
+        return { ...prev, lightingScenes: next };
+      });
+    },
+    [commitWork]
+  );
+
+  // Sceneメモ（textarea）。F章の方針通り、1文字入力ごとにUndo履歴を作らないよう、
+  // beginEdit（onFocus）〜endEdit（onBlur/Enter）で1回の編集セッション＝1件の履歴にまとめる
+  // 既存のdraft state方式を踏襲する（updateLiveで見た目だけ更新し、commitはしない）。
+  const updateLightingSceneNoteLive = useCallback(
+    (sceneId, note) => {
+      updateWorkLive((prev) => {
+        const scenes = getLightingScenes(prev);
+        const next = scenes.map((sc) => (sc.id === sceneId ? { ...sc, note } : sc));
+        return { ...prev, lightingScenes: next };
+      });
+    },
+    [updateWorkLive]
+  );
 
   // ---- BPM（プロジェクト全体で共通の値。slideごとの値ではない） ----
   // ＋／－ボタン・DraftNumberFieldのblur/Enter確定、どちらもこの1つの関数を呼ぶだけで
@@ -11115,6 +11402,7 @@ export default function App() {
                 transitionPaths={transitionPaths}
                 waypointHandle={waypointHandle}
                 onWaypointDrag={updateWaypointLive}
+                floorColorKey={stageAppearance.floorColor}
               />
             ) : (
               <OverheadAudienceView
@@ -11134,6 +11422,8 @@ export default function App() {
                 height={containerSize.height}
                 locked={isTransitionActive}
                 transitionPaths={transitionPaths}
+                floorColorKey={stageAppearance.floorColor}
+                backdropColorKey={stageAppearance.backdropColor}
               />
             )}
 
@@ -11401,6 +11691,66 @@ export default function App() {
 
           <Divider />
 
+          {/* Lighting v0・K章：舞台外観（床／壁色）。照明そのものではなくProject全体の
+              舞台環境設定のため、Lightingパネル（構成ごとの設定内）ではなく、ここ
+              （舞台の広さのすぐ下）に置く。床・壁は独立して選べる、色プリセットのみのシンプルなUI。 */}
+          <section>
+            <SectionTitle>舞台の外観</SectionTitle>
+            <div className="flex flex-col gap-2 mt-2">
+              <div>
+                <div style={{ color: THEME.textDim }} className="text-xs mb-1">床の色</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {STAGE_APPEARANCE_COLOR_KEYS.map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFloorColorCommit(key)}
+                      title={STAGE_APPEARANCE_COLOR_LABELS[key]}
+                      aria-label={`床の色を${STAGE_APPEARANCE_COLOR_LABELS[key]}にする`}
+                      style={{
+                        width: 28,
+                        height: 28,
+                        borderRadius: 6,
+                        background: STAGE_APPEARANCE_COLOR_PRESETS[key],
+                        border: stageAppearance.floorColor === key ? `2px solid ${THEME.accent}` : `1px solid ${THEME.border}`,
+                        boxShadow: stageAppearance.floorColor === key ? `0 0 0 2px ${THEME.panelBg}` : "none",
+                        cursor: "pointer",
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: THEME.textDim }} className="text-xs mb-1">壁・背景の色</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {STAGE_APPEARANCE_COLOR_KEYS.map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setBackdropColorCommit(key)}
+                      title={STAGE_APPEARANCE_COLOR_LABELS[key]}
+                      aria-label={`壁・背景の色を${STAGE_APPEARANCE_COLOR_LABELS[key]}にする`}
+                      style={{
+                        width: 28,
+                        height: 28,
+                        borderRadius: 6,
+                        background: STAGE_APPEARANCE_COLOR_PRESETS[key],
+                        border: stageAppearance.backdropColor === key ? `2px solid ${THEME.accent}` : `1px solid ${THEME.border}`,
+                        boxShadow: stageAppearance.backdropColor === key ? `0 0 0 2px ${THEME.panelBg}` : "none",
+                        cursor: "pointer",
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
+                床の色は平面図・俯瞰客席ビューの舞台床に、壁・背景の色は俯瞰客席ビューの舞台周囲の背景に反映されます。
+              </p>
+            </div>
+          </section>
+
+          <Divider />
+
           {/* BPM：slideごとの値ではなく、プロジェクト全体で共通の値（work.project.bpm）。
               「このプロジェクト／使用曲の時間軸を決める値」として扱うため、ステージ設定の
               すぐ下にまとめて配置する。countsToDurationMsの計算に使われるため、
@@ -11589,6 +11939,10 @@ export default function App() {
               </p>
             </div>
           </section>
+
+          {/* Lighting v0・O・P章：現在のFormationのLighting Scene UIは「照明の設定」
+              （独立したCollapsibleGroup）へ移動した（UI整理v1・C〜E章）。ここでは「構成ごとの
+              設定」を出演者・Formationそのものの設定に限定し、Lighting固有UIは置かない。 */}
 
           {/* キープ：「この構成のまま何カウント維持するか」＝構成そのものの属性。
               構成と構成の「間」の属性である移動時間（transitionCounts、構成バー側にあるもの）とは
@@ -12408,6 +12762,100 @@ export default function App() {
               </div>
             )}
           </section>
+          </CollapsibleGroup>
+
+          {/* Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層に独立した
+              「照明の設定」グループを新設する。既存のCollapsibleGroupをそのまま再利用し、
+              Lighting専用の別形式アコーディオンは作らない（C章の方針）。
+              G章：lightingEnabledがfalseでもグループ自体は常に表示し、中身を「照明機能を使う」
+              チェックボックスだけに絞る（現在の構成のScene UIはlightingEnabled時のみ表示）。 */}
+          <CollapsibleGroup
+            title="照明の設定"
+            icon="💡"
+            open={lightingSettingsOpen}
+            onToggle={() => setLightingSettingsOpen((v) => !v)}
+          >
+          <section>
+            <SectionTitle>照明機能</SectionTitle>
+            <div className="mt-2">
+              <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: THEME.text }}>
+                <input
+                  type="checkbox"
+                  checked={lightingEnabled}
+                  onChange={(e) => setLightingEnabledCommit(e.target.checked)}
+                />
+                照明機能を使う
+              </label>
+              <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
+                振付師の照明イメージ・要望を構成ごとに記録します。
+              </p>
+              {lightingEnabled && (
+                <>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer mt-3" style={{ color: THEME.text }}>
+                    <input type="checkbox" checked={showLighting} onChange={(e) => setShowLighting(e.target.checked)} />
+                    舞台上に照明表示を出す
+                  </label>
+                  <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
+                    表示だけを切り替えます。保存した照明データは消えません。
+                  </p>
+                </>
+              )}
+            </div>
+          </section>
+
+          {/* Lighting v0・O・P章（UI整理v1・E章で「構成ごとの設定」からここへ移動）：
+              現在のFormationのLighting Scene UI。lightingEnabledがtrueの場合のみ表示する
+              （F・G章の方針）。Sceneが無ければ作成ボタンのみ、あれば ON/OFF・メモ・削除の
+              最小限のUIを表示する。handler・データ処理自体は一切変更していない（UI移動のみ）。 */}
+          {lightingEnabled && (
+            <section>
+              <SectionTitle>現在の構成の照明</SectionTitle>
+              <div className="mt-2">
+                {!currentLightingScene ? (
+                  <button
+                    type="button"
+                    onClick={addLightingSceneForCurrentSlide}
+                    style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                    className="w-full rounded-lg py-1.5 text-xs font-bold"
+                  >
+                    ＋ この構成に照明設定を追加
+                  </button>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: THEME.text }}>
+                      <input
+                        type="checkbox"
+                        checked={!!currentLightingScene.enabled}
+                        onChange={(e) => setLightingSceneEnabledCommit(currentLightingScene.id, e.target.checked)}
+                      />
+                      この構成の照明を有効にする
+                    </label>
+                    <div>
+                      <div style={{ color: THEME.textDim }} className="text-xs mb-1">メモ</div>
+                      <textarea
+                        value={currentLightingScene.note || ""}
+                        onFocus={beginEdit}
+                        onChange={(e) => updateLightingSceneNoteLive(currentLightingScene.id, e.target.value)}
+                        onBlur={endEdit}
+                        placeholder="例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
+                        rows={3}
+                        style={inputStyle}
+                        className="w-full rounded px-2 py-1.5 text-xs resize-y"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => deleteLightingScene(currentLightingScene.id)}
+                      style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                      className="rounded-lg py-1.5 text-xs font-bold"
+                    >
+                      この構成の照明設定を削除
+                    </button>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
           </CollapsibleGroup>
 
           <Divider />

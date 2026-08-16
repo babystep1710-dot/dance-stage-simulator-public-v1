@@ -215,6 +215,73 @@ function findLightingSceneBySlideId(lightingScenes, slideId) {
   return (lightingScenes || []).find((sc) => sc && sc.slideId === slideId) || null;
 }
 
+// ------------------------------------------------------------------
+// Lighting Area v1・D・E章：Lighting Sceneへの areas[] 拡張
+// ------------------------------------------------------------------
+// Scene schema：{ id, slideId, enabled, note, areas?: [] }。既存Scene（v0）にはareasが
+// 存在しないため、getLightingScenes(work)と全く同じ「optional field + fallback」方針で、
+// 未設定は必ず空配列へフォールバックする。既存Sceneの一括migrationは行わない。
+// Areaは { id, shape("circle"|"ellipse"|"rect"), x, y, width, height, color, intensity(0-1) }
+// という最小限のschema。x/y/width/heightは出演者placementと同じ舞台座標系（1単位=90cm）。
+function getLightingAreas(scene) {
+  return scene && Array.isArray(scene.areas) ? scene.areas : [];
+}
+
+// Area色プリセット（J章）。既存STAGE_APPEARANCE_COLOR_PRESETSとは役割が異なる
+// （舞台の床/壁ではなく照明の色）ため、別の定数として独立させる。
+const LIGHTING_AREA_COLOR_PRESETS = {
+  white: "#ffffff",
+  yellow: "#ffd54a",
+  orange: "#ff9f43",
+  red: "#ff4d4d",
+  pink: "#ff70c8",
+  purple: "#a66cff",
+  blue: "#4d7cff",
+  cyan: "#38d9ff",
+  green: "#51d88a",
+};
+const LIGHTING_AREA_COLOR_KEYS = Object.keys(LIGHTING_AREA_COLOR_PRESETS);
+const LIGHTING_AREA_COLOR_LABELS = {
+  white: "白",
+  yellow: "黄",
+  orange: "オレンジ",
+  red: "赤",
+  pink: "ピンク",
+  purple: "紫",
+  blue: "青",
+  cyan: "水色",
+  green: "緑",
+};
+function lightingAreaColorHex(colorKey) {
+  return LIGHTING_AREA_COLOR_PRESETS[colorKey] || LIGHTING_AREA_COLOR_PRESETS.white;
+}
+const LIGHTING_AREA_SHAPES = ["circle", "ellipse", "rect"];
+const LIGHTING_AREA_SHAPE_LABELS = { circle: "円", ellipse: "楕円", rect: "矩形" };
+const DEFAULT_LIGHTING_AREA_WIDTH = 4;
+const DEFAULT_LIGHTING_AREA_HEIGHT = 4;
+const DEFAULT_LIGHTING_AREA_INTENSITY = 0.6;
+const LIGHTING_AREA_MIN_SIZE = 0.5; // 舞台座標単位（0.5単位=45cm）。0や負値のAreaを防ぐ下限
+const LIGHTING_AREA_MAX_SIZE = 40; // 極端に大きい値の保険上限
+
+// H章：新規Areaのdefault。舞台サイズが小さい場合に極端にはみ出さないよう、
+// stage.width/depthに応じてclampする（新しいAreaのwidth/heightだけを対象。既存Areaには影響しない）。
+function createDefaultLightingArea(stage) {
+  const maxW = stage ? clamp(stage.width * 0.6, LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE) : DEFAULT_LIGHTING_AREA_WIDTH;
+  const maxH = stage ? clamp(stage.depth * 0.6, LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE) : DEFAULT_LIGHTING_AREA_HEIGHT;
+  const width = Math.min(DEFAULT_LIGHTING_AREA_WIDTH, maxW);
+  const height = Math.min(DEFAULT_LIGHTING_AREA_HEIGHT, maxH);
+  return {
+    id: makeId("lighting-area"),
+    shape: "circle",
+    x: 0,
+    y: stage ? stage.depth / 2 : 5,
+    width,
+    height,
+    color: "white",
+    intensity: DEFAULT_LIGHTING_AREA_INTENSITY,
+  };
+}
+
 // BPM値を許容範囲（MIN_BPM〜MAX_BPM）へ収める。小数BPM（将来の音源解析・手動修正用）にも
 // 対応できるよう、整数への丸めは行わずNumberのまま扱う。
 function clampBpm(bpm) {
@@ -2555,7 +2622,95 @@ function reconcileTransitionCounts(transitionCounts, oldSlides, newSlides) {
 }
 
 // ------------------------------------------------------------------
-// Lighting v0・PART R：Formation削除・並べ替えに追従するLighting Scene reconcile
+// Lighting Area v1・X章：舞台座標上のshape geometryを作る共通pure helper
+// ------------------------------------------------------------------
+// TopView（SVG）・OverheadAudienceView（疑似遠近投影）の両方が、Areaのshapeを
+// 「舞台座標上の頂点配列」として同じ形で受け取れるようにする（別々のshape解釈ロジックを
+// 書かない＝X章の方針）。円・楕円は正確な曲線ではなく、指定点数の多角形近似で表現する
+// （物理的に正確な照明シミュレーションは不要＝A章）。半径0以下等の不正値は安全側で
+// 最小サイズへclampする。
+const LIGHTING_AREA_ELLIPSE_SEGMENTS = 28;
+function getLightingAreaStagePoints(area) {
+  if (!area) return [];
+  const w = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.width) || DEFAULT_LIGHTING_AREA_WIDTH);
+  const h = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.height) || DEFAULT_LIGHTING_AREA_HEIGHT);
+  const cx = Number(area.x) || 0;
+  const cy = Number(area.y) || 0;
+  if (area.shape === "rect") {
+    const hw = w / 2;
+    const hh = h / 2;
+    return [
+      { x: cx - hw, y: cy - hh },
+      { x: cx + hw, y: cy - hh },
+      { x: cx + hw, y: cy + hh },
+      { x: cx - hw, y: cy + hh },
+    ];
+  }
+  // circle / ellipse：中心＋width/heightから多角形近似（X章・W章の案A）。circleはH・I章の
+  // 仕様通りwidth===heightとして保存されている想定だが、念のためここでも両軸を独立して扱う
+  // （万一width!==heightのデータが来ても壊れず楕円として描かれるだけで安全）。
+  const rx = w / 2;
+  const ry = h / 2;
+  const points = [];
+  for (let i = 0; i < LIGHTING_AREA_ELLIPSE_SEGMENTS; i++) {
+    const angle = (i / LIGHTING_AREA_ELLIPSE_SEGMENTS) * Math.PI * 2;
+    points.push({ x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) });
+  }
+  return points;
+}
+
+// ------------------------------------------------------------------
+// Area resize v1・D・E章：平面図TopView専用のリサイズハンドル配置
+// ------------------------------------------------------------------
+// 中心x/yを固定したまま（G章）width/heightだけを変える、という単純なリサイズのため、
+// ハンドルは常に「境界ボックスの辺の中点」に置く（circle/ellipse/rectいずれも同じ考え方＝
+// getLightingAreaStagePoints()と対をなす共通pure helper。俯瞰客席ビューでは使わない＝B章）。
+// circleはD章の推奨通り右側1個のみ（width===heightを維持するのに十分）。
+// ellipse/rectは東西南北4方向（最低限「左右→width、上下→height」というD章の要件を満たす）。
+function getLightingAreaResizeHandles(area) {
+  if (!area) return [];
+  const w = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.width) || DEFAULT_LIGHTING_AREA_WIDTH);
+  const h = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.height) || DEFAULT_LIGHTING_AREA_HEIGHT);
+  const cx = Number(area.x) || 0;
+  const cy = Number(area.y) || 0;
+  const hw = w / 2;
+  const hh = h / 2;
+  if (area.shape === "circle") {
+    return [{ dir: "e", x: cx + hw, y: cy, cursor: "ew-resize" }];
+  }
+  return [
+    { dir: "e", x: cx + hw, y: cy, cursor: "ew-resize" },
+    { dir: "w", x: cx - hw, y: cy, cursor: "ew-resize" },
+    { dir: "s", x: cx, y: cy + hh, cursor: "ns-resize" },
+    { dir: "n", x: cx, y: cy - hh, cursor: "ns-resize" },
+  ];
+}
+
+// Area fillのopacity（N章）：intensity(0-1)をそのまま1.0opacityにはせず、「照明の雰囲気を
+// 重ねる」程度の範囲（0.08〜0.45）へ写像する。intensity 0でも編集時に薄く見えるよう、
+// 下限を0にしない。TopView・OverheadAudienceView・（将来のExport）で同じ計算式を共有する。
+const LIGHTING_AREA_OPACITY_MIN = 0.08;
+const LIGHTING_AREA_OPACITY_MAX = 0.45;
+function lightingAreaFillOpacity(intensity) {
+  const t = clamp(typeof intensity === "number" ? intensity : DEFAULT_LIGHTING_AREA_INTENSITY, 0, 1);
+  return LIGHTING_AREA_OPACITY_MIN + t * (LIGHTING_AREA_OPACITY_MAX - LIGHTING_AREA_OPACITY_MIN);
+}
+
+// Area 1件の任意フィールドをpatchする共通pure helper。TopView側のライブドラッグ更新
+// （updateWorkLive）・確定操作（commitWork）の両方から同じロジックを再利用することで、
+// 「同じ更新ロジックを2回書かない」を徹底する。指定したslideId（＝現在のFormation）に
+// 対応するSceneのareas配列だけを対象にする（Formation 1つにつきScene0〜1個＝v0の制約を踏襲）。
+function updateLightingAreaInScenes(lightingScenes, slideId, areaId, patch) {
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  return scenes.map((sc) => {
+    if (!sc || sc.slideId !== slideId) return sc;
+    const areas = getLightingAreas(sc);
+    const nextAreas = areas.map((a) => (a.id === areaId ? { ...a, ...(typeof patch === "function" ? patch(a) : patch) } : a));
+    return { ...sc, areas: nextAreas };
+  });
+}
+
+
 // ------------------------------------------------------------------
 // reconcileTransitionCounts/reconcileTransitionPathsと同じ考え方（「新しいslides配列に
 // 実際に存在するslideIdだけを残す」）で、削除されたslideIdを参照する孤児Sceneを除去する。
@@ -2581,7 +2736,17 @@ function copyLightingSceneForSlideCopy(lightingScenes, oldSlideId, newSlideId) {
   const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
   const source = findLightingSceneBySlideId(scenes, oldSlideId);
   if (!source) return scenes;
-  const newScene = { id: makeId("lighting"), slideId: newSlideId, enabled: !!source.enabled, note: typeof source.note === "string" ? source.note : "" };
+  // Lighting Area v1・T章：areasもSceneの一部としてdeep copyする。Area.idはコピー先で
+  // 新規発行し（T章の要件）、shape/x/y/width/height/color/intensityはそのまま引き継ぐ。
+  const sourceAreas = getLightingAreas(source);
+  const newAreas = sourceAreas.map((area) => ({ ...area, id: makeId("lighting-area") }));
+  const newScene = {
+    id: makeId("lighting"),
+    slideId: newSlideId,
+    enabled: !!source.enabled,
+    note: typeof source.note === "string" ? source.note : "",
+    areas: newAreas,
+  };
   return [...scenes, newScene];
 }
 
@@ -3437,6 +3602,20 @@ const TopView = forwardRef(function TopView(
     // Lighting v0・K章：Projectごとの舞台外観（床色）。未指定時は既存の黒（THEME.stageFloorと
     // 同じ色）にフォールバックし、既存の見た目を一切変えない後方互換設計にする。
     floorColorKey = "black",
+    // Lighting Area v1・C・M章：平面図はArea編集可能ビュー。showLightingAreasは
+    // lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled
+    // をApp側で計算済みの単一boolean（表示条件の判定ロジックをTopView側で重複させない）。
+    lightingAreas = [],
+    showLightingAreas = false,
+    selectedLightingAreaId = null,
+    onSelectLightingArea,
+    onLightingAreaDrag,
+    onLightingAreaDragStart,
+    onLightingAreaDragEnd,
+    // Area resize v1・J章：リサイズハンドルのライブ更新用コールバック(areaId, "width"|"height", value)。
+    // Undo履歴の確定自体はonLightingAreaDragEnd（既存のendWorkBatch）をそのまま再利用する
+    // （move/resizeで別々のバッチ機構を作らない）。
+    onLightingAreaResize,
   },
   ref
 ) {
@@ -3678,6 +3857,59 @@ const TopView = forwardRef(function TopView(
     onDragStart();
   };
 
+  // Lighting Area v1・O章：Area本体のドラッグ移動。出演者ドラッグ（handlePointerDown）と
+  // 全く同じdragStateステートマシン・同じonDragStart/onDragEnd（beginWorkBatch/endWorkBatch）
+  // を再利用する（Area専用のUndoシステムは作らない＝S章）。stopPropagationにより、Area上での
+  // pointerDownが背景pan/矩形選択・出演者ドラッグへ伝播しないようにする（O章の要件）。
+  const handleLightingAreaPointerDown = (e, areaId) => {
+    e.stopPropagation();
+    if (locked) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    svg.setPointerCapture(e.pointerId);
+    const area = lightingAreas.find((a) => a.id === areaId);
+    if (!area) return;
+    onSelectLightingArea && onSelectLightingArea(areaId);
+    const loc = clientToContentPoint(e.clientX, e.clientY);
+    const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
+    dragState.current = {
+      mode: "lightingArea",
+      pointerId: e.pointerId,
+      areaId,
+      initialArea: { x: area.x, y: area.y },
+      anchorStart,
+      moved: false,
+    };
+    onLightingAreaDragStart && onLightingAreaDragStart();
+  };
+
+  // Area resize v1・J・L章：既存のlightingArea move用dragStateステートマシンへ
+  // "lightingAreaResize" モードを追加するだけで、専用のpointer systemは新設しない。
+  // stopPropagationで、ハンドルを掴んだ時にArea本体move・出演者drag・背景panが同時発火しない
+  // ようにする（L章の要件）。
+  const handleLightingAreaResizeHandlePointerDown = (e, areaId, dir) => {
+    e.stopPropagation();
+    if (locked) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    svg.setPointerCapture(e.pointerId);
+    const area = lightingAreas.find((a) => a.id === areaId);
+    if (!area) return;
+    onSelectLightingArea && onSelectLightingArea(areaId);
+    const loc = clientToContentPoint(e.clientX, e.clientY);
+    const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
+    dragState.current = {
+      mode: "lightingAreaResize",
+      pointerId: e.pointerId,
+      areaId,
+      dir,
+      initialArea: { shape: area.shape, width: area.width, height: area.height },
+      anchorStart,
+      moved: false,
+    };
+    onLightingAreaDragStart && onLightingAreaDragStart();
+  };
+
   const handlePointerMove = (e) => {
     const st = dragState.current;
     if (!st || st.pointerId !== e.pointerId) return;
@@ -3725,6 +3957,50 @@ const TopView = forwardRef(function TopView(
         return { performerId, x: snapHalf(init.x + dx), y: snapHalf(init.y + dy) };
       });
       onWaypointDrag(st.fromSlideId, updates);
+      return;
+    }
+
+    if (st.mode === "lightingArea") {
+      // Lighting Area v1・O章：出演者ドラッグと同じ「アンカーからの連続移動量」方式。
+      // Areaは0.5単位スナップを強制しない（出演者ほど厳密な整列を必要としないため、
+      // より自由な微調整ができるようにする）。舞台範囲外へも制限なく移動できる
+      // （出演者ドラッグと同様、境界チェックは行わない＝既存方針を踏襲）。
+      const loc = clientToContentPoint(e.clientX, e.clientY);
+      if (!loc) return;
+      const curX = fromScreenX(loc.x);
+      const curY = fromScreenY(loc.y);
+      const dx = curX - st.anchorStart.x;
+      const dy = curY - st.anchorStart.y;
+      if (!st.moved && (Math.abs(dx) > 0.02 || Math.abs(dy) > 0.02)) st.moved = true;
+      if (!st.moved) return;
+      onLightingAreaDrag && onLightingAreaDrag(st.areaId, st.initialArea.x + dx, st.initialArea.y + dy);
+      return;
+    }
+
+    if (st.mode === "lightingAreaResize") {
+      // Area resize v1・F・G章：既存のscreen→stage座標変換（clientToContentPoint +
+      // fromScreenX/fromScreenY）をそのまま再利用し、リサイズ専用の座標変換は作らない。
+      // 中心x/yは固定したまま（G章）、掴んだ辺の方向（dir）に応じてwidth/heightだけを
+      // 「アンカーからの連続移動量の2倍」で増減させる（中心固定のまま片側を伸ばすと、
+      // その反対側も同じだけ動くのと数学的に同じ＝全体の増分は2倍になる）。
+      const loc = clientToContentPoint(e.clientX, e.clientY);
+      if (!loc) return;
+      const curX = fromScreenX(loc.x);
+      const curY = fromScreenY(loc.y);
+      const dx = curX - st.anchorStart.x;
+      const dy = curY - st.anchorStart.y;
+      if (!st.moved && (Math.abs(dx) > 0.02 || Math.abs(dy) > 0.02)) st.moved = true;
+      if (!st.moved) return;
+      const { dir, initialArea } = st;
+      if (initialArea.shape === "circle") {
+        // D章：円は右側1ハンドルのみ。水平方向の移動量だけでwidth/height（同値）を決める。
+        onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width + 2 * dx);
+        return;
+      }
+      if (dir === "e") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width + 2 * dx);
+      else if (dir === "w") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width - 2 * dx);
+      else if (dir === "s") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height + 2 * dy);
+      else if (dir === "n") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height - 2 * dy);
       return;
     }
 
@@ -3780,6 +4056,20 @@ const TopView = forwardRef(function TopView(
       // ドラッグ終了＝履歴のバッチ確定。動いていなければ present が baseline のままなので、
       // endBatch側で自動的に履歴は増えない（出演者ドラッグと同じ挙動）。
       onDragEnd();
+      return;
+    }
+
+    if (st.mode === "lightingArea") {
+      dragState.current = null;
+      onLightingAreaDragEnd && onLightingAreaDragEnd();
+      return;
+    }
+
+    if (st.mode === "lightingAreaResize") {
+      dragState.current = null;
+      // ドラッグ終了＝履歴のバッチ確定（K章：1回のリサイズドラッグ＝Undo履歴1件）。
+      // move用と同じonLightingAreaDragEnd（既存のendWorkBatch）をそのまま再利用する。
+      onLightingAreaDragEnd && onLightingAreaDragEnd();
       return;
     }
 
@@ -4032,6 +4322,60 @@ const TopView = forwardRef(function TopView(
             );
           })()}
         </g>
+
+        {/* Lighting Area v1・M章：照明Areaレイヤー。描画順は「stage floor/grid → Lighting Area →
+            transition trajectory → performers」（M章）。showLightingAreasはApp側で
+            lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled
+            を判定済みのbooleanのため、ここでは条件判定ロジックを重複させない。平面図はArea編集
+            可能ビュー（C章）のため、各Areaにpointer downハンドラを付ける。 */}
+        {showLightingAreas && (
+          <g>
+            {lightingAreas.map((area) => {
+              const stagePoints = getLightingAreaStagePoints(area);
+              if (stagePoints.length === 0) return null;
+              const pointsAttr = stagePoints.map((p) => `${toScreenX(p.x)},${toScreenY(p.y)}`).join(" ");
+              const isSelected = area.id === selectedLightingAreaId;
+              const fillColor = lightingAreaColorHex(area.color);
+              return (
+                <polygon
+                  key={area.id}
+                  points={pointsAttr}
+                  fill={fillColor}
+                  fillOpacity={lightingAreaFillOpacity(area.intensity)}
+                  stroke={isSelected ? THEME.accent : fillColor}
+                  strokeOpacity={isSelected ? 0.9 : 0.5}
+                  strokeWidth={isSelected ? 2.5 : 1}
+                  style={{ cursor: locked ? "default" : "move" }}
+                  onPointerDown={(e) => handleLightingAreaPointerDown(e, area.id)}
+                />
+              );
+            })}
+
+            {/* Area resize v1・C章：選択中Areaだけにリサイズハンドルを表示する。出演者・
+                waypointのハンドルと混同しないよう、塗り=THEME.accent・縁=THEME.bgの小さい丸に
+                する（E章）。ハンドル半径はperformerマーカーと同じsizeComp（zoom<1時のみ拡大）
+                で、極端に小さくならないようにする（E章。新しい複雑なCSSシステムは作らない）。 */}
+            {(() => {
+              const selectedArea = lightingAreas.find((a) => a.id === selectedLightingAreaId);
+              if (!selectedArea) return null;
+              const handles = getLightingAreaResizeHandles(selectedArea);
+              const handleRadius = 6 * sizeComp;
+              return handles.map((h) => (
+                <circle
+                  key={h.dir}
+                  cx={toScreenX(h.x)}
+                  cy={toScreenY(h.y)}
+                  r={handleRadius}
+                  fill={THEME.accent}
+                  stroke={THEME.bg}
+                  strokeWidth={1.5}
+                  style={{ cursor: locked ? "default" : h.cursor }}
+                  onPointerDown={(e) => handleLightingAreaResizeHandlePointerDown(e, selectedArea.id, h.dir)}
+                />
+              ));
+            })()}
+          </g>
+        )}
 
         {/* 移動軌跡（表示専用レイヤー）：出演者より背面・非インタラクティブに描画する。
             transitionPaths は App 側で computeTransitionPaths により毎回計算し直された
@@ -5759,6 +6103,9 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     // Lighting UI整理 v1・H章：俯瞰客席ビューの「舞台の周囲・背景」に反映する壁・背景色。
     // 物理的な壁オブジェクトは追加せず、viewBox全体を覆う背景矩形の色として扱う。
     backdropColorKey = "black",
+    // Lighting Area v1・W章：俯瞰客席ビューは表示専用（編集・ドラッグ・選択は平面図のみ＝C章）。
+    lightingAreas = [],
+    showLightingAreas = false,
   },
   ref
 ) {
@@ -6092,6 +6439,35 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
           />
         </g>
 
+        {/* Lighting Area v1・W章：照明Areaレイヤー（表示専用。編集・ドラッグ・選択は平面図のみ
+            ＝C章）。Areaの舞台座標上の頂点（getLightingAreaStagePoints、TopViewと共通のpure
+            helper＝X章）を、既存のproject()（projectAudiencePoint）へそのまま通すことで、
+            矩形は4隅のpolygon、円・楕円は多角形近似のpolygonとして、舞台床に沿って見えるように
+            投影する（W章の要件：単なるscreen上の円ではなく、舞台床上に置かれているように見える
+            こと）。投影計算・画角・出演者位置・待機エリア・目盛り・舞台台形・ラベルには
+            一切手を加えていない。 */}
+        {showLightingAreas && (
+          <g pointerEvents="none" style={{ userSelect: "none", WebkitUserSelect: "none" }}>
+            {lightingAreas.map((area) => {
+              const stagePoints = getLightingAreaStagePoints(area);
+              if (stagePoints.length === 0) return null;
+              const pointsAttr = stagePoints.map((p) => project(p.x, p.y)).map((sp) => `${sp.sx},${sp.sy}`).join(" ");
+              const fillColor = lightingAreaColorHex(area.color);
+              return (
+                <polygon
+                  key={area.id}
+                  points={pointsAttr}
+                  fill={fillColor}
+                  fillOpacity={lightingAreaFillOpacity(area.intensity)}
+                  stroke={fillColor}
+                  strokeOpacity={0.5}
+                  strokeWidth={1}
+                />
+              );
+            })}
+          </g>
+        )}
+
         {/* 移動軌跡（表示専用レイヤー）：人物本体より背面・非インタラクティブに描画する。
             平面図と同じ transitionPaths（App側でcomputeTransitionPathsにより毎回計算し直された
             「開始→終了」の経路・表示専用情報）を、このビュー独自の疑似遠近法project()で
@@ -6394,6 +6770,10 @@ export default function App() {
   // 「照明データは残すが舞台上の照明表示だけ一時的に消す」ためのもの。今回はまだArea/Beamを
   // 描画しないため実際の表示への影響はほぼ無いが、将来の描画基盤として用意しておく。
   const [showLighting, setShowLighting] = useState(true);
+  // Lighting Area v1・L章：現在選択中のLighting Area（UI専用state、作品データではない）。
+  // Formation切替・Scene削除・Area削除等で存在しなくなった場合は下のuseEffectで自動的に
+  // クリアする（selectedIds＝出演者選択の既存クリーンアップと同じ考え方）。
+  const [selectedLightingAreaId, setSelectedLightingAreaId] = useState(null);
   // 「？ 操作方法」パネルの開閉状態。表示のON/OFFだけの一時的なUI stateであり、
   // 作品データ（work）には含めないため履歴（Undo/Redo）の対象外。初期状態は閉じておく。
   const [helpOpen, setHelpOpen] = useState(false);
@@ -7146,6 +7526,18 @@ export default function App() {
 
   // Lighting v0・O章：現在のFormationに対応するLighting Scene（0〜1個）。
   const currentLightingScene = findLightingSceneBySlideId(lightingScenes, currentSlide.id);
+  // Lighting Area v1・G章：現在のSceneが持つArea一覧（Sceneが無ければ常に空配列）。
+  const currentLightingAreas = getLightingAreas(currentLightingScene);
+  const selectedLightingArea = currentLightingAreas.find((a) => a.id === selectedLightingAreaId) || null;
+
+  // Lighting Area v1・L章：Formation切替・Scene削除・Area削除等で選択中Areaが存在しなくなった
+  // 場合、selectedIds（出演者選択）のクリーンアップと全く同じ考え方で自動的にクリアする。
+  useEffect(() => {
+    if (selectedLightingAreaId && !currentLightingAreas.some((a) => a.id === selectedLightingAreaId)) {
+      setSelectedLightingAreaId(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingAreaId, currentLightingAreas]);
 
   // ステージ下部に表示する「現在の順番 / 全構成数　構成名」用のラベル。
   // 桁数はslides.lengthに合わせて自動調整し、最低2桁でゼロ埋めする（100構成以上でも自然に3桁になる）。
@@ -9461,6 +9853,143 @@ export default function App() {
     [updateWorkLive]
   );
 
+  // ------------------------------------------------------------------
+  // Lighting Area v1・G〜S章：現在のFormationのSceneに対するArea追加・削除・編集
+  // ------------------------------------------------------------------
+  // G章：現在のFormationにSceneが無い場合は何もしない（Scene→Areaという親子関係を維持し、
+  // Areaだけが宙に浮いた状態を作らない）。新規Areaはcreate DefaultLightingArea()で
+  // 「舞台中央付近・stage sizeに応じてclamp済み」のdefault値を持つ（H章）。
+  const addLightingAreaForCurrentScene = useCallback(() => {
+    commitWork((prev) => {
+      const slide = prev.slides[prev.currentSlideIndex];
+      if (!slide) return prev;
+      const scenes = getLightingScenes(prev);
+      const scene = findLightingSceneBySlideId(scenes, slide.id);
+      if (!scene) return prev; // Sceneが無ければ追加しない（G章）
+      const newArea = createDefaultLightingArea(prev.stage);
+      const nextAreas = [...getLightingAreas(scene), newArea];
+      const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, areas: nextAreas } : sc));
+      return { ...prev, lightingScenes: nextScenes };
+    });
+  }, [commitWork]);
+
+  // Area削除（U章：Scene削除・Formation削除時の孤児処理は既存のScene/Slide削除フローに
+  // 委ねるため、ここでは「単体Area削除」だけを扱う）。
+  const deleteLightingArea = useCallback(
+    (areaId) => {
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, slide.id);
+        if (!scene) return prev;
+        const nextAreas = getLightingAreas(scene).filter((a) => a.id !== areaId);
+        if (nextAreas.length === getLightingAreas(scene).length) return prev;
+        const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, areas: nextAreas } : sc));
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [commitWork]
+  );
+
+  // shape / color / intensity：ボタン選択のみのUIのため即1件のcommit。
+  const setLightingAreaShapeCommit = useCallback(
+    (areaId, shape) => {
+      if (!LIGHTING_AREA_SHAPES.includes(shape)) return;
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        // I章：circleの場合はwidth/heightを同じ値に揃える（既存widthを両軸へコピー）。
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
+          shape === "circle" ? { shape, height: a.width } : { shape }
+        );
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [commitWork]
+  );
+  const setLightingAreaColorCommit = useCallback(
+    (areaId, colorKey) => {
+      if (!LIGHTING_AREA_COLOR_KEYS.includes(colorKey)) return;
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { color: colorKey });
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [commitWork]
+  );
+  const setLightingAreaIntensityCommit = useCallback(
+    (areaId, intensity) => {
+      const clamped = clamp(Number(intensity), 0, 1);
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { intensity: clamped });
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [commitWork]
+  );
+
+  // width / height（サイドバーの数値/＋−操作。P章：v1ではドラッグリサイズは実装しない）。
+  // I章：circleの場合はwidth/heightどちらを変更しても両方同じ値へ更新する。
+  const setLightingAreaSizeCommit = useCallback(
+    (areaId, dimension, value) => {
+      const clamped = clamp(Number(value), LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE);
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
+          a.shape === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
+        );
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [commitWork]
+  );
+
+  // Area本体のドラッグ移動（O章）。出演者drag（dragGroup/updateSlidePlacementsLive）と同じ
+  // 「ドラッグ中はupdateWorkLiveで見た目だけ更新し、pointer up時に呼び出し側がendWorkBatchで
+  // 1件の履歴に確定する」パターンをそのまま再利用する（Area専用のUndoシステムは作らない＝S章）。
+  // begin/end自体は既存のhandleDragStart/handleDragEnd（beginWorkBatch/endWorkBatch）を
+  // そのままAreaドラッグにも流用する（work全体を対象にした汎用バッチのため、出演者drag専用に
+  // 限定されていない）。
+  const updateLightingAreaPositionLive = useCallback(
+    (areaId, x, y) => {
+      updateWorkLive((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { x, y });
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [updateWorkLive]
+  );
+
+  // Area resize v1・K・N章：リサイズハンドルのドラッグ中に呼ばれるlive版。position dragの
+  // updateLightingAreaPositionLiveと全く同じ「updateWorkLiveで見た目だけ更新し、pointer up時に
+  // TopView側のonLightingAreaDragEnd（既存のendWorkBatch）で1件の履歴に確定する」パターンを
+  // 再利用する（Resize専用のUndoシステムは作らない＝K章）。clamp・circle時のwidth/height同期は
+  // サイドバーのsetLightingAreaSizeCommit（commit版）と全く同じロジックにし、
+  // Area.width/Area.heightだけが唯一のsource of truthになるようにする（N章：別のresize
+  // stateへサイズを保存しない）。
+  const updateLightingAreaSizeLive = useCallback(
+    (areaId, dimension, value) => {
+      const clamped = clamp(Number(value), LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE);
+      updateWorkLive((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
+          a.shape === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
+        );
+        return { ...prev, lightingScenes: nextScenes };
+      });
+    },
+    [updateWorkLive]
+  );
+
   // ---- BPM（プロジェクト全体で共通の値。slideごとの値ではない） ----
   // ＋／－ボタン・DraftNumberFieldのblur/Enter確定、どちらもこの1つの関数を呼ぶだけで
   // 即1件のcommit＝1件のUndo履歴になる（20章）。入力操作の改善v2でDraftNumberField側が
@@ -11443,6 +11972,14 @@ export default function App() {
                 waypointHandle={waypointHandle}
                 onWaypointDrag={updateWaypointLive}
                 floorColorKey={stageAppearance.floorColor}
+                lightingAreas={currentLightingAreas}
+                showLightingAreas={!!(lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled)}
+                selectedLightingAreaId={selectedLightingAreaId}
+                onSelectLightingArea={setSelectedLightingAreaId}
+                onLightingAreaDrag={updateLightingAreaPositionLive}
+                onLightingAreaResize={updateLightingAreaSizeLive}
+                onLightingAreaDragStart={handleDragStart}
+                onLightingAreaDragEnd={handleDragEnd}
               />
             ) : (
               <OverheadAudienceView
@@ -11464,6 +12001,8 @@ export default function App() {
                 transitionPaths={transitionPaths}
                 floorColorKey={stageAppearance.floorColor}
                 backdropColorKey={stageAppearance.backdropColor}
+                lightingAreas={currentLightingAreas}
+                showLightingAreas={!!(lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled)}
               />
             )}
 
@@ -12883,8 +13422,201 @@ export default function App() {
                         className="w-full rounded px-2 py-1.5 text-xs resize-y"
                       />
                     </div>
+
+                    {/* Lighting Area v1・Q章：Area一覧＋選択中Areaの設定。Scene→Areaという
+                        親子関係のため、Sceneがある場合だけこのブロックが現れる（G章）。 */}
+                    <div style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 10 }}>
+                      <div style={{ color: THEME.textDim }} className="text-xs mb-1">照明エリア</div>
+                      {currentLightingAreas.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {currentLightingAreas.map((area, idx) => (
+                            <button
+                              key={area.id}
+                              type="button"
+                              onClick={() => setSelectedLightingAreaId(area.id)}
+                              style={{
+                                background: area.id === selectedLightingAreaId ? THEME.panelBg2 : "transparent",
+                                border: `1px solid ${area.id === selectedLightingAreaId ? THEME.accent : THEME.border}`,
+                                color: THEME.text,
+                              }}
+                              className="rounded-lg px-2 py-1 text-xs"
+                            >
+                              照明エリア {idx + 1}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={addLightingAreaForCurrentScene}
+                        style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                        className="w-full rounded-lg py-1.5 text-xs font-bold"
+                      >
+                        ＋ 照明エリアを追加
+                      </button>
+
+                      {selectedLightingArea && (
+                        <div className="flex flex-col gap-2 mt-2">
+                          <div>
+                            <div style={{ color: THEME.textDim }} className="text-xs mb-1">形</div>
+                            <div className="flex gap-1.5">
+                              {LIGHTING_AREA_SHAPES.map((shapeKey) => (
+                                <button
+                                  key={shapeKey}
+                                  type="button"
+                                  onClick={() => setLightingAreaShapeCommit(selectedLightingArea.id, shapeKey)}
+                                  style={{
+                                    background: selectedLightingArea.shape === shapeKey ? THEME.panelBg2 : "transparent",
+                                    border: `1px solid ${selectedLightingArea.shape === shapeKey ? THEME.accent : THEME.border}`,
+                                    color: THEME.text,
+                                  }}
+                                  className="flex-1 rounded-lg py-1 text-xs"
+                                >
+                                  {LIGHTING_AREA_SHAPE_LABELS[shapeKey]}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div>
+                            <div style={{ color: THEME.textDim }} className="text-xs mb-1">色</div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {LIGHTING_AREA_COLOR_KEYS.map((colorKey) => (
+                                <button
+                                  key={colorKey}
+                                  type="button"
+                                  onClick={() => setLightingAreaColorCommit(selectedLightingArea.id, colorKey)}
+                                  title={LIGHTING_AREA_COLOR_LABELS[colorKey]}
+                                  aria-label={`照明エリアの色を${LIGHTING_AREA_COLOR_LABELS[colorKey]}にする`}
+                                  style={{
+                                    width: 26,
+                                    height: 26,
+                                    borderRadius: 6,
+                                    background: LIGHTING_AREA_COLOR_PRESETS[colorKey],
+                                    border:
+                                      selectedLightingArea.color === colorKey
+                                        ? `2px solid ${THEME.accent}`
+                                        : `1px solid ${THEME.border}`,
+                                    boxShadow: selectedLightingArea.color === colorKey ? `0 0 0 2px ${THEME.panelBg}` : "none",
+                                    cursor: "pointer",
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-col gap-2">
+                            <div style={{ color: THEME.textDim }} className="text-xs">位置（平面図上でドラッグしても移動できます）</div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="X"
+                                value={selectedLightingArea.x}
+                                min={-halfW}
+                                max={halfW}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) =>
+                                  commitWork((prev) => {
+                                    const slide = prev.slides[prev.currentSlideIndex];
+                                    if (!slide) return prev;
+                                    const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, selectedLightingArea.id, {
+                                      x: clamp(Number(v), -prev.stage.width / 2, prev.stage.width / 2),
+                                    });
+                                    return { ...prev, lightingScenes: nextScenes };
+                                  })
+                                }
+                              />
+                              <DraftNumberField
+                                label="Y"
+                                value={selectedLightingArea.y}
+                                min={0}
+                                max={stage.depth}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) =>
+                                  commitWork((prev) => {
+                                    const slide = prev.slides[prev.currentSlideIndex];
+                                    if (!slide) return prev;
+                                    const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, selectedLightingArea.id, {
+                                      y: clamp(Number(v), 0, prev.stage.depth),
+                                    });
+                                    return { ...prev, lightingScenes: nextScenes };
+                                  })
+                                }
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex flex-col gap-2">
+                            <div style={{ color: THEME.textDim }} className="text-xs">
+                              サイズ{selectedLightingArea.shape === "circle" ? "（円は幅＝奥行き）" : ""}
+                            </div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="幅"
+                                value={selectedLightingArea.width}
+                                min={LIGHTING_AREA_MIN_SIZE}
+                                max={LIGHTING_AREA_MAX_SIZE}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) => setLightingAreaSizeCommit(selectedLightingArea.id, "width", v)}
+                              />
+                              <DraftNumberField
+                                label="奥行き"
+                                value={selectedLightingArea.height}
+                                min={LIGHTING_AREA_MIN_SIZE}
+                                max={LIGHTING_AREA_MAX_SIZE}
+                                step={0.5}
+                                allowDecimal
+                                disabled={selectedLightingArea.shape === "circle"}
+                                onCommit={(v) => setLightingAreaSizeCommit(selectedLightingArea.id, "height", v)}
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <div style={{ color: THEME.textDim }} className="text-xs mb-1">明るさ</div>
+                            <div className="flex gap-1.5">
+                              {[0, 0.25, 0.5, 0.75, 1].map((v) => (
+                                <button
+                                  key={v}
+                                  type="button"
+                                  onClick={() => setLightingAreaIntensityCommit(selectedLightingArea.id, v)}
+                                  style={{
+                                    background:
+                                      Math.abs((selectedLightingArea.intensity ?? DEFAULT_LIGHTING_AREA_INTENSITY) - v) < 0.001
+                                        ? THEME.panelBg2
+                                        : "transparent",
+                                    border: `1px solid ${
+                                      Math.abs((selectedLightingArea.intensity ?? DEFAULT_LIGHTING_AREA_INTENSITY) - v) < 0.001
+                                        ? THEME.accent
+                                        : THEME.border
+                                    }`,
+                                    color: THEME.text,
+                                  }}
+                                  className="flex-1 rounded-lg py-1 text-xs"
+                                >
+                                  {Math.round(v * 100)}%
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => deleteLightingArea(selectedLightingArea.id)}
+                            style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                            className="rounded-lg py-1.5 text-xs font-bold"
+                          >
+                            この照明エリアを削除
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
                     <button
                       type="button"
+
                       onClick={() => deleteLightingScene(currentLightingScene.id)}
                       style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
                       className="rounded-lg py-1.5 text-xs font-bold"
@@ -13769,6 +14501,7 @@ function DraftNumberField({ label, value, min, max, step, allowDecimal = false, 
           inputMode={allowDecimal ? "decimal" : "numeric"}
           value={displayValue}
           disabled={disabled}
+          aria-label={label || undefined}
           onFocus={handleFocus}
           onChange={handleChange}
           onBlur={handleBlur}

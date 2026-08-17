@@ -326,7 +326,6 @@ test.describe("Lighting Area v1", () => {
     // aria-label="構成メニュー（複製・コピー・貼り付け・削除）"）→「複製」。
     // この時点では構成は1枚しか存在しないため、このaria-labelを持つボタンは1つだけのはず。
     // 既存Lightingテストで安定している同一Project内コピー経路を再利用する。
-    // 構成一覧のメニュー操作ではなく、Meta+C → Meta+V を使う。
     await page.keyboard.press("Meta+c");
     await page.keyboard.press("Meta+v");
 

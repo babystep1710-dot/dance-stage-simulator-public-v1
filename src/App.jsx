@@ -4797,6 +4797,10 @@ function buildFormationExportModel({
   stageAppearance, // Export舞台色反映 v1：Projectごとの舞台外観（floorColor/backdropColor）。
   // performerDisplayScaleと同じ考え方で、Project全体の値をExport Modelにもそのまま含める
   // （getStageAppearance()側で既にfallback済みの値がここへ渡ってくる想定）。
+  lightingEnabled, // Lighting Area Export v1：work.project.lightingEnabled（getLightingEnabled()で
+  // 既にfallback済みの値が渡ってくる想定）。
+  lightingScenes, // Lighting Area Export v1：work.lightingScenes（getLightingScenes()で
+  // 既にfallback済みの配列が渡ってくる想定）。
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
@@ -4850,6 +4854,18 @@ function buildFormationExportModel({
     // Export舞台色反映 v1：未指定（呼び出し元が省略した場合）でも安全に黒へフォールバックする
     // （既存getStageAppearance()と同じdefault値。ここで新しい判定ロジックは作らない）。
     stageAppearance: stageAppearance || DEFAULT_STAGE_APPEARANCE,
+    // Lighting Area Export v1・D〜H章：Export条件（lightingEnabled && 対象SceneのScene.enabled）を
+    // ここで一度だけ判定し、条件を満たす場合のみそのSceneのarea一覧をそのまま格納する。
+    // showLighting（編集画面専用UI state）はここでは一切参照しない（D章）。条件を満たさない
+    // 場合は常に空配列にしておくことで、renderer側は「lightingAreas.length > 0か」だけを
+    // 見ればよく、Lighting ON/OFF・Scene enabled判定をrenderer側で再実装しない
+    // （findLightingSceneBySlideId・getLightingAreasという既存helperをそのまま再利用＝AD章）。
+    lightingAreas: (() => {
+      if (!lightingEnabled) return [];
+      const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
+      if (!scene || !scene.enabled) return [];
+      return getLightingAreas(scene);
+    })(),
   };
 }
 
@@ -4878,6 +4894,8 @@ function buildFormationExportModels({
   performerDisplayScale,
   showMusicTime, // Export音楽位置・音源内時間 v1：buildFormationExportModelへそのまま伝播するだけ
   stageAppearance, // Export舞台色反映 v1：buildFormationExportModelへそのまま伝播するだけ
+  lightingEnabled, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
+  lightingScenes, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -4902,6 +4920,8 @@ function buildFormationExportModels({
         performerDisplayScale,
         showMusicTime,
         stageAppearance,
+        lightingEnabled,
+        lightingScenes,
       })
     )
     .filter((m) => m !== null);
@@ -5299,6 +5319,36 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     ctx.globalAlpha = 1;
   }
 
+  // Lighting Area Export v1・I・J・K章：出演者・軌跡より先（＝出演者より下のレイヤー）に描く。
+  // model.lightingAreasはbuildFormationExportModel側で既にLighting ON/OFF・Scene enabled判定
+  // 済みの配列（条件を満たさない場合は常に[]）なので、ここでは条件判定を一切行わず、
+  // 「配列を描くだけ」にする。編集画面のTopViewと全く同じgetLightingAreaStagePoints()で
+  // 舞台座標上の頂点列を取得し、既存のtoX/toY（Export用stage→canvas変換）へそのまま通す
+  // （Area専用の座標変換・別のshape計算は一切作らない＝J・K章）。色・opacityも編集画面と
+  // 同じlightingAreaColorHex()・lightingAreaFillOpacity()を再利用する（N・O章）。
+  // 選択中outline・resize handle等の編集専用UIはここに一切描かない（Q章）。
+  if (model.lightingAreas && model.lightingAreas.length > 0) {
+    ctx.save();
+    model.lightingAreas.forEach((area) => {
+      const stagePoints = getLightingAreaStagePoints(area);
+      if (stagePoints.length === 0) return;
+      ctx.beginPath();
+      stagePoints.forEach((p, i) => {
+        const sx = toX(p.x);
+        const sy = toY(p.y);
+        if (i === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = lightingAreaColorHex(area.color);
+      ctx.globalAlpha = lightingAreaFillOpacity(area.intensity);
+      ctx.fill();
+    });
+    // P章：save/restoreで囲むことで、globalAlphaが後続の軌跡・出演者・ラベル描画へ
+    // 絶対に漏れないようにする。
+    ctx.restore();
+  }
+
   // 可視出演者（PART B・11・12・13・14章：showWaitingAreasに応じてここでフィルタする。
   // buildFormationExportModel()自体は常に全出演者を返すため、「何を見せるか」の判断は
   // このrenderer側に一本化されている＝v1.1バグの再発防止）。
@@ -5649,6 +5699,34 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
     ctx.lineTo(c.sx, c.sy + 9);
     ctx.stroke();
     ctx.globalAlpha = 1;
+  }
+
+  // Lighting Area Export v1・L・M章：出演者・軌跡より先（＝出演者より下のレイヤー）に描く。
+  // model.lightingAreasは平面図Exportと全く同じ既にLighting ON/OFF・Scene enabled判定済みの
+  // 配列（buildFormationExportModel側で共通に算出）なので、ここでも条件判定は一切行わない。
+  // 編集画面のOverheadAudienceViewと全く同じgetLightingAreaStagePoints()で舞台座標上の
+  // 頂点列を取得し、このrenderer既存のproject()（projectAudiencePoint＋Canvas fit変換の
+  // ラッパー、上のstageFrontLeft等と全く同じ関数）へそのまま通して投影する（M章：Areaだけ
+  // 別の遠近法にしない）。色・opacityは平面図Exportと同じcolor/opacity helperを再利用する。
+  if (model.lightingAreas && model.lightingAreas.length > 0) {
+    ctx.save();
+    model.lightingAreas.forEach((area) => {
+      const stagePoints = getLightingAreaStagePoints(area);
+      if (stagePoints.length === 0) return;
+      ctx.beginPath();
+      stagePoints.forEach((p, i) => {
+        const sp = project(p.x, p.y);
+        if (i === 0) ctx.moveTo(sp.sx, sp.sy);
+        else ctx.lineTo(sp.sx, sp.sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = lightingAreaColorHex(area.color);
+      ctx.globalAlpha = lightingAreaFillOpacity(area.intensity);
+      ctx.fill();
+    });
+    // P章：save/restoreで囲むことで、globalAlphaが後続の軌跡・出演者・ラベル描画へ
+    // 絶対に漏れないようにする。
+    ctx.restore();
   }
 
   // 可視出演者・可視軌跡（PART B・14章と同じisPerformerVisibleForExport()を再利用。
@@ -9551,6 +9629,8 @@ export default function App() {
         performerDisplayScale,
         showMusicTime: exportShowMusicTime,
         stageAppearance,
+        lightingEnabled,
+        lightingScenes,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");
@@ -9668,6 +9748,8 @@ export default function App() {
     performerDisplayScale,
     exportFormat,
     activeProject.name,
+    lightingEnabled,
+    lightingScenes,
   ]);
 
 

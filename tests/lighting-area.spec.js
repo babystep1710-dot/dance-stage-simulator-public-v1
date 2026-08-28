@@ -50,8 +50,12 @@ function currentSceneSection(page) {
 }
 
 // 「照明の設定」内の「照明機能を使う」をONにする。
+// 旧「照明機能を使う」（Project-level lightingEnabled）checkboxは、Lighting UI整理・
+// Prototype卒業により正式UIから削除された。Lighting Scene追加UIは常に表示されるため、
+// このhelperはもう何もする必要がない（no-op）。呼び出し側のテスト本体を個別に書き換えず
+// 済むよう、関数自体は残してある。
 async function enableLighting(page) {
-  await page.getByLabel("照明機能を使う").check();
+  // no-op：Project全体の「照明機能を使う」は正式UIから削除済み。
 }
 
 // 現在のFormationにLighting Sceneを追加する（未追加の場合のみ有効なボタンが表示される）。
@@ -95,12 +99,13 @@ test.describe("Lighting Area v1", () => {
     // 「照明エリア 1」が一覧に表示される
     await expect(section.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
 
-    // Area設定UI一式が表示される（exact:trueで「矩形」ボタン等との部分一致を避ける）
+    // Area設定UI一式が表示される（exact:trueで念のため部分一致を避ける。矩形ボタンは
+    // Lighting Area整理v1で削除済みのため、以前あった「形」と「矩形」の衝突は解消済み）
     await expect(section.getByText("形", { exact: true })).toBeVisible();
     await expect(section.getByText("色", { exact: true })).toBeVisible();
     await expect(section.getByText("明るさ", { exact: true })).toBeVisible();
 
-    // shapeの初期値は「円」
+    // shapeの初期値は「円」（exact:trueで「楕円」との部分一致を避ける）
     await expect(section.getByRole("button", { name: "円", exact: true })).toBeVisible();
 
     // 色の初期値は「白」（スウォッチボタンが存在すること。選択状態そのものの視覚的な
@@ -145,22 +150,28 @@ test.describe("Lighting Area v1", () => {
   });
 
   // ------------------------------------------------------------------
-  // H. shape変更
+  // H. shape変更（Lighting Area整理 v1・B章：矩形はUIから削除し、円・楕円の2種類のみ）
   // ------------------------------------------------------------------
-  test("shapeを円→楕円→矩形へ変更できる", async ({ page }) => {
+  test("shapeは円→楕円へ変更できる", async ({ page }) => {
     await setupSceneWithOneArea(page);
     const section = currentSceneSection(page);
 
     await section.getByRole("button", { name: "楕円" }).click();
+    // 楕円へ変更後もArea設定UIが正常に残ること
     await expect(section.getByLabel("幅")).toBeVisible();
     await expect(section.getByLabel("奥行き")).toBeVisible();
-
-    await section.getByRole("button", { name: "矩形" }).click();
-    // 矩形へ変更後もArea設定UIが正常に残ること
-    await expect(section.getByLabel("幅")).toBeVisible();
-    await expect(section.getByLabel("奥行き")).toBeVisible();
-    // 矩形では「幅」「奥行き」が独立して編集可能（disabledでないこと）
+    // 楕円では「幅」「奥行き」が独立して編集可能（disabledでないこと）
     await expect(section.getByLabel("奥行き")).toBeEnabled();
+
+    // 円へ戻しても正常に動くこと（exact:trueで「楕円」との部分一致を避ける）
+    await section.getByRole("button", { name: "円", exact: true }).click();
+    await expect(section.getByLabel("奥行き")).toBeDisabled();
+  });
+
+  test("矩形ボタンが存在しない", async ({ page }) => {
+    await setupSceneWithOneArea(page);
+    const section = currentSceneSection(page);
+    await expect(section.getByRole("button", { name: "矩形" })).toHaveCount(0);
   });
 
   // ------------------------------------------------------------------
@@ -263,9 +274,11 @@ test.describe("Lighting Area v1", () => {
   });
 
   // ------------------------------------------------------------------
-  // M. Lighting OFF→ONでArea保持
+  // Lighting UI整理・Prototype卒業により、Project全体の「照明機能を使う」は正式UIから
+  // 削除された。旧「Lighting OFF→ON」テストの代わりに、新仕様の主要ON/OFFである
+  // 「この構成で照明を使用」（Scene.enabled）のOFF→ONでデータが保持されることを確認する。
   // ------------------------------------------------------------------
-  test("Lighting OFF→ONでもAreaのデータが保持される", async ({ page }) => {
+  test("この構成で照明を使用OFF→ONでもAreaのデータが保持される", async ({ page }) => {
     await setupSceneWithOneArea(page);
     const section = currentSceneSection(page);
     await section.getByRole("button", { name: "楕円" }).click();
@@ -274,36 +287,38 @@ test.describe("Lighting Area v1", () => {
     await widthInput.fill("7");
     await widthInput.blur();
 
-    // Lighting機能をOFF
-    await page.getByLabel("照明機能を使う").uncheck();
-    await expect(page.getByRole("button", { name: "照明エリア 1" })).toHaveCount(0);
+    // Scene（この構成で照明を使用）をOFF
+    await section.getByLabel("この構成で照明を使用").uncheck();
+
+    // Area一覧UI自体はScene.enabledの影響を受けず、引き続き表示・編集可能であること
+    // （Scene.enabledは「舞台上への表示」だけを左右し、サイドバーの編集UIは
+    // Sceneが存在する限り常に操作可能という既存仕様＝Q章）。
+    await expect(section.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
 
     // 再度ON
-    await page.getByLabel("照明機能を使う").check();
+    await section.getByLabel("この構成で照明を使用").check();
 
-    // Areaが再表示され、設定値も保持されていること
-    const sectionAfter = currentSceneSection(page);
-    await expect(sectionAfter.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
+    // Areaの設定値が保持されていること
     await selectArea(page, 1);
-    await expect(sectionAfter.getByRole("button", { name: "楕円" })).toBeVisible();
-    await expect(sectionAfter.getByLabel("幅")).toHaveValue(/7/);
+    await expect(section.getByRole("button", { name: "楕円" })).toBeVisible();
+    await expect(section.getByLabel("幅")).toHaveValue(/7/);
   });
 
   // ------------------------------------------------------------------
-  // N. showLighting OFF→ONでArea保持
+  // N. 照明を表示 OFF→ONでArea保持
   // ------------------------------------------------------------------
-  test("showLighting OFF→ONでもAreaのデータ・設定UIが保持される", async ({ page }) => {
+  test("照明を表示OFF→ONでもAreaのデータ・設定UIが保持される", async ({ page }) => {
     await setupSceneWithOneArea(page);
 
-    // 「舞台上に照明表示を出す」をOFF
-    await page.getByLabel("舞台上に照明表示を出す").uncheck();
+    // 「照明を表示」をOFF（旧「舞台上に照明表示を出す」からの改名）
+    await page.getByLabel("照明を表示").uncheck();
 
     // Area設定UI（サイドバー側）はデータ操作パネルなので、表示ON/OFFの影響を受けず
     // 引き続き操作可能であること
     await expect(page.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
 
     // 再度ON
-    await page.getByLabel("舞台上に照明表示を出す").check();
+    await page.getByLabel("照明を表示").check();
     await expect(page.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
   });
 
@@ -313,7 +328,7 @@ test.describe("Lighting Area v1", () => {
   test("同一Project内でFormationを複製するとLighting SceneとAreaも引き継がれる", async ({ page }) => {
     await setupSceneWithOneArea(page);
     const section = currentSceneSection(page);
-    await section.getByRole("button", { name: "矩形" }).click();
+    await section.getByRole("button", { name: "楕円" }).click();
     await section.getByRole("button", { name: "照明エリアの色を緑にする" }).click();
     const widthInput = section.getByLabel("幅");
     await widthInput.fill("8");
@@ -322,25 +337,19 @@ test.describe("Lighting Area v1", () => {
     await heightInput.fill("2");
     await heightInput.blur();
 
-    // 構成カード左上の「⋯」メニュー（SlideCardMenuButton、
-    // aria-label="構成メニュー（複製・コピー・貼り付け・削除）"）→「複製」。
-    // この時点では構成は1枚しか存在しないため、このaria-labelを持つボタンは1つだけのはず。
-    // 既存Lightingテストで安定している同一Project内コピー経路を再利用する。
+    // 構成一覧の「⋯」メニュー（構成メニュー）経由はモーダル描画待ちが絡み実機で
+    // timeoutしやすいため、既存の安定したキーボードショートカット経路
+    // （Ctrl/Cmd+C→Ctrl/Cmd+V、同一Project内貼り付け）を使う。pasteCopiedSlide()は
+    // 貼り付け後、currentSlideIndexを新しく貼り付けられた構成へ自動的に移動するため
+    // （duplicateSlideAt()とは異なり）、Meta+V直後にそのままコピー先の内容を確認できる。
     await page.keyboard.press("Meta+c");
     await page.keyboard.press("Meta+v");
-
-    // 重要：duplicateSlideAt()は複製後もcurrentSlideIndexを複製元のまま維持する仕様のため
-    // （新しく増えた構成が自動的に「現在の構成」にはならない）、コピー先を実際に確認するには
-    // 明示的に2番目の構成カードへ移動する必要がある。SlideCardのaria-labelは
-    // `${番号}番目の構成：${構成名}` という形式なので、構成名に依存しないよう正規表現で
-    // 先頭一致させる。
-    await page.getByRole("button", { name: /^2番目の構成/ }).click();
 
     // コピー先Formationでも Lighting Scene + Area が存在し、設定が引き継がれていること
     const copiedSection = currentSceneSection(page);
     await expect(copiedSection.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
     await selectArea(page, 1);
-    await expect(copiedSection.getByRole("button", { name: "矩形" })).toBeVisible();
+    await expect(copiedSection.getByRole("button", { name: "楕円" })).toBeVisible();
     await expect(copiedSection.getByLabel("幅")).toHaveValue(/8/);
     await expect(copiedSection.getByLabel("奥行き")).toHaveValue(/2/);
   });
@@ -390,13 +399,13 @@ test.describe("Lighting Area v1", () => {
 
   // ------------------------------------------------------------------
   // R. resize drag（実機確認済み。座標依存のE2Eは不安定なリスクがあるため、
-  //    ここでは「rect Areaのresize handleがDOM上に存在し、ドラッグでwidthが変わる」
+  //    ここでは「ellipse Areaのresize handleがDOM上に存在し、ドラッグでwidthが変わる」
   //    という軽量な確認に留める。不安定な場合はtest.skip()で構わない）。
   // ------------------------------------------------------------------
-  test("rect Areaのresize handleをドラッグするとwidthが変わる（不安定な場合はskip検討）", async ({ page }) => {
+  test("ellipse Areaのresize handleをドラッグするとwidthが変わる（不安定な場合はskip検討）", async ({ page }) => {
     await setupSceneWithOneArea(page);
     const section = currentSceneSection(page);
-    await section.getByRole("button", { name: "矩形" }).click();
+    await section.getByRole("button", { name: "楕円" }).click();
 
     const widthInput = section.getByLabel("幅");
     const before = await widthInput.inputValue();

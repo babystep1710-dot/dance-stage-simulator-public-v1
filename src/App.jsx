@@ -221,8 +221,11 @@ function findLightingSceneBySlideId(lightingScenes, slideId) {
 // Scene schema：{ id, slideId, enabled, note, areas?: [] }。既存Scene（v0）にはareasが
 // 存在しないため、getLightingScenes(work)と全く同じ「optional field + fallback」方針で、
 // 未設定は必ず空配列へフォールバックする。既存Sceneの一括migrationは行わない。
-// Areaは { id, shape("circle"|"ellipse"|"rect"), x, y, width, height, color, intensity(0-1) }
+// Areaは { id, shape("circle"|"ellipse"), x, y, width, height, color, intensity(0-1) }
 // という最小限のschema。x/y/width/heightは出演者placementと同じ舞台座標系（1単位=90cm）。
+// Lighting Area整理 v1・I章：正式なshapeは"circle"|"ellipse"の2つのみ（矩形は廃止）。
+// ただし過去に保存された shape:"rect" のデータも読み込めるよう、実際に読み書きする箇所では
+// 必ず normalizeLightingAreaShape() を通すこと（一括migrationはしない＝C章）。
 function getLightingAreas(scene) {
   return scene && Array.isArray(scene.areas) ? scene.areas : [];
 }
@@ -255,10 +258,21 @@ const LIGHTING_AREA_COLOR_LABELS = {
 function lightingAreaColorHex(colorKey) {
   return LIGHTING_AREA_COLOR_PRESETS[colorKey] || LIGHTING_AREA_COLOR_PRESETS.white;
 }
-const LIGHTING_AREA_SHAPES = ["circle", "ellipse", "rect"];
-const LIGHTING_AREA_SHAPE_LABELS = { circle: "円", ellipse: "楕円", rect: "矩形" };
-const DEFAULT_LIGHTING_AREA_WIDTH = 4;
-const DEFAULT_LIGHTING_AREA_HEIGHT = 4;
+const LIGHTING_AREA_SHAPES = ["circle", "ellipse"];
+const LIGHTING_AREA_SHAPE_LABELS = { circle: "円", ellipse: "楕円" };
+
+// Lighting Area整理 v1・C章：既存Projectに保存済みの旧shape（"rect"）や、将来万一
+// 混入した未知の値を、UI・geometry計算・copy・Exportのすべてで一貫して安全に扱うための
+// 正規化pure helper。一括migrationは行わない（C章）ため、workデータ自体は書き換えず、
+// 「読む・描く・編集する」タイミングでこのhelperを通すだけにする。
+// "rect" → "ellipse" にfallbackするのは、矩形の見た目に最も近い代替がellipseの
+// 多角形近似だから（幅・高さをそのまま楕円の長径・短径として引き継げる）。
+function normalizeLightingAreaShape(shape) {
+  if (shape === "circle") return "circle";
+  return "ellipse"; // "ellipse" 自身も含め、"rect"・未知の値はすべてここに集約する
+}
+const DEFAULT_LIGHTING_AREA_WIDTH = 2;
+const DEFAULT_LIGHTING_AREA_HEIGHT = 2;
 const DEFAULT_LIGHTING_AREA_INTENSITY = 0.6;
 const LIGHTING_AREA_MIN_SIZE = 0.5; // 舞台座標単位（0.5単位=45cm）。0や負値のAreaを防ぐ下限
 const LIGHTING_AREA_MAX_SIZE = 40; // 極端に大きい値の保険上限
@@ -272,6 +286,11 @@ function createDefaultLightingArea(stage) {
   const height = Math.min(DEFAULT_LIGHTING_AREA_HEIGHT, maxH);
   return {
     id: makeId("lighting-area"),
+    // Lighting Area Formation間logical identity v1・STEP 3：新規Areaは常に新しい
+    // logicalAreaIdを持つ（「これから新しく作るAreaは、過去のどのAreaの続きでもない」
+    // という既定の意味論。位置・配列index・近さから推測して既存のlogicalAreaIdを
+    // 再利用することは絶対に行わない）。
+    logicalAreaId: makeId("logical-area"),
     shape: "circle",
     x: 0,
     y: stage ? stage.depth / 2 : 5,
@@ -279,7 +298,306 @@ function createDefaultLightingArea(stage) {
     height,
     color: "white",
     intensity: DEFAULT_LIGHTING_AREA_INTENSITY,
+    rotation: 0, // Lighting Area 回転 v1・5章：新規Areaは常に0°（既存Projectはrotation未定義→読み取り時に0へfallback）
+    // Lighting Area Move v1・STEP 2：新規Areaはpositionmovecounts未設定（=0/瞬時切替）のまま。
+    // ここで明示的に0をセットする必要はない（getLightingAreaPositionMoveCounts()が
+    // 未定義を0へfallbackするため）が、フィールドの存在をコード上わかりやすくする目的で
+    // 明示している。値としての意味はSTEP 3のfallback仕様と完全に同じ。
   };
+}
+
+// Lighting Area Move v1・STEP 3：後方互換fallback専用の小さなpure helper。
+// area.positionMoveCounts（optional field。Cue snapshot内のAreaが持つ、「このAreaの現在の
+// Cue位置へ到達するために、直前状態から何countかけて移動するか」という値）を、常に
+// 0以上の数値へ正規化して返す。旧Area（このfieldを持たない）はundefinedになるため、
+// 必ずこの1箇所を経由して0へfallbackする（migrationは行わない＝STEP 3）。
+// 0または未定義の場合の意味は「Cue地点で瞬時に位置が切り替わる」という既存Move前の挙動と
+// 完全に同じ。
+function getLightingAreaPositionMoveCounts(area) {
+  const n = Number(area && area.positionMoveCounts);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// Cue間Beam Move v1・STEP 2・3：Area Moveのpositionmovecountsと全く同じ思想の、Beam専用
+// safe getter。旧Project（fieldが存在しない）・未定義・不正値はすべて0（＝瞬時切替）へ
+// fallbackする。migrationは行わない。0.5カウント値もそのまま許可する。
+function getLightingBeam3DPositionMoveCounts(beam) {
+  const n = Number(beam && beam.positionMoveCounts);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// Lighting Area Formation間logical identity v1・STEP 2：logicalAreaIdの後方互換fallback
+// 読み出し専用pure helper。既存のgetLightingAreaPositionMoveCounts()等と全く同じ「optional
+// field＋fallback」パターン。文字列でなければnullを返す（旧Project・未操作Areaは常にnull）。
+// このhelper自体は新しいlogicalAreaIdを発行しない（読み出し専用）。発行は各生成/clone/
+// copy/paste/引き継ぎhandler側の責務のまま集約しない（STEP 16：大規模refactor禁止）。
+function getLightingAreaLogicalId(area) {
+  return area && typeof area.logicalAreaId === "string" ? area.logicalAreaId : null;
+}
+
+// Cue間Beam・前の状態との接続 v1・PART A：Area版getLightingAreaLogicalId()と全く同じ
+// 「optional field＋fallback」pure helper。Beam schemaへlogicalBeamId（optional）を追加する
+// だけで、migrationは行わない。旧Project・未操作Beamは常にnullを返す（undefined/null両方を
+// 安全に許容）。
+function getLightingBeamLogicalId(beam) {
+  return beam && typeof beam.logicalBeamId === "string" ? beam.logicalBeamId : null;
+}
+
+// Cue間・前の状態との接続 v1・STEP2：Cue間Area Move用の共通matching pure helper。
+// 優先順位：1. id一致　2. id一致が無い場合だけlogicalAreaId一致　3. どちらも無ければnull。
+// 既存正常Project（常にid一致）の挙動を一切変えないまま、copy/paste等でidが切れたAreaを
+// 「前の状態との接続」で明示的にlogicalAreaId経由へfallbackできるようにするための最小限の
+// 拡張。Formation間Boundary Moveのmatchingロジック（resolveBoundaryMoveArrivingAreas内、
+// 別の目的・別のprevList方向）とは別用途のため、無理に共通化しない。
+function findMatchingLightingArea(fromAreas, toArea) {
+  const list = Array.isArray(fromAreas) ? fromAreas : [];
+  const byId = list.find((a) => a.id === toArea.id);
+  if (byId) return byId;
+  const toLogicalId = getLightingAreaLogicalId(toArea);
+  if (!toLogicalId) return null;
+  return list.find((a) => getLightingAreaLogicalId(a) === toLogicalId) || null;
+}
+
+// Cue間Beam・前の状態との接続 v1・PART B：findMatchingLightingArea()と全く同じ優先順位
+// （1. id一致　2. id一致が無い場合だけlogicalBeamId一致　3. どちらも無ければnull）をBeamへ
+// 適用しただけの対称なpure helper。既存正常Project（常にid一致）の挙動は完全に維持する。
+function findMatchingLightingBeam(fromBeams, toBeam) {
+  const list = Array.isArray(fromBeams) ? fromBeams : [];
+  const byId = list.find((b) => b.id === toBeam.id);
+  if (byId) return byId;
+  const toLogicalId = getLightingBeamLogicalId(toBeam);
+  if (!toLogicalId) return null;
+  return list.find((b) => getLightingBeamLogicalId(b) === toLogicalId) || null;
+}
+
+// Cue間・前の状態との接続 v1・STEP5：選択中Cue（cueSelection）に対して、「現在Cueより前に
+// 実在する最後のLighting Area状態」を返すpure helper。keep/transitionの所属は区別せず、
+// あくまで時間軸（開始時→keep→transition）を一本として辿る。
+//   現在がkeep Cue：countが現在より小さいkeep Cueの最後。無ければBase Scene。
+//   現在がtransition Cue：countが現在より小さいtransition Cueの最後。無ければkeep Cueの
+//     最後（実在すれば）。keep Cueも無ければBase Scene。
+// 重要：Keep→Transition境界そのものを仮想候補として新設しない（STEP15）。previousCueIdの
+// ような参照fieldも保存しない。cueSelectionと現在のkeep/transition Cue配列から毎回導出する
+// （STEP14：Cueのcount変更・削除があっても常に最新のtimeline順序から求まる）。
+function resolvePreviousLightingAreasForCueSelection(scene, keepCues, transitionCues, cueSelection) {
+  const baseAreas = getLightingAreas(scene);
+  if (!cueSelection) return baseAreas; // Base Scene自体には「前の状態」という概念が無い
+  const keepList = Array.isArray(keepCues) ? keepCues : [];
+  const transitionList = Array.isArray(transitionCues) ? transitionCues : [];
+  if (cueSelection.phase === "keep") {
+    const current = keepList.find((c) => c.id === cueSelection.cueId);
+    if (!current) return baseAreas;
+    const earlier = keepList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+    return earlier.length > 0 ? earlier[0].areas : baseAreas;
+  }
+  const current = transitionList.find((c) => c.id === cueSelection.cueId);
+  if (!current) return baseAreas;
+  const earlierTransition = transitionList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+  if (earlierTransition.length > 0) return earlierTransition[0].areas;
+  if (keepList.length > 0) {
+    const lastKeep = [...keepList].sort((a, b) => b.count - a.count)[0];
+    return lastKeep.areas;
+  }
+  return baseAreas;
+}
+
+// Cue間・前の状態との接続 v1・STEP12：UI補助表示用。「前の状態：開始時」または
+// 「前の状態：○カウント目」のラベルを、resolvePreviousLightingAreasForCueSelection()と
+// 全く同じ判定ロジックで導出する（別の参照を保存せず、常にtimelineから毎回導出する点も
+// 同じ）。keepCountsは表示count変換（transition local count→通しcount表示）にだけ使う。
+function resolvePreviousLightingStateLabel(keepCues, transitionCues, cueSelection, keepCounts) {
+  const keepList = Array.isArray(keepCues) ? keepCues : [];
+  const transitionList = Array.isArray(transitionCues) ? transitionCues : [];
+  if (!cueSelection) return "開始時";
+  if (cueSelection.phase === "keep") {
+    const current = keepList.find((c) => c.id === cueSelection.cueId);
+    if (!current) return "開始時";
+    const earlier = keepList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+    return earlier.length > 0 ? `${earlier[0].count + 1}カウント目` : "開始時";
+  }
+  const current = transitionList.find((c) => c.id === cueSelection.cueId);
+  if (!current) return "開始時";
+  const earlierTransition = transitionList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+  if (earlierTransition.length > 0) return `${keepCounts + earlierTransition[0].count + 1}カウント目`;
+  if (keepList.length > 0) {
+    const lastKeep = [...keepList].sort((a, b) => b.count - a.count)[0];
+    return `${lastKeep.count + 1}カウント目`;
+  }
+  return "開始時";
+}
+
+// Cue間Beam・前の状態との接続 v1・PART E：resolvePreviousLightingAreasForCueSelection()と
+// 完全に同じtimeline判定式をBeam3Dへ適用しただけの、Beam専用の小さなhelper（大規模共通化は
+// しない＝PART E指示通り）。keep/transitionの所属は区別せず、あくまで時間軸（開始時→keep→
+// transition）を一本として辿る。Keep→Transition境界そのものは仮想候補にしない。
+// previousCueIdのような参照は保存せず、cueSelectionと現在のkeep/transition Cue配列から
+// 毎回導出する。
+function resolvePreviousLightingBeamsForCueSelection(scene, keepCues, transitionCues, cueSelection) {
+  const baseBeams3D = getLightingBeams3D(scene);
+  if (!cueSelection) return baseBeams3D; // Base Scene自体には「前の状態」という概念が無い
+  const keepList = Array.isArray(keepCues) ? keepCues : [];
+  const transitionList = Array.isArray(transitionCues) ? transitionCues : [];
+  if (cueSelection.phase === "keep") {
+    const current = keepList.find((c) => c.id === cueSelection.cueId);
+    if (!current) return baseBeams3D;
+    const earlier = keepList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+    return earlier.length > 0 ? earlier[0].beams3D : baseBeams3D;
+  }
+  const current = transitionList.find((c) => c.id === cueSelection.cueId);
+  if (!current) return baseBeams3D;
+  const earlierTransition = transitionList.filter((c) => c.count < current.count).sort((a, b) => b.count - a.count);
+  if (earlierTransition.length > 0) return earlierTransition[0].beams3D;
+  if (keepList.length > 0) {
+    const lastKeep = [...keepList].sort((a, b) => b.count - a.count)[0];
+    return lastKeep.beams3D;
+  }
+  return baseBeams3D;
+}
+
+// Lighting Area Boundary Move v1・STEP 4B：Formation境界Move専用のmode field。
+// 「このAreaは直前Formationの最終Lighting状態から、構成境界を越えて移動してくるか」を表す。
+// "none"＝境界Moveなし（既定・旧Project）。"transition"＝直前Formationのtransitioncounts全体
+// （STEP 5B：保存値ではなく再生時に現在値を参照）。"custom"＝このArea自身のpositionMoveCounts
+// （STEP 6B：既存fieldを再利用、新しいfieldは増やさない）。
+// このfieldは「次Formationの開始時（Base Scene）Area」だけが持つ意味を持つ。通常のCue間Move
+// （Lighting Area Move v1・PART A、Cue snapshot内Areaのpositionmovecounts）とは文脈
+// （Base Scene Area vs Cue snapshot内Area）で完全に分離されており、意味が曖昧にならない
+// （STEP 4B）。旧Project・未知の値は必ず"none"へfallbackする（migrationは行わない＝STEP 20）。
+const LIGHTING_AREA_POSITION_MOVE_MODES = ["none", "transition", "custom"];
+function getLightingAreaPositionMoveMode(area) {
+  const mode = area && area.positionMoveMode;
+  return LIGHTING_AREA_POSITION_MOVE_MODES.includes(mode) ? mode : "none";
+}
+
+// Lighting Beam 3D Formation間Move v1・PART B：Area版getLightingAreaPositionMoveMode()と
+// 全く同じ「optional field＋fallback」思想をBeam Base Scene用へ対称に追加した。値の集合は
+// Area版と同じ（"none"/"transition"/"custom"）で、既存のLIGHTING_AREA_POSITION_MOVE_MODES
+// をそのまま再利用する（Beam専用の別配列は増やさない＝PART Y：大規模共通化はしないが、単純な
+// 定数の重複は避ける）。このfieldは「次Formationの開始時（Base Scene）Beam」だけが持つ意味を
+// 持ち、Cue snapshot内Beamのpositionmovecounts（Cue間Beam Move用）とは文脈で完全に分離
+// される（PART C：Area版4B章と同じ思想）。旧Project・未知の値は必ず"none"へfallbackする
+// （migrationは行わない）。
+function getLightingBeam3DPositionMoveMode(beam) {
+  const mode = beam && beam.positionMoveMode;
+  return LIGHTING_AREA_POSITION_MOVE_MODES.includes(mode) ? mode : "none";
+}
+
+// Lighting Area Move v1・STEP 7・8・9・10：Area位置（x/y）だけを補間する小さなpure helper。
+// 責務はintensityやそれ以外のfield（width/height/rotation/color/shape等）には一切触れない、
+// x/yのみのlerpだけ（STEP 7・18：「移動」と「変形」は別概念）。
+//   fromAreas：直前状態（settled Cue、またはbaseAreas）のsnapshot。
+//   toAreas：destination Cue（next）のsnapshot。
+//   elapsedCounts：現在のkeep/move phase内の経過count（連続値、0.5対応＝STEP 6）。
+//   destCount：destination Cue（next）のcount。
+//   prevBoundary：直前Cueのcount（無ければ0）。fadeのprevBoundary思想と同じ（STEP 9）。
+// 同一idのAreaだけを対象にする。fromAreasに存在しない（=このCueで新規追加された）Area、
+// toAreasに存在しない（=このCueで削除される）Areaは対象外（STEP 8：Area追加／削除は
+// Move対象外）。structural（配列の要素数・並び・id構成）はfromAreas側を基準にする
+// （interpolateLightingIntensityState()と同じ考え方）。
+// Areaごとにpositionmovecountsを持つため、Area単位でmoveStart/progressを個別に計算する
+// （STEP 10：Cue全体で単一のprogressにしない）。
+// 既存objectは一切mutationせず、新しい配列/objectだけを返す。
+// Cue間・前の状態との接続 v1・STEP3：matchingをfindMatchingLightingArea()（id優先→
+// logicalAreaId fallback）へ拡張した。既存正常Project（常にid一致）の挙動は完全に維持
+// する。Move対象はx/yのみ（変更なし）。__matchedToAreaId（work stateへは保存されない
+// 計算専用の一時field）は、resolveLightingCueState()のFade窓内マッチング（STEP4）が
+// 「id一致でもlogicalAreaId一致でも、正しいMove結果を再結合できる」ようにするために
+// 追加した。
+function interpolateLightingAreaPositionState(fromAreas, toAreas, elapsedCounts, destCount, prevBoundary) {
+  const fromList = Array.isArray(fromAreas) ? fromAreas : [];
+  const toList = Array.isArray(toAreas) ? toAreas : [];
+  // STEP2の方向（toAreaを起点にfromAreasから一致するfromAreaを探す）で対応付けを1回だけ
+  // 求め、from.id→toAreaのMapとして持つ（fromList.mapの中で毎回再検索しない）。
+  const toAreaByFromId = new Map();
+  toList.forEach((toArea) => {
+    const matchedFromArea = findMatchingLightingArea(fromList, toArea);
+    if (matchedFromArea) toAreaByFromId.set(matchedFromArea.id, toArea);
+  });
+  return fromList.map((fromArea) => {
+    const toArea = toAreaByFromId.get(fromArea.id);
+    if (!toArea) return fromArea; // to側に対応が無い＝Move対象外（STEP 8）
+    const moveCounts = getLightingAreaPositionMoveCounts(toArea);
+    if (moveCounts <= 0) return fromArea; // STEP 3：0/未定義は従来通り瞬時切替のまま
+    const moveStart = clamp(destCount - moveCounts, prevBoundary, destCount); // STEP 9：prevBoundaryより前へは遡らない
+    const span = destCount - moveStart;
+    const progress = span > 0 ? clamp((elapsedCounts - moveStart) / span, 0, 1) : elapsedCounts >= destCount ? 1 : 0;
+    if (progress <= 0) return fromArea; // まだmove窓に入っていない
+    return {
+      ...fromArea,
+      x: lerp(fromArea.x, toArea.x, progress),
+      y: lerp(fromArea.y, toArea.y, progress),
+      __matchedToAreaId: toArea.id,
+    };
+  });
+}
+
+// Cue間Beam Move v1・STEP 4・5・6・11：同一Formation内のCue間で、Beamのsource/target座標
+// だけをlerpするpure helper。既存のinterpolateLightingAreaPositionState()と全く同じ設計
+// 思想（同一id対応・Areaごと個別progress・moveStart clampはprevBoundary思想と同じ）を
+// Beamへそのまま適用しただけで、新しい別のtiming計算式は作らない。
+//   Move対象：fromBeam.id === toBeam.idが両方に存在するBeamのみ（STEP5：logicalBeamIdは
+//     今回不要。追加/削除Beamのアニメーションは既存Fade側の責務のまま、ここでは一切扱わない）。
+//   Move対象field：source.x/y/z・target.x/y/zのみ。sourceWidth/targetWidth/color/
+//     intensity/followPerformerId・その他metadataには一切触れない（STEP4）。
+//   STEP11：followPerformerId（追尾）が設定されているBeamは、destination（toBeam）側の
+//     判定でMove対象外とする（`if (toBeam.followPerformerId) return fromBeam;`）。表示時に
+//     resolveLightingBeam3DTarget()がtarget.x/yを出演者位置へ差し替えるため、保存targetの
+//     Moveとの意味が曖昧になることを避けるための安全側の設計。
+// Cue間Beam・前の状態との接続 v1・PART C：matchingをfindMatchingLightingBeam()（id優先→
+// logicalBeamId fallback）へ拡張した。既存正常Project（常にid一致）の挙動は完全に維持する。
+// Move対象fieldはsource/targetのx/y/zのみ（変更なし）。__matchedToBeamId（work stateへは
+// 保存されない計算専用の一時field）は、resolveLightingCueState()のFade窓内マッチング
+// （PART D）が「id一致でもlogicalBeamId一致でも、正しいMove結果を再結合できる」ように
+// するために追加した（Area版の__matchedToAreaIdと全く同じ役割）。
+function interpolateLightingBeam3DPositionState(fromBeams3D, toBeams3D, elapsedCounts, destCount, prevBoundary) {
+  const fromList = Array.isArray(fromBeams3D) ? fromBeams3D : [];
+  const toList = Array.isArray(toBeams3D) ? toBeams3D : [];
+  // Area版interpolateLightingAreaPositionState()と同じ方向（toBeamを起点にfromBeams3Dから
+  // 一致するfromBeamを探す）で対応付けを1回だけ求め、from.id→toBeamのMapとして持つ。
+  const toBeamByFromId = new Map();
+  toList.forEach((toBeam) => {
+    const matchedFromBeam = findMatchingLightingBeam(fromList, toBeam);
+    if (matchedFromBeam) toBeamByFromId.set(matchedFromBeam.id, toBeam);
+  });
+  return fromList.map((fromBeam) => {
+    const toBeam = toBeamByFromId.get(fromBeam.id);
+    if (!toBeam) return fromBeam; // to側に対応が無い＝Move対象外（STEP5）
+    if (toBeam.followPerformerId) return fromBeam; // STEP11・PART J：追尾Beamは対象外（接続＝identity, Move可否＝別概念）
+    const moveCounts = getLightingBeam3DPositionMoveCounts(toBeam);
+    if (moveCounts <= 0) return fromBeam; // 0/未定義は瞬時切替のまま
+    const moveStart = clamp(destCount - moveCounts, prevBoundary, destCount);
+    const span = destCount - moveStart;
+    const progress = span > 0 ? clamp((elapsedCounts - moveStart) / span, 0, 1) : elapsedCounts >= destCount ? 1 : 0;
+    if (progress <= 0) return fromBeam; // まだmove窓に入っていない
+    // Lighting Beam 3D 幅の動的補間 v1・STEP 2：既存のsource/target座標補間と全く同じ
+    // progressを使い、sourceWidth/targetWidthも追加で補間する。新しいwidthMoveCounts等は
+    // 作らず、positionMoveCountsを「Beamの位置・形状が前状態から現在状態へ変化する時間」
+    // として流用する（PART指定通り）。sourceWidthは0を正式値として許可するため`||`は禁止、
+    // 既存rendererのgetLightingBeam3DScreenPolygon等と同じ`??`ベースのfallbackで
+    // safe normalizeしてからlerpする（未設定Beamの補間結果がdefault値へ化けないように）。
+    const fromSourceWidth = fromBeam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH;
+    const toSourceWidth = toBeam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH;
+    const fromTargetWidth = fromBeam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH;
+    const toTargetWidth = toBeam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH;
+    return {
+      ...fromBeam,
+      source: {
+        ...fromBeam.source,
+        x: lerp(fromBeam.source.x, toBeam.source.x, progress),
+        y: lerp(fromBeam.source.y, toBeam.source.y, progress),
+        z: lerp(fromBeam.source.z, toBeam.source.z, progress),
+      },
+      target: {
+        ...fromBeam.target,
+        x: lerp(fromBeam.target.x, toBeam.target.x, progress),
+        y: lerp(fromBeam.target.y, toBeam.target.y, progress),
+        z: lerp(fromBeam.target.z, toBeam.target.z, progress),
+      },
+      sourceWidth: lerp(fromSourceWidth, toSourceWidth, progress),
+      targetWidth: lerp(fromTargetWidth, toTargetWidth, progress),
+      __matchedToBeamId: toBeam.id,
+    };
+  });
 }
 
 // BPM値を許容範囲（MIN_BPM〜MAX_BPM）へ収める。小数BPM（将来の音源解析・手動修正用）にも
@@ -718,6 +1036,19 @@ function clamp(v, min, max) {
   return Math.min(max, Math.max(min, v));
 }
 
+// 0.5カウント精度対応 v1：0.5単位への正規化pure helper。
+// 通常操作は引き続き1カウント単位（－／＋ボタン・input type="number"のブラウザ標準▲▼は
+// 従来通りstep=1のまま＝変更しない）だが、直接入力（キーボードから数値を打ち込む）だけ
+// 0.5カウントを指定できるようにするための共通roundingだけをここへ集約する。
+// Math.round(value*2)/2相当の単純な方式（浮動小数点誤差が入りにくい）。
+// keepCounts/transitionCounts/Lighting Cue count/fadeCounts/entryFadeCountsの全commitで
+// この1つのhelperだけを使い、同じ計算式を各所へコピーしない。
+// 注：既存のroundToHalfCount(progress, totalCounts)（進捗表示専用・別signature）とは
+// 名前が衝突するため、別名snapCountToHalf(value)として新設する（既存関数は無変更）。
+function snapCountToHalf(value) {
+  return Math.round(value * 2) / 2;
+}
+
 // Keyboard Editing v1：入力欄（input / textarea / select / contenteditable）へフォーカス中かどうかの
 // 判定を1箇所へ集約するhelper（26章）。既存のUndo/Redo・ズームショートカットが持っていた
 // インライン判定（tag === "INPUT" 等）もこの関数へ統一し、新しく追加するCopy/Paste/Delete/Backspaceの
@@ -795,7 +1126,7 @@ function roundToHalfCount(progress, totalCounts) {
 // 将来、waypoints・出演者ごとの移動時間・曲線移動などを追加する場合も、この関数の
 // シグネチャ（fromPlacements, toPlacements, progress）はそのまま維持しつつ、
 // 内部処理だけを拡張できるようにしてある。
-function interpolatePlacements(fromPlacements, toPlacements, progress) {
+function interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig) {
   const from = fromPlacements || {};
   const to = toPlacements || {};
   const ids = new Set([...Object.keys(from), ...Object.keys(to)]);
@@ -810,9 +1141,12 @@ function interpolatePlacements(fromPlacements, toPlacements, progress) {
         // area は表示上の分類にのみ使うため、再生完了の瞬間にのみ切り替える
         // （途中は開始側のエリアのまま扱う＝終了側エリアへの特殊な出入り処理はv1では行わない）。
         area: progress >= 1 ? b.area : a.area,
-        // 姿勢 v1.1：pose も area と全く同じ考え方で扱う（姿勢そのものを補間しない＝PART D）。
-        // 移動中は開始側のposeを維持し、到着した瞬間（progress>=1）にだけ終了側へ切り替える。
-        pose: progress >= 1 ? b.pose : a.pose,
+        // 姿勢 v1.1→移動時の姿勢v1：poseの決定はresolveTransitionPose()という共通pure
+        // helperへ集約した（曲線側のinterpolatePlacementsWithPathsと同じ判定を共有し、
+        // 二重実装しない）。transitionPoseConfigが無い、またはそのperformerのentryが
+        // 無い場合は、従来通り「移動中は開始側のposeを維持し、到着（progress>=1）で
+        // 終了側へ切り替える」という既存挙動のまま変わらない。
+        pose: resolveTransitionPose(a.pose, b.pose, progress, transitionPoseConfig && transitionPoseConfig[id]),
       };
     } else if (a && !b) {
       // 終了placementがない → 開始位置に固定
@@ -863,6 +1197,114 @@ function computeTransitionPaths(fromPlacements, toPlacements, pathConfig) {
     paths.push(path);
   });
   return paths;
+}
+
+// 追尾スポット軌跡 Export対応 v1・4〜8章：追尾Beam（followPerformerId）が「fromPlacements→
+// toPlacements」の間でtargetをどう追うかを、出演者の既存transition path（直線／曲線／
+// waypoint）から導出する共通pure helper。編集画面（単一選択中のBeam）とExport（Base Scene内
+// 全追尾Beam）の両方から呼ばれる想定で、selection・work書き込みには一切関与しない。
+//   ・beam.followPerformerIdが無い → skip（5章）
+//   ・対象performerのfrom/to placementのどちらかが無い → skip（保存済みbeam.targetへは
+//     fallbackしない＝追尾軌跡は「出演者の移動経路」だから、6章）
+//   ・幾何計算（直線/曲線判定・waypoint）は既存のcomputeTransitionPaths()をそのまま呼ぶ
+//     （7章：Lighting専用の直線補間・Bezier・waypoint計算は再実装しない）。
+//   ・computeTransitionPaths()は「直線かつ完全に静止」の場合はエントリを作らない既存仕様の
+//     ため、その場合はfrom===toのlinearエントリをfallbackし、始点/終点位置だけを提供する
+//     （8章：軌跡線を描くかどうかは呼び出し側＝TopView/Exportが判断する）。
+function resolveLightingBeamTrackingPaths({ beams, fromPlacements, toPlacements, pathConfig }) {
+  const list = Array.isArray(beams) ? beams : [];
+  if (list.length === 0) return [];
+  const paths = computeTransitionPaths(fromPlacements || {}, toPlacements || {}, pathConfig);
+  const result = [];
+  list.forEach((beam) => {
+    if (!beam || !beam.followPerformerId) return;
+    const followId = beam.followPerformerId;
+    const fromPos = fromPlacements && fromPlacements[followId];
+    const toPos = toPlacements && toPlacements[followId];
+    if (!fromPos || !toPos) return;
+    const matched = paths.find((p) => p.id === followId);
+    if (matched) {
+      result.push({
+        beamId: beam.id,
+        performerId: followId,
+        color: beam.color,
+        type: matched.type,
+        from: matched.from,
+        to: matched.to,
+        waypoint: matched.waypoint,
+      });
+    } else {
+      result.push({
+        beamId: beam.id,
+        performerId: followId,
+        color: beam.color,
+        type: "linear",
+        from: { x: fromPos.x, y: fromPos.y },
+        to: { x: toPos.x, y: toPos.y },
+      });
+    }
+  });
+  return result;
+}
+
+// Lighting Cue Export 軌跡対応 v1・3〜9・22〜24章：Transition Cue用のExport専用pure helper。
+// 「current Formation → next Formation」の元のTransition path（computeTransitionPathsや
+// resolveLightingBeamTrackingPathsが返すfull path）を、指定progress地点で
+// previous側（0〜progress）／next側（progress〜1）へ分割するだけの表示専用ジオメトリ関数。
+//   ・Cue位置からcomputeTransitionPathsを再計算しない（2章：curveの場合、元waypointを
+//     そのままCue位置→次Formation用に使い回すと元のBezier曲線と異なる形になってしまうため）。
+//   ・curveはDe Casteljau分割で元の二次Bezier形状を完全に維持する（8章）。
+//     P0=from, P1=waypoint, P2=to, t=progressとして、
+//     A=lerp(P0,P1,t)、B=lerp(P1,P2,t)、C=lerp(A,B,t)（＝Cue時点の点）を求め、
+//     previous側: from=P0, waypoint=A, to=C / next側: from=C, waypoint=B, to=P2 とする。
+//   ・linearは単純なlerpで同じ考え方を適用する（7章）。
+//   ・Playback側のquadraticBezierPoint・interpolatePlacementsWithPathsは一切変更せず、
+//     ここでは表示用geometryを切り出すためだけに、同じ数式（De Casteljau＝二次Bezierの
+//     lerpの繰り返し）を独立して使う（9章：Bezier engineの再設計ではなく、既存の考え方を
+//     Export表示専用に薄く再利用しているだけ）。
+//   ・結果が実質長さ0（from===to）になる場合はnullを返す（14・15・16章：progress=0の
+//     previous側・progress=1のnext側・静止performer等で、無理にzero-length trajectoryを
+//     追加しない）。
+// 出演者移動軌跡（{id,type,from,to,waypoint}）・追尾スポット軌跡
+// （{beamId,performerId,color,type,from,to,waypoint}）のどちらの形でも、from/to/waypoint/type
+// 以外のfield（id・beamId・performerId・color等）はそのまま維持されるようspreadする（22章：
+// Bezier分割ロジックを出演者用／Beam用で二重実装しない）。
+function sliceTransitionPathAtProgress(path, progress, direction) {
+  if (!path) return null;
+  const t = clamp(progress, 0, 1);
+  let result;
+  if (path.type === "curve" && path.waypoint) {
+    const P0 = path.from;
+    const P1 = path.waypoint;
+    const P2 = path.to;
+    const A = { x: lerp(P0.x, P1.x, t), y: lerp(P0.y, P1.y, t) };
+    const B = { x: lerp(P1.x, P2.x, t), y: lerp(P1.y, P2.y, t) };
+    const C = { x: lerp(A.x, B.x, t), y: lerp(A.y, B.y, t) };
+    result =
+      direction === "previous"
+        ? { ...path, type: "curve", from: P0, waypoint: A, to: C }
+        : { ...path, type: "curve", from: C, waypoint: B, to: P2 };
+  } else {
+    const P0 = path.from;
+    const P1 = path.to;
+    const Pt = { x: lerp(P0.x, P1.x, t), y: lerp(P0.y, P1.y, t) };
+    result =
+      direction === "previous"
+        ? { ...path, type: "linear", from: P0, to: Pt }
+        : { ...path, type: "linear", from: Pt, to: P1 };
+  }
+  const dx = result.to.x - result.from.x;
+  const dy = result.to.y - result.from.y;
+  if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return null;
+  return result;
+}
+
+// 上のsliceTransitionPathAtProgress()を配列全体へ適用する薄いラッパー（24章：
+// 「full path derive」と「Cue用segment derive」を分離する構造の後段）。null（zero-length）は
+// 結果配列から取り除く。
+function sliceTransitionPathsAtProgress(paths, progress, direction) {
+  const list = Array.isArray(paths) ? paths : [];
+  return list.map((p) => sliceTransitionPathAtProgress(p, progress, direction)).filter((p) => p !== null);
 }
 
 // 移動軌跡の「参照方向モード」（次に／前に）から、軌跡計算に渡すべき
@@ -1124,8 +1566,8 @@ function quadraticBezierPoint(p0, p1, p2, t) {
 // 出演者だけ、二次ベジェ曲線上の位置で上書きする。
 // これにより、同じ構成間で「1番→直線／2番→曲線／3番→直線」のように混在していても、
 // 直線移動する出演者の挙動はinterpolatePlacements単体を使った場合と完全に同じになる。
-function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, pathConfig) {
-  const base = interpolatePlacements(fromPlacements, toPlacements, progress);
+function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, pathConfig, transitionPoseConfig) {
+  const base = interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig);
   if (!pathConfig) return base;
   const from = fromPlacements || {};
   const to = toPlacements || {};
@@ -1136,9 +1578,14 @@ function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, 
     const b = to[id];
     if (!a || !b) return; // 開始・終了の両方が揃っている出演者のみ曲線を適用する
     const point = quadraticBezierPoint(a, cfg.waypoint, b, progress);
-    // 姿勢 v1.1：曲線移動で座標を上書きする際も、interpolatePlacements側と同じ
-    // 「途中は開始側pose、progress>=1で終了側pose」のルールをposeにも適用する（PART D）。
-    base[id] = { x: point.x, y: point.y, area: progress >= 1 ? b.area : a.area, pose: progress >= 1 ? b.pose : a.pose };
+    // 移動時の姿勢v1：曲線移動で座標を上書きする際も、interpolatePlacements側と全く同じ
+    // resolveTransitionPose()を再利用する（直線・曲線でpose判定ロジックを二重実装しない）。
+    base[id] = {
+      x: point.x,
+      y: point.y,
+      area: progress >= 1 ? b.area : a.area,
+      pose: resolveTransitionPose(a.pose, b.pose, progress, transitionPoseConfig && transitionPoseConfig[id]),
+    };
   });
   return base;
 }
@@ -1432,6 +1879,22 @@ function createInitialWork() {
     // slideIdを参照する片方向参照。新規Projectは常に[]から始まる（既存Projectはoptional field
     // なので、getLightingScenes()のfallbackにより自動的に[]として扱われる＝migration不要）。
     lightingScenes: [],
+    // Lighting Cue STEP 2D：transition Cue（「fromSlide→次のslide」の移動区間に属するCue）。
+    // transitionCounts/transitionPathsと全く同じ「移動元slideのidをキーにした独立map」方式
+    // （{ [fromSlideId]: [{id, count, areas, beams3D}] }）。keep Cue（lightingScene.cues）とは
+    // 意図的に別の場所に保存する（keep CueはFormation本体に属し、transition Cueは「次への
+    // 移動」という関係に属するため）。新規Projectは常に{}から始まり、既存Projectはoptional
+    // fieldなので、getTransitionLightingCues()のfallbackにより自動的に[]として扱われる
+    // （migration不要）。
+    transitionLightingCues: {},
+    // 移動時の姿勢 v1：transitionCounts/transitionPaths/transitionLightingCuesと全く同じ
+    // 「移動元slideのidをキーにした独立map」方式（{ [fromSlideId]: { [performerId]:
+    // "standing" | "kneeling" } }）。「開始時の姿勢」（デフォルト＝従来通り開始側placementの
+    // poseを維持）はentry自体を持たないことで表現する疎なmap。新規Projectは常に{}から
+    // 始まり、既存Projectはoptional fieldなので、getTransitionPosesForSlide()のfallback
+    // により自動的に{}として扱われる（migration不要。この機能を一度も操作しない限り
+    // 従来と完全に同じ再生結果になる）。
+    transitionPoses: {},
     project: {
       bpm: DEFAULT_BPM,
       musicSections: [createDefaultMusicSection(DEFAULT_BPM)],
@@ -2621,6 +3084,106 @@ function reconcileTransitionCounts(transitionCounts, oldSlides, newSlides) {
   return next;
 }
 
+// Lighting Cue STEP 2D：transitionLightingCues用の安全なgetter。transitionCounts/
+// transitionPathsと全く同じ「optional field + fallback」方針。work.transitionLightingCues
+// （またはそこから取り出した1件分の配列）が存在しない・配列でない場合は必ず空配列を返す。
+// 呼び出し側がwork.transitionLightingCues[fromSlideId]へ直接アクセスするコードを増やさない
+// よう、この関数を必ず経由する。
+function getTransitionLightingCues(transitionLightingCues, fromSlideId) {
+  const arr = transitionLightingCues && transitionLightingCues[fromSlideId];
+  return Array.isArray(arr) ? arr : [];
+}
+
+// reconcileTransitionCounts/reconcileTransitionPathsと全く同じ考え方（「移動元→移動先の
+// 隣接ペアが変化していない遷移だけ既存データを引き継ぐ」）を、transitionLightingCuesにも
+// 適用する。新しいルールは作らず、既存の複製・削除・並べ替え時の挙動と完全に一貫させる。
+function reconcileTransitionLightingCues(transitionLightingCues, oldSlides, newSlides) {
+  const oldNextId = new Map();
+  for (let i = 0; i < oldSlides.length - 1; i += 1) {
+    oldNextId.set(oldSlides[i].id, oldSlides[i + 1].id);
+  }
+  const next = {};
+  for (let i = 0; i < newSlides.length - 1; i += 1) {
+    const fromId = newSlides[i].id;
+    const toId = newSlides[i + 1].id;
+    if (
+      oldNextId.get(fromId) === toId &&
+      transitionLightingCues &&
+      Object.prototype.hasOwnProperty.call(transitionLightingCues, fromId)
+    ) {
+      next[fromId] = transitionLightingCues[fromId];
+    }
+  }
+  return next;
+}
+
+// 移動時の姿勢（Transition Pose）v1：work.transitionPosesの安全なgetter。
+// transitionCounts/transitionPaths/transitionLightingCuesと全く同じ「optional field +
+// fallback」方針。work.transitionPoses（またはそこから取り出した1件分のmap）が
+// 存在しない・オブジェクトでない場合は必ず空オブジェクトを返す。呼び出し側が
+// work.transitionPoses[fromSlideId]へ直接アクセスするコードを増やさないよう、
+// この関数を必ず経由する。「開始時の姿勢」（デフォルト）はentry自体が存在しないことで
+// 表現するため、ここで返る空オブジェクトが「全員デフォルト」を意味する。
+function getTransitionPosesForSlide(transitionPoses, fromSlideId) {
+  const forSlide = transitionPoses && transitionPoses[fromSlideId];
+  return forSlide && typeof forSlide === "object" ? forSlide : {};
+}
+
+// reconcileTransitionCounts/reconcileTransitionPaths/reconcileTransitionLightingCuesと
+// 全く同じ考え方（「移動元→移動先の隣接ペアが変化していない遷移だけ既存データを
+// 引き継ぐ」）を、transitionPosesにも適用する。新しいルールは作らず、既存の複製・削除・
+// 並べ替え時の挙動と完全に一貫させる。
+function reconcileTransitionPoses(transitionPoses, oldSlides, newSlides) {
+  const oldNextId = new Map();
+  for (let i = 0; i < oldSlides.length - 1; i += 1) {
+    oldNextId.set(oldSlides[i].id, oldSlides[i + 1].id);
+  }
+  const next = {};
+  for (let i = 0; i < newSlides.length - 1; i += 1) {
+    const fromId = newSlides[i].id;
+    const toId = newSlides[i + 1].id;
+    if (
+      oldNextId.get(fromId) === toId &&
+      transitionPoses &&
+      Object.prototype.hasOwnProperty.call(transitionPoses, fromId)
+    ) {
+      next[fromId] = transitionPoses[fromId];
+    }
+  }
+  return next;
+}
+
+// 移動時の姿勢 v1：移動中（progress<1）に実際に使うposeを1箇所で判定する共通pure
+// helper。interpolatePlacements（直線）・interpolatePlacementsWithPaths（曲線）の
+// 両方から呼ばれ、同じ判定ロジックを二重実装しない。
+//   progress >= 1        → 必ず終了側（到着後）のpose
+//   progress < 1 かつ
+//     overridePoseが "standing"/"kneeling" → そのoverride pose
+//     overridePoseが無い（＝「開始時の姿勢」）→ 従来通り開始側のpose
+function resolveTransitionPose(fromPose, toPose, progress, overridePose) {
+  if (progress >= 1) return toPose;
+  if (overridePose === "standing" || overridePose === "kneeling") return overridePose;
+  return fromPose;
+}
+
+// Lighting Area 回転 v1：楕円の中心を軸にした標準的な2D回転（舞台座標系のまま完結させる）。
+// getLightingAreaStagePoints()・getLightingAreaResizeHandles()の両方から共通で使う、
+// 「舞台座標上の1点を、指定した中心点まわりにdegrees度だけ回転させる」だけのpure helper。
+// TopView・FormationThumbnail・平面図Export・俯瞰客席Export・OverheadAudienceViewは
+// いずれも「舞台座標上の頂点配列を受け取り、それぞれ自前のtoScreenX/Y・project()等へ通す」
+// という共通構造（X章）のため、頂点そのものを舞台座標の時点で回転させておけば、各呼び出し側の
+// 座標変換・投影方式に一切手を加えずに回転が伝播する（Top ViewとExportで回転方向が食い違う
+// 心配がない＝19章）。degrees=0（rotation未定義のfallback含む＝4章）は完全な no-op。
+function rotatePointAroundCenter(point, center, degrees) {
+  if (!degrees) return point;
+  const rad = (degrees * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  return { x: center.x + dx * cos - dy * sin, y: center.y + dx * sin + dy * cos };
+}
+
 // ------------------------------------------------------------------
 // Lighting Area v1・X章：舞台座標上のshape geometryを作る共通pure helper
 // ------------------------------------------------------------------
@@ -2636,37 +3199,39 @@ function getLightingAreaStagePoints(area) {
   const h = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.height) || DEFAULT_LIGHTING_AREA_HEIGHT);
   const cx = Number(area.x) || 0;
   const cy = Number(area.y) || 0;
-  if (area.shape === "rect") {
-    const hw = w / 2;
-    const hh = h / 2;
-    return [
-      { x: cx - hw, y: cy - hh },
-      { x: cx + hw, y: cy - hh },
-      { x: cx + hw, y: cy + hh },
-      { x: cx - hw, y: cy + hh },
-    ];
-  }
-  // circle / ellipse：中心＋width/heightから多角形近似（X章・W章の案A）。circleはH・I章の
-  // 仕様通りwidth===heightとして保存されている想定だが、念のためここでも両軸を独立して扱う
-  // （万一width!==heightのデータが来ても壊れず楕円として描かれるだけで安全）。
+  // Lighting Area整理 v1・C・H章：矩形（"rect"）は廃止した。旧データ（shape:"rect"）・未知の
+  // 値も含め、circle/ellipseどちらも元々同じ「中心＋width/heightからの多角形近似」を使って
+  // おり、shapeによる分岐はそもそも不要だった（circleはwidth===heightとして保存される、
+  // というデータ側の制約だけで円に見える）。そのため今回はrect専用の4点矩形計算を削除する
+  // だけで、TopView・OverheadAudienceView・Exportのすべてで自動的に「旧rectもellipseと同じ
+  // 楕円近似で描かれる」という挙動になる（Export専用のshape判定を別実装しない＝H章）。
   const rx = w / 2;
   const ry = h / 2;
+  // Lighting Area 回転 v1・2〜4章：rotationは既存Projectには存在しないfieldのため、
+  // Number(area.rotation) || 0 で安全にfallbackする（未定義・NaN・0いずれも0°として扱う）。
+  // circleはw===hのため回転しても見た目が変わらない（この関数を素通りしてもno-op）。
+  const rotation = Number(area.rotation) || 0;
+  const center = { x: cx, y: cy };
   const points = [];
   for (let i = 0; i < LIGHTING_AREA_ELLIPSE_SEGMENTS; i++) {
     const angle = (i / LIGHTING_AREA_ELLIPSE_SEGMENTS) * Math.PI * 2;
-    points.push({ x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) });
+    const raw = { x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) };
+    points.push(rotatePointAroundCenter(raw, center, rotation));
   }
   return points;
 }
 
 // ------------------------------------------------------------------
-// Area resize v1・D・E章：平面図TopView専用のリサイズハンドル配置
+// Area resize v1・F章：平面図TopView専用のリサイズハンドル配置
 // ------------------------------------------------------------------
 // 中心x/yを固定したまま（G章）width/heightだけを変える、という単純なリサイズのため、
-// ハンドルは常に「境界ボックスの辺の中点」に置く（circle/ellipse/rectいずれも同じ考え方＝
+// ハンドルは常に「境界ボックスの辺の中点」に置く（circle/ellipseいずれも同じ考え方＝
 // getLightingAreaStagePoints()と対をなす共通pure helper。俯瞰客席ビューでは使わない＝B章）。
 // circleはD章の推奨通り右側1個のみ（width===heightを維持するのに十分）。
-// ellipse/rectは東西南北4方向（最低限「左右→width、上下→height」というD章の要件を満たす）。
+// ellipseは東西南北4方向（最低限「左右→width、上下→height」というD章の要件を満たす）。
+// Lighting Area整理 v1・F章：矩形は廃止したため、rect用の分岐は削除しellipseへ統合した。
+// normalizeLightingAreaShape()を通すことで、旧rectデータもellipse用の4方向ハンドルに
+// なる（F章：旧データもellipse用handleで編集できるようにする）。
 function getLightingAreaResizeHandles(area) {
   if (!area) return [];
   const w = Math.max(LIGHTING_AREA_MIN_SIZE, Number(area.width) || DEFAULT_LIGHTING_AREA_WIDTH);
@@ -2675,21 +3240,35 @@ function getLightingAreaResizeHandles(area) {
   const cy = Number(area.y) || 0;
   const hw = w / 2;
   const hh = h / 2;
-  if (area.shape === "circle") {
+  if (normalizeLightingAreaShape(area.shape) === "circle") {
+    // Lighting Area 回転 v1・6章：circleの単一handleは常にdue-east固定のまま
+    // （回転しても見た目が変わらないcircleに、不要な回転処理を追加しない）。
     return [{ dir: "e", x: cx + hw, y: cy, cursor: "ew-resize" }];
   }
-  return [
+  // Lighting Area 回転 v1・8章：ellipseの4方向handleは、楕円本体（getLightingAreaStagePoints）
+  // と全く同じrotatePointAroundCenter()で中心まわりに回転させる。これにより、回転後の
+  // 楕円の向きとhandleの表示位置が常に一致する（回転していない場合はno-opのため、
+  // 従来のhandle位置と完全に一致する）。
+  const rotation = Number(area.rotation) || 0;
+  const center = { x: cx, y: cy };
+  const rawHandles = [
     { dir: "e", x: cx + hw, y: cy, cursor: "ew-resize" },
     { dir: "w", x: cx - hw, y: cy, cursor: "ew-resize" },
     { dir: "s", x: cx, y: cy + hh, cursor: "ns-resize" },
     { dir: "n", x: cx, y: cy - hh, cursor: "ns-resize" },
   ];
+  return rawHandles.map((h2) => {
+    const rotated = rotatePointAroundCenter({ x: h2.x, y: h2.y }, center, rotation);
+    return { ...h2, x: rotated.x, y: rotated.y };
+  });
 }
 
 // Area fillのopacity（N章）：intensity(0-1)をそのまま1.0opacityにはせず、「照明の雰囲気を
-// 重ねる」程度の範囲（0.08〜0.45）へ写像する。intensity 0でも編集時に薄く見えるよう、
-// 下限を0にしない。TopView・OverheadAudienceView・（将来のExport）で同じ計算式を共有する。
-const LIGHTING_AREA_OPACITY_MIN = 0.08;
+// 重ねる」程度の範囲へ写像する。照明フェード v1.1・E章：intensity=0は表示上も完全消灯
+// （fillOpacity=0）になるようMINを0へ変更した（フェードイン/フェードアウトが自然に成立する
+// ため）。MAX（0.45、intensity=1時の見た目）は維持。TopView・OverheadAudienceView・Exportで
+// 同じ計算式を共有する。
+const LIGHTING_AREA_OPACITY_MIN = 0;
 const LIGHTING_AREA_OPACITY_MAX = 0.45;
 function lightingAreaFillOpacity(intensity) {
   const t = clamp(typeof intensity === "number" ? intensity : DEFAULT_LIGHTING_AREA_INTENSITY, 0, 1);
@@ -2710,8 +3289,1366 @@ function updateLightingAreaInScenes(lightingScenes, slideId, areaId, patch) {
   });
 }
 
+// ------------------------------------------------------------------
+// 旧Lighting Beam v1・Scene.beams（Lighting UI整理・Prototype卒業により正式UIからは
+// 卒業。詳細は下記コメント参照）
+// ------------------------------------------------------------------
+// 正式UIとしての「照明ビーム」（角度・長さ・太さで舞台床に貼り付く帯）は、正式版
+// 「3D照明ビーム」（Scene.beams3D、source/target/z）に統合されたため、追加・編集・
+// 削除UIとTopView/OverheadAudienceViewでの描画コードはすべて削除した。
+//
+// ただし既存Projectに保存済みの Scene.beams（旧データ）を破壊しないため、以下は
+// 意図的に残している：
+//   - getLightingBeams(scene)：copyLightingSceneForSlideCopy()がFormationコピー時に
+//     旧beamsをそのままdeep copyするために使用（後方互換：古い保存データをコピー操作
+//     だけで消してしまわないため）。
+// 一括migrationは行わず、Scene.beams フィールド自体も保存データから物理削除しない。
+// 新規UI・rendererからは一切参照しない、というだけの整理である。
+function getLightingBeams(scene) {
+  return scene && Array.isArray(scene.beams) ? scene.beams : [];
+}
+
+
+// Lighting Beam v2・正式実装 STEP1（C〜G章）
+// ------------------------------------------------------------------
+// Beam v1（Scene.beams、x/y/angle/length/widthの床貼り付き帯）とはデータを完全に分離する
+// （D章：同じ配列へ混在させない）。正式な3D Beamは Scene.beams3D という別フィールドに保存する。
+// schema：{ id, source:{x,y,z}, target:{x,y,z}, color, intensity, sourceWidth, targetWidth }
+// STEP1では target.z は常に0（照射先は舞台床）で固定するが、将来target.z > 0へ拡張できる
+// よう、targetも最初からsource同様の{x,y,z}構造にしておく（C章）。
+// 既存Scene（beams3D未設定）は getLightingScenes(work) と全く同じ「optional field +
+// fallback」方針で、必ず空配列へフォールバックする。一括migrationは行わない。
+function getLightingBeams3D(scene) {
+  return scene && Array.isArray(scene.beams3D) ? scene.beams3D : [];
+}
 
 // ------------------------------------------------------------------
+// Lighting Cue STEP 2A：Lighting Scene内keep Cueの土台（data構造・pure helperのみ）
+// ------------------------------------------------------------------
+// Scene schema拡張：{ id, slideId, enabled, note, areas?, beams3D?, cues?: [] }。
+// cues：そのFormation（keep区間）内で、指定countに到達したらLighting状態を瞬時に
+// 切り替えるためのsnapshot配列。1件は { id, count, areas, beams3D }。areas/beams3Dは
+// そのCue時点のLighting状態を丸ごと保持するsnapshot方式（新しいgeometry計算・新しい
+// projectionは一切持たない、既存のarea/beam3D schemaをそのまま複製したものにすぎない）。
+// 既存Sceneと全く同じ「optional field + fallback」方針で、cues未設定（既存Project・
+// 既存Scene）は必ず空配列へフォールバックする。一括migrationは行わない。
+// 今回のSTEP 2Aではこのhelperを追加するだけで、UI・playback・seekのどこからも
+// まだ呼び出さない（既存の表示・再生経路は一切変更しない）。
+function getLightingSceneCues(scene) {
+  return scene && Array.isArray(scene.cues) ? scene.cues : [];
+}
+
+// 照明フェード v1・STEP 7〜10：Cue snapshot間のintensityだけを補間する小さなpure helper。
+// 責務はArea/Beam 3DのintensityフィールドのlerpだけでStep 4の対象外field（color・位置・
+// 形状・source/target・followPerformerId等）には一切触れない。同じidのArea/Beam同士だけを
+// 対応付け（STEP 8）、構造的な配列（要素数・並び・id構成）はfromState側を基準にする
+// （STEP 9：fade中の追加/削除アニメーションはv1では実装しない。Cue地点へ到達した時点で
+// resolveLightingCueState側がtoState（Cue snapshot）へ丸ごと切り替える）。既存object群は
+// 一切mutationせず、新しい配列/objectだけを返す。
+function interpolateLightingIntensityState(fromAreas, fromBeams3D, toAreas, toBeams3D, progress) {
+  const t = clamp(Number.isFinite(progress) ? progress : 0, 0, 1);
+  const fromAreaList = Array.isArray(fromAreas) ? fromAreas : [];
+  const toAreaList = Array.isArray(toAreas) ? toAreas : [];
+  const areas = [];
+  fromAreaList.forEach((fromArea) => {
+    const toArea = toAreaList.find((a) => a.id === fromArea.id);
+    if (toArea) {
+      // both：既存v1と完全に同じ。intensityだけをfrom→toでlerpし、それ以外のfieldは
+      // from側objectをそのまま使う（color/geometry等は今回も補間しない）。
+      if (typeof toArea.intensity !== "number" || typeof fromArea.intensity !== "number") {
+        areas.push(fromArea);
+      } else {
+        areas.push({ ...fromArea, intensity: lerp(fromArea.intensity, toArea.intensity, t) });
+      }
+      return;
+    }
+    // 照明フェード v1.1・B-2章：from-only＝fade out。from側objectを基準（geometry/color/
+    // followPerformerId等はfrom側の値のまま）に、intensityだけ0へ近づける。Cue地点へ到達した
+    // 瞬間はresolveLightingCueState()の既存仕様どおりto snapshotへ完全に切り替わるため、この
+    // objectは配列から自然に消える（ここでは配列から除去する処理はしない＝fade中は表示上
+    // 存在させ続けるだけ）。
+    if (typeof fromArea.intensity !== "number") {
+      areas.push(fromArea);
+    } else {
+      areas.push({ ...fromArea, intensity: lerp(fromArea.intensity, 0, t) });
+    }
+  });
+  toAreaList.forEach((toArea) => {
+    if (fromAreaList.some((a) => a.id === toArea.id)) return; // both側で処理済み
+    // 照明フェード v1.1・B-3章：to-only＝fade in。to側objectを基準（geometry/color/
+    // followPerformerId等はto側の値）に、0からintensityへ近づける。
+    if (typeof toArea.intensity !== "number") {
+      areas.push(toArea);
+    } else {
+      areas.push({ ...toArea, intensity: lerp(0, toArea.intensity, t) });
+    }
+  });
+
+  const fromBeamList = Array.isArray(fromBeams3D) ? fromBeams3D : [];
+  const toBeamList = Array.isArray(toBeams3D) ? toBeams3D : [];
+  const beams3D = [];
+  fromBeamList.forEach((fromBeam) => {
+    const toBeam = toBeamList.find((b) => b.id === fromBeam.id);
+    if (toBeam) {
+      if (typeof toBeam.intensity !== "number" || typeof fromBeam.intensity !== "number") {
+        beams3D.push(fromBeam);
+      } else {
+        beams3D.push({ ...fromBeam, intensity: lerp(fromBeam.intensity, toBeam.intensity, t) });
+      }
+      return;
+    }
+    // 照明フェード v1.1・D章：追尾Beam（followPerformerId）でも、from-onlyのfade outは
+    // from側Beam object（followPerformerIdを含む）をそのまま基準にするだけなので、
+    // resolveLightingBeams3DForDisplay()による追尾target解決は変更なしにそのまま機能する
+    // （出演者を追尾しながら徐々に暗くなる）。
+    if (typeof fromBeam.intensity !== "number") {
+      beams3D.push(fromBeam);
+    } else {
+      beams3D.push({ ...fromBeam, intensity: lerp(fromBeam.intensity, 0, t) });
+    }
+  });
+  toBeamList.forEach((toBeam) => {
+    if (fromBeamList.some((b) => b.id === toBeam.id)) return;
+    // to-onlyのfade inも同様に、to側Beam object（followPerformerIdを含む）をそのまま基準に
+    // するため、fade in開始時点からresolveLightingBeams3DForDisplay()による追尾が機能する。
+    // 追尾専用の新しい補間ロジックは追加していない。
+    if (typeof toBeam.intensity !== "number") {
+      beams3D.push(toBeam);
+    } else {
+      beams3D.push({ ...toBeam, intensity: lerp(0, toBeam.intensity, t) });
+    }
+  });
+
+  return { areas, beams3D };
+}
+
+// Lighting Cue STEP 2A：keep Cueのresolve用pure helper。
+// 「baseAreas/baseBeams3D（基本Lighting）」と「cues（そのFormationのCue snapshot配列）」、
+// 「elapsedCounts（keep phase内の経過count数）」から、今表示すべきLighting状態を1つ
+// 決定する。cuesの保存順には依存せず、必ずcount昇順へsortしてから判定する
+// （元のcues配列はsortしても書き換えない＝[...cues].sort()で新しい配列を作る）。
+// 「elapsedCounts >= cue.count」を満たす最後のCueをactiveとする単純なstep function判定。
+// 同じcountのCueが複数存在する場合は、Array.prototype.sortの安定ソート特性により元配列で
+// 後ろにあるものが後に評価される＝「後勝ち」になる（重複防止・警告等の追加ロジックは
+// 今回持たない。それはUI実装STEPで扱う）。count=0のCueも通常通り許可する。
+// STEP 2Aでは追加するだけで、TopView/OverheadAudienceView/playback/seekのどこからも
+// まだ呼び出さない。
+function resolveLightingCueState({ baseAreas, baseBeams3D, cues, elapsedCounts }) {
+  const list = Array.isArray(cues) ? cues : [];
+  if (list.length === 0) {
+    return { areas: baseAreas, beams3D: baseBeams3D, activeCueId: null };
+  }
+  const sorted = [...list].sort((a, b) => a.count - b.count);
+  // 照明フェード v1・STEP 5・6：settled＝従来通り「elapsedCounts >= cue.count」を満たす
+  // 最後のCue（＝直前に完成している状態）。next＝まだ到達していない最初のCue（＝これから
+  // fadeで向かう先）。sortedは昇順のため、settledが決まった時点でnextも同時に確定する
+  // （二重ループにしない）。
+  let settled = null;
+  let next = null;
+  for (const cue of sorted) {
+    if (elapsedCounts >= cue.count) settled = cue;
+    else {
+      next = cue;
+      break;
+    }
+  }
+  const settledResult = settled
+    ? { areas: settled.areas, beams3D: settled.beams3D, activeCueId: settled.id }
+    : { areas: baseAreas, beams3D: baseBeams3D, activeCueId: null };
+  if (!next) return settledResult; // 従来通り：これ以上到達すべきCueが無い
+
+  // Lighting Area Move v1・STEP 9・10・11：Fade（intensity）の有無に関わらず、settled（また
+  // はbase）からnextへのArea位置移動は独立して評価する（STEP 11：位置progressとFade
+  // progressを同一progressへ統合しない）。prevBoundary・fromAreasはFadeのprevBoundary思想
+  // と同じ材料をそのまま再利用する（新しい別のtimeline判定を作らない）。
+  const prevBoundary = settled ? settled.count : 0;
+  const moveFromAreas = settled ? settled.areas : baseAreas;
+  const movedAreas = interpolateLightingAreaPositionState(moveFromAreas, next.areas, elapsedCounts, next.count, prevBoundary);
+  // Cue間Beam Move v1・STEP 7：Area Moveと全く同じタイミング情報（settled/next/elapsedCounts/
+  // next.count/prevBoundary）から、Beam Moveも並列に評価する。Fade・Areaいずれのprogressとも
+  // 統合しない、完全に独立した計算。
+  const moveFromBeams3D = settled ? settled.beams3D : baseBeams3D;
+  const movedBeams3D = interpolateLightingBeam3DPositionState(moveFromBeams3D, next.beams3D, elapsedCounts, next.count, prevBoundary);
+
+  // 照明フェード v1・STEP 3：旧Cue（fadeCountsフィールドが存在しない）はsafe fallbackで0
+  // （＝瞬時切替）として扱う。一括migrationはしない。
+  const fadeCounts = Number.isFinite(Number(next.fadeCounts)) ? Math.max(0, Number(next.fadeCounts)) : 0;
+  if (fadeCounts <= 0) {
+    // Lighting Area Move v1：Fadeが無い/未設定でも、positionMoveCountsが設定されたAreaが
+    // あればx/yだけは補間する。全Areaがpositionmovecounts=0/未定義（＝既存Project）の場合、
+    // movedAreasはmoveFromAreasの各要素をそのまま返す＝settledResultと表示結果は完全一致
+    // する（STEP 3・22：後方互換）。
+    // Cue間Beam Move v1・STEP 8：Beamについても同じ後方互換原則（未設定なら完全一致）。
+    return { ...settledResult, areas: movedAreas, beams3D: movedBeams3D };
+  }
+
+  // 照明フェード v1・STEP 6：fade開始地点は「nextへ到達するcount − fadeCounts」だが、
+  // 直前Cue（settled）のcountより前へは遡らない。settledが無い（Base→最初のCue）場合だけ
+  // phase開始地点（elapsedCounts=0）まで遡ってよい。
+  const fadeStart = clamp(next.count - fadeCounts, prevBoundary, next.count);
+  if (elapsedCounts < fadeStart) {
+    // Lighting Area Move v1：まだfade窓に入っていなくても、Moveだけは独立して進む場合がある。
+    // Cue間Beam Move v1・STEP 9：Beamも同様。
+    return { ...settledResult, areas: movedAreas, beams3D: movedBeams3D };
+  }
+
+  // 照明フェード v1・STEP 2・7〜10：fade窓内（fadeStart <= elapsedCounts < next.count）。
+  // settled（またはbase）からnext snapshotへ、intensityだけをinterpolateLightingIntensityState()
+  // で補間する。activeCueIdは「完成済みのCue」の意味を維持するため、fade中はsettled側のまま
+  // （nextへは、実際にelapsedCounts >= next.countへ到達した次の呼び出しで自然に切り替わる）。
+  const span = next.count - fadeStart;
+  const progress = span > 0 ? (elapsedCounts - fadeStart) / span : 1; // span=0はゼロ除算防止の保険
+  const fromAreas = settled ? settled.areas : baseAreas;
+  const fromBeams3D = settled ? settled.beams3D : baseBeams3D;
+  const interpolated = interpolateLightingIntensityState(fromAreas, fromBeams3D, next.areas, next.beams3D, progress);
+  // Lighting Area Move v1・STEP 11：Fade窓内でも、intensity補間結果のx/yだけを、独立して
+  // 計算したmovedAreas（Move progress）へ差し替える。Fadeのfrom-only/to-only（fade in/out）
+  // Areaはmoved側に対応が無いため元のまま（新規追加/削除Areaと同じくMove対象外＝STEP 8）。
+  // Cue間・前の状態との接続 v1・STEP4：movedAreasの各要素は、id一致の場合はmoved.id===area.id
+  // （from/toが同じid）で見つかるが、logicalAreaId一致でMoveした場合はmoved.id
+  // （＝fromArea.idのまま）とarea.id（interpolated.areasの方は、to-onlyのfade-inエントリ
+  // なのでtoArea.id）が異なるため、interpolateLightingAreaPositionState()が付与した
+  // __matchedToAreaId（該当movedAreaが実際に対応付いたtoArea.id）もフォールバックとして
+  // 併用する。これにより「Fadeなしだけ動いてFadeありで止まる」不具合を防ぐ。
+  const finalAreas = interpolated.areas.map((area) => {
+    const moved = movedAreas.find((m) => m.id === area.id || m.__matchedToAreaId === area.id);
+    return moved ? { ...area, x: moved.x, y: moved.y } : area;
+  });
+  // Cue間Beam Move v1・STEP 10：Fade窓内でもintensity補間結果はSource of Truthのまま、
+  // source/targetだけを独立計算したmovedBeams3D（Beam Move progress）へ差し替える。
+  // color/followPerformerId等はFade・Moveどちらでも補間せず、interpolated側の
+  // 値（from側基準）をそのまま維持する。
+  // Lighting Beam 3D 幅の動的補間 v1・STEP 3：sourceWidth/targetWidthも同じ理由で
+  // movedBeams3D（Move progress）側からoverlayする。位置・幅のprogressとFade（intensity）
+  // progressは独立したまま（Fade窓内でも幅補間が止まらない）。colorやfollowPerformerId等の
+  // 従来通り補間しないfieldには一切触れない。
+  // Cue間Beam・前の状態との接続 v1・PART D：Area版finalAreasと同じ理由で、id一致だけでなく
+  // __matchedToBeamId（logicalBeamId一致でMoveした場合、moved.id===fromBeam.idのままだが
+  // interpolated.beams3D側のbeam.idはtoBeam.idになるため）もフォールバックとして併用する。
+  const finalBeams3D = interpolated.beams3D.map((beam) => {
+    const moved = movedBeams3D.find((m) => m.id === beam.id || m.__matchedToBeamId === beam.id);
+    return moved ? { ...beam, source: moved.source, target: moved.target, sourceWidth: moved.sourceWidth, targetWidth: moved.targetWidth } : beam;
+  });
+  return { areas: finalAreas, beams3D: finalBeams3D, activeCueId: settled ? settled.id : null };
+}
+
+// Lighting Cue STEP 2E/2G：keep/move phaseの1点（phase・slideIndex・progress）から、
+// 表示すべきLighting状態を解決する共通pure helper。通常再生用Lighting
+// （playbackLightingState）から呼ばれ、keep/move Lighting resolveの数式を二重実装しない。
+// read-onlyで、areas/beams3D/Cueオブジェクトを一切mutationしない。
+// 新しいLighting resolve engineではなく、既存のresolveLightingCueState()・
+// getLightingAreas()・getLightingBeams3D()・getLightingSceneCues()・
+// getTransitionLightingCues()・getTransitionCounts()・getKeepCounts()という既存pure
+// helperを呼び出しているだけの薄いオーケストレーション層。
+// Lighting Fade v2・6章：cues配列の中で「count <= limitを満たす最後のCue」を返す小さなpure
+// helper。resolveLightingCueState()内部の「settled」判定（elapsedCounts >= cue.countを
+// 満たす最後のCueを採用する、sortしてから安定ソートで後勝ち）と全く同じ考え方を、境界Fadeの
+// 「直前keep Cueより前へ遡らない」制約を計算するためだけに単独で使えるようにした汎用版。
+// resolveLightingCueState()自体は変更していない（既存timeline仕様はそのまま）。
+function findLastCueAtOrBefore(cues, limit) {
+  const sorted = [...(Array.isArray(cues) ? cues : [])].sort((a, b) => a.count - b.count);
+  let result = null;
+  for (const c of sorted) {
+    if (c.count <= limit) result = c;
+    else break;
+  }
+  return result;
+}
+
+// Lighting Fade v2：keep phaseの終盤を、move開始地点のtransition Cue（internal count=0）へ
+// 向けて境界Fadeさせるための薄いオーケストレーション層。
+//   4章：対象はtransition Cueのうちcount===0（sort＋後勝ちで既存resolveLightingCueState()と
+//        同じ判定基準を使う＝17章）かつfadeCounts>0のものだけ。無ければ・fadeCounts<=0なら
+//        通常のkeep resolve（resolveLightingCueState()をそのまま1回呼ぶだけ）と完全に同じ
+//        結果を返す（13・15章：後方互換・既存keep Fadeの非回帰）。
+//   6章：境界Fade開始地点（fadeStart）は「keepCounts - fadeCounts」だが、直前に完成する
+//        keep Cueのcountより前へは遡らない（findLastCueAtOrBeforeで判定、既存
+//        resolveLightingCueState()のprevBoundary思想と同じ）。
+//   5・8・9・10・11・12章：fromState（fadeStart時点のkeep resolve結果、
+//        resolveLightingCueState()をそのまま再利用）→toState（transition count=0 Cueの
+//        snapshotそのもの）を、既存interpolateLightingIntensityState()でintensityだけ補間
+//        する（新しいinterpolation engineは作らない。Area/Beam・same id/from-only/to-only・
+//        followPerformerId保持は既存実装にそのまま委譲される）。
+//   16章：keep終了地点（elapsedCounts===keepCounts）ではprogress=1となり、transition
+//        count=0 Cueのsnapshotと視覚的に完全一致する。
+function resolveKeepPhaseLightingWithBoundaryFade({ scene, keepCues, keepCounts, elapsedCounts, transitionCues }) {
+  const baseAreas = getLightingAreas(scene);
+  const baseBeams3D = getLightingBeams3D(scene);
+  const normalResolved = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts });
+
+  const boundaryCue = findLastCueAtOrBefore(transitionCues, 0);
+  if (!boundaryCue) return normalResolved; // 10章：count=0 Cueが無ければ従来と完全一致
+
+  // Lighting Area Boundary Move v1・PART A・STEP 4A：Move用のprevBoundary（直前keep Cueの
+  // count、無ければ0）は、境界Fadeと同じ「直前Cueより前へは遡らない」思想を再利用する。
+  // Fade用のfadeCounts分岐より前に用意しておき、Fadeの有無に関わらずMoveを評価できるようにする
+  // （STEP 6A：Fade=0でもMoveだけ動く）。
+  const lastKeepCue = findLastCueAtOrBefore(keepCues, keepCounts);
+  const prevBoundary = lastKeepCue ? lastKeepCue.count : 0;
+
+  // PART A・STEP 3A・4A・6A：boundaryCue（transition count=0 Cue）のArea snapshotが持つ
+  // positionMoveCounts（Cue全体の値ではなく、既存Lighting Area Move v1と全く同じ、Area個別
+  // fieldそのもの）を使い、直前keep Cue時点（prevBoundary）のkeep resolve結果を移動元として、
+  // 既存のinterpolateLightingAreaPositionState()でx/yだけを独立して補間する（新しい補間
+  // engineは作らない＝STEP 1B）。Fadeの有無に関わらず評価する。
+  const moveFromState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: prevBoundary });
+  const movedAreas = interpolateLightingAreaPositionState(moveFromState.areas, boundaryCue.areas, elapsedCounts, keepCounts, prevBoundary);
+
+  // keep内Lighting Cue崩れ 修正（PART A）：
+  // interpolateLightingAreaPositionState()は、move対象外（moveCounts<=0）または
+  // まだmove窓に入っていない（progress<=0）Areaについては、引数で渡したfromArea
+  // object（=moveFromState.areasの要素）をそのまま参照で返す（新しいobjectを作らない）
+  // という既存の性質を持つ（関数自体は無変更のまま、この性質だけを利用する）。
+  // これを使い、「実際にx/yがMove補間された（＝moveFromState.areasの元objectから
+  // 参照が変わった）Areaだけ」をidキーで抽出する。moveFromState.areasはprevBoundary
+  // 時点に固定されたsnapshotであり、その値をelapsedCounts全域へ無条件適用すると、
+  // Move開始前のkeep Cue進行（開始時→Cue3→Cue6→…）が最後のkeep Cue位置で
+  // 上書きされてしまう（今回の不具合の原因）。「実際に動いたAreaだけ」を判別する
+  // ことで、この問題を解消する。
+  const activeMovedAreaById = new Map();
+  moveFromState.areas.forEach((originalArea, i) => {
+    const moved = movedAreas[i];
+    if (moved !== originalArea) activeMovedAreaById.set(moved.id, moved);
+  });
+  // Keep→Transition境界 Beam Move修正 v1・STEP 2・4・5・6：Area版activeMovedAreaByIdと
+  // 全く同じ思想で、Beamについても同じKeep→Transition境界のBoundary Moveを成立させる。
+  // 新しいBeam専用補間engineは作らず、最新版interpolateLightingBeam3DPositionState()
+  // （source.x/y/z・target.x/y/z・sourceWidth・targetWidthを同じprogressで補間し、
+  // matchingはfindMatchingLightingBeam()＝id優先→logicalBeamId fallback、追尾Beamは
+  // 対象外、progress計算・prevBoundary clampも既存と同一）をそのまま呼び出すだけで
+  // よい。moveFromState.beams3D（prevBoundary時点のkeep resolve結果）を移動元、
+  // boundaryCue.beams3D（transition count=0 Cue）を移動先として渡す。
+  const movedBeams3D = interpolateLightingBeam3DPositionState(moveFromState.beams3D, boundaryCue.beams3D, elapsedCounts, keepCounts, prevBoundary);
+  // interpolateLightingBeam3DPositionState()は、Move対象外（matchingなし・追尾中・
+  // moveCounts<=0）またはまだmove窓に入っていない（progress<=0）Beamについては、
+  // 引数で渡したfromBeam object（=moveFromState.beams3Dの要素）をそのまま参照で返す
+  // という既存の性質を持つ（関数自体は無変更）。Area版と全く同じ理由で、この性質を
+  // 使い「実際にMoveされた（＝参照が変わった）Beamだけ」をidキーで抽出する。
+  const activeMovedBeamById = new Map();
+  moveFromState.beams3D.forEach((originalBeam, i) => {
+    const moved = movedBeams3D[i];
+    if (moved !== originalBeam) activeMovedBeamById.set(moved.id, moved);
+  });
+  // PART A-2・A-3・STEP9：keep中の通常Lighting Cue解決（normalResolved・Fade結果）を
+  // Source of Truthとし、Boundary Moveは「Move対象Beamのsource/target/sourceWidth/
+  // targetWidthだけを必要な時間帯に上書きするもの」として扱う（Area版applyBoundaryMovedPositions
+  // と全く同じ役割分担）。color/intensity/followPerformerId等には一切触れない
+  // （STEP9：intensityは既存Fade処理の責務のまま独立を維持）。
+  const applyBoundaryMovedPositions = (baseResult) => {
+    if (activeMovedAreaById.size === 0 && activeMovedBeamById.size === 0) return baseResult;
+    const overlaidAreas =
+      activeMovedAreaById.size === 0
+        ? baseResult.areas
+        : baseResult.areas.map((area) => {
+            const moved = activeMovedAreaById.get(area.id);
+            return moved ? { ...area, x: moved.x, y: moved.y } : area;
+          });
+    const overlaidBeams3D =
+      activeMovedBeamById.size === 0
+        ? baseResult.beams3D
+        : baseResult.beams3D.map((beam) => {
+            const moved = activeMovedBeamById.get(beam.id);
+            return moved
+              ? { ...beam, source: moved.source, target: moved.target, sourceWidth: moved.sourceWidth, targetWidth: moved.targetWidth }
+              : beam;
+          });
+    return { ...baseResult, areas: overlaidAreas, beams3D: overlaidBeams3D };
+  };
+
+  const fadeCounts = Number.isFinite(Number(boundaryCue.fadeCounts)) ? Math.max(0, Number(boundaryCue.fadeCounts)) : 0;
+  if (fadeCounts <= 0) {
+    // STEP 6A：Fadeが無い/未設定でもMoveだけは独立して動く。Move対象Areaが1つも
+    // 実際には動いていない場合（全AreaのpositionMoveCountsが0/未定義＝既存Project、
+    // またはまだmove窓に入っていない）は、normalResolvedと表示結果が完全一致する
+    // （STEP 20・23：後方互換。今回の修正で、Move開始前のkeep Cue進行も維持される）。
+    return applyBoundaryMovedPositions(normalResolved);
+  }
+
+  const fadeStart = clamp(keepCounts - fadeCounts, prevBoundary, keepCounts);
+  if (elapsedCounts < fadeStart) {
+    // STEP 5A：まだ境界Fade窓に入っていなくても、Moveだけは独立して進む場合がある。
+    return applyBoundaryMovedPositions(normalResolved);
+  }
+
+  const fromState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: fadeStart });
+  const span = keepCounts - fadeStart;
+  const progress = span > 0 ? (elapsedCounts - fadeStart) / span : 1; // 8・11章：0除算・NaN防止
+  const interpolated = interpolateLightingIntensityState(
+    fromState.areas,
+    fromState.beams3D,
+    boundaryCue.areas,
+    boundaryCue.beams3D,
+    progress
+  );
+  // PART A・STEP 5A：Fade窓内でも、intensity補間結果のx/yだけを、独立して計算した
+  // activeMovedAreaById（Move progress）へ差し替える。Fade progressをMove progress
+  // として使わない・その逆もしない。まだMove窓に入っていないAreaはactiveMovedAreaById
+  // に含まれないため、intensity補間結果のx/y（=fromState/boundaryCue由来の値）が
+  // そのまま維持される（今回の修正でFade窓内の挙動も同じ原則へ統一）。
+  return applyBoundaryMovedPositions({ areas: interpolated.areas, beams3D: interpolated.beams3D, activeCueId: normalResolved.activeCueId });
+}
+
+// Lighting Area Boundary Move v1・PART B・STEP 7B・8B・9B・12B：次Formation Base Areaの
+// うち、Formation境界Moveが有効（positionMoveMode!=="none"）かつ有効な対応元Areaを
+// 持ち、その参照先が実際にfinalPrevAreas（前Formationのtransition timelineを最後まで
+// 解決した最終Area配列＝resolveFinalLightingStateForSlide()の結果、呼び出し側で計算済み）
+// に存在するものだけを対象に、x/yを補間した「先行表示用」の完全なArea object配列を返す。
+//   destCount：到着地点＝現在Formationのtransitioncounts（次Formation1カウント目の頭＝
+//     STEP 3B「次Formationの1countをさらに使って移動する、という意味ではない」）。
+//   elapsedCounts：move phase内の経過count。
+//   prevBoundary：move phase内の最後のtransition Cueのcount（無ければ0）。既存境界Fadeの
+//     prevBoundary思想と揃える（STEP 4A相当をPART Bにも適用）。
+// STEP 12B：対応元Areaが無い・モードが"none"・moveCounts<=0のAreaはこの配列に含まれない
+// （配列順等で勝手に対応を推測しない）。x/y以外は一切補間しない（STEP 16）。intensityは
+// 呼び出し側の既存entryFadeロジック（interpolateLightingIntensityState）が別途担当する
+// （STEP 14の独立思想と同じ）。既存objectは一切mutationせず、新しいobjectだけを返す。
+//
+// Boundary Move中の非position field先行切替 修正（v1.1）：
+// 「前Formationの最終Lighting Areaが、その見た目を保ったまま位置だけ移動する」という
+// 仕様を満たすため、返すobjectのベースをtoArea（destination側）からfromArea（前Formation
+// 最終状態側）へ変更した。color/intensity/width/height/rotation/shape等の非position
+// fieldは、Boundary Move中（destinationのCueへ到達するまで）は常にfromArea側の値を
+// 維持する（destination側の値は、move phaseが終わりkeep phaseへ切り替わった瞬間、
+// resolveLightingForPhasePosition()が自然にnextScene自身を返すことで反映される＝
+// ここで先行して見せる必要はない）。
+// 一方、Boundary Moveの対応付け・merge（mergeBoundaryMoveArrivingAreas）・Fade共存
+// （resolveMovePhaseLightingWithEntryFade）が依存するidentity/metadata
+// （id・positionMoveFromAreaId・positionMoveMode・positionMoveCounts）は、
+// destination Area（toArea）側の値を明示的に維持する。すなわち「表示上の非position
+// fieldはfromArea由来、Boundary Moveを成立させるidentity/metadataはtoArea由来」という
+// 役割分担にする。
+//
+// Formation間logical identity matching v1・PART A・B：対応元Area（fromArea）の探索を、
+// 第一優先logicalAreaId・第二優先（旧Project fallback）positionMoveFromAreaIdの2段階へ
+// 変更した。
+//   1. toArea.logicalAreaIdが存在し、finalPrevAreasの中に同じlogicalAreaIdを持つAreaが
+//      見つかれば、それをfromAreaとして採用する（from.logicalAreaId===to.logicalAreaId）。
+//      「最終照明コピー→貼り付け」を経由しなくても、「前の構成から引き継ぐ」だけで
+//      Boundary Moveが成立するのはこの経路による（PART D）。
+//   2. 1で見つからなかった場合だけ、既存のpositionMoveFromAreaId→fromArea.id matchingへ
+//      fallbackする（旧Project互換。PART E：削除しない）。
+//   3. どちらでも見つからなければ、従来通りMove対象外（STEP 12B）。
+// PART I：同一Formation Base Scene内に同じlogicalAreaIdを持つAreaが複数存在する場合の
+// 安全性については、既存の.find()と全く同じ「最初に見つかった1件を採用する」という
+// 単純な思想をそのまま維持する（配列index matchingではなく、あくまでlogicalAreaId値に
+// よる検索である点は変わらない）。大規模なvalidation/重複検出systemは今回追加しない。
+// PART H：ghost duplicate対策のため、実際に採用したfromArea.idを__matchedFromAreaId
+// という一時的な計算専用field（workへ保存されるschemaの一部ではない。playbackLightingState
+// 算出の内部でだけ使われ、mergeBoundaryMoveArrivingAreas()がtakenOverIds判定に使う）として
+// 結果objectへ含める。旧来の「toArea.positionMoveFromAreaIdをtakenOverIdsとして使う」方式
+// のままだと、「引き継ぐ」で生成されたArea（positionMoveFromAreaId=undefined、
+// logicalAreaIdだけで対応付く）でghost duplicateを防げなくなるため、この変更が必要。
+function resolveBoundaryMoveArrivingAreas(toAreas, finalPrevAreas, destCount, elapsedCounts, prevBoundary) {
+  const toList = Array.isArray(toAreas) ? toAreas : [];
+  const prevList = Array.isArray(finalPrevAreas) ? finalPrevAreas : [];
+  const safeDestCount = Math.max(0, Number(destCount) || 0);
+  const result = [];
+  toList.forEach((toArea) => {
+    const mode = getLightingAreaPositionMoveMode(toArea);
+    if (mode === "none") return; // STEP 12B：Moveなし
+
+    // 第一優先：logicalAreaId matching（from.logicalAreaId === to.logicalAreaId）。
+    const toLogicalId = getLightingAreaLogicalId(toArea);
+    let fromArea = toLogicalId ? prevList.find((a) => getLightingAreaLogicalId(a) === toLogicalId) || null : null;
+    // 第二優先（旧Project fallback）：logicalAreaId matchingが成立しなかった場合だけ、
+    // 既存のpositionMoveFromAreaId → fromArea.id matchingを試す。
+    if (!fromArea) {
+      const fromAreaId = typeof toArea.positionMoveFromAreaId === "string" ? toArea.positionMoveFromAreaId : null;
+      if (fromAreaId) fromArea = prevList.find((a) => a.id === fromAreaId) || null;
+    }
+    if (!fromArea) return; // STEP 12B：対応元Areaが前Formation最終状態に存在しない
+    // STEP 5B・6B：mode="transition"は直前Formationのtransitioncounts全体（=destCount、
+    // 呼び出し側で現在のtransitioncountsをその都度渡す＝保存値ではなく再生時に参照する
+    // 設計）。mode="custom"はこのArea自身のpositionMoveCounts（既存fieldを再利用）。
+    const areaMoveCounts = mode === "transition" ? safeDestCount : getLightingAreaPositionMoveCounts(toArea);
+    if (areaMoveCounts <= 0) return; // custom未設定（0）ならMove対象外
+    const moveStart = clamp(safeDestCount - areaMoveCounts, prevBoundary, safeDestCount); // STEP 4A思想と同じclamp
+    const span = safeDestCount - moveStart;
+    const progress = span > 0 ? clamp((elapsedCounts - moveStart) / span, 0, 1) : elapsedCounts >= safeDestCount ? 1 : 0;
+    // progress=0（moveStart前）でもfromArea位置のまま先行表示する（既存Move v1・PART Aの
+    // 「moveStart前はfrom位置に留まる」挙動と揃える。moveStart前だけ非表示にはしない）。
+    // ベースはfromArea（見た目を保つ）にし、identity/metadataだけtoArea側で上書きする。
+    result.push({
+      ...fromArea,
+      id: toArea.id,
+      logicalAreaId: toArea.logicalAreaId,
+      positionMoveFromAreaId: toArea.positionMoveFromAreaId,
+      positionMoveMode: toArea.positionMoveMode,
+      positionMoveCounts: toArea.positionMoveCounts,
+      x: lerp(fromArea.x, toArea.x, progress),
+      y: lerp(fromArea.y, toArea.y, progress),
+      __matchedFromAreaId: fromArea.id, // ghost duplicate対策専用の一時field（永続化しない）
+    });
+  });
+  return result;
+}
+
+// Lighting Area Boundary Move v1・PART B：move phase中に表示するArea配列へ、
+// resolveBoundaryMoveArrivingAreas()が返した「先行表示用」Areaを合成する薄いhelper。
+// 境界Moveで「移動元」として参照されている現在Formation側のAreaは、そのまま残すと
+// 静止した元Areaと移動中のarriving Areaが同じ位置に二重表示されてしまうため、
+// currentAreas側からは取り除いたうえで結合する（＝1つの論理Areaが連続して移動して見える）。
+// Formation間logical identity matching v1・PART H：takenOverIdsは、arrivingAreasが
+// resolveBoundaryMoveArrivingAreas()で実際に採用したfromArea.id（__matchedFromAreaId、
+// logicalAreaId経由・positionMoveFromAreaId経由のどちらで見つかった場合でも正しい値が
+// 入っている）を使う。以前のtoArea.positionMoveFromAreaIdをそのまま使う方式だと、
+// 「引き継ぐ」で生成されたArea（positionMoveFromAreaId=undefined）のghost duplicateを
+// 防げなくなるため、この変更が必要だった。
+function mergeBoundaryMoveArrivingAreas(currentAreas, arrivingAreas) {
+  const base = Array.isArray(currentAreas) ? currentAreas : [];
+  const arriving = Array.isArray(arrivingAreas) ? arrivingAreas : [];
+  if (arriving.length === 0) return base;
+  const takenOverIds = new Set(arriving.map((a) => a.__matchedFromAreaId).filter((id) => typeof id === "string"));
+  const filteredBase = base.filter((a) => !takenOverIds.has(a.id));
+  return [...filteredBase, ...arriving];
+}
+
+// Lighting Beam 3D Formation間Move v1・PART D・E・F・G・H・I：resolveBoundaryMoveArrivingAreas()
+// と対称なBeam版。ただしmatchingはArea版のlegacy fallback（positionMoveFromAreaId）に相当
+// する新しいBeam専用legacy fieldを作らず、logicalBeamIdのみで行う（PART E：Beam Formation間
+// Moveは今回が初実装であり、旧ProjectにBeam Boundary Move設定自体が存在しないため）。
+//   対象Beamの条件（PART D）：
+//     1. positionMoveMode !== "none"
+//     2. toBeam.logicalBeamId === fromBeam.logicalBeamId で前Formation最終Beamと対応付く
+//        （logicalBeamId未設定＝nullの場合はmatching不成立＝Move対象外）
+//     3. 有効なmoveCounts（mode="transition"はdestCount全体、mode="custom"は
+//        getLightingBeam3DPositionMoveCounts(toBeam)）が0より大きい
+//   PART F：補間するのはsource.x/y/z・target.x/y/zのみ（Cue間Beam Moveと同じlerp思想）。
+//   PART G：非position field（sourceWidth/targetWidth/color/intensity/followPerformerId等）
+//     はfromBeam（前Formation側の見た目）をそのまま維持し、identity/metadata
+//     （id/logicalBeamId/positionMoveMode/positionMoveCounts）だけtoBeam側で上書きする
+//     （Area版resolveBoundaryMoveArrivingAreas()と全く同じ役割分担）。
+//   PART H：toBeam.followPerformerIdが設定されているBeamはMove対象外（追尾中は表示時に
+//     target位置が出演者位置へ置き換わるため、保存target座標の補間自体に意味が無い）。
+//   PART I：__matchedFromBeamId（work stateへ保存されない計算専用の一時field）を、実際に
+//     採用したfromBeam.idとして結果へ含める（ghost duplicate対策・Entry Fade時のFade Out側
+//     座標overlay用、Area版__matchedFromAreaIdと全く同じ役割）。
+function resolveBoundaryMoveArrivingBeams(toBeams, finalPrevBeams, destCount, elapsedCounts, prevBoundary) {
+  const toList = Array.isArray(toBeams) ? toBeams : [];
+  const prevList = Array.isArray(finalPrevBeams) ? finalPrevBeams : [];
+  const safeDestCount = Math.max(0, Number(destCount) || 0);
+  const result = [];
+  toList.forEach((toBeam) => {
+    const mode = getLightingBeam3DPositionMoveMode(toBeam);
+    if (mode === "none") return; // PART D-1：Moveなし
+    if (toBeam.followPerformerId) return; // PART H：追尾中はMove対象外
+
+    // PART E：対応元はlogicalBeamId一致のみで探す（legacy fallbackは作らない）。
+    const toLogicalId = getLightingBeamLogicalId(toBeam);
+    const fromBeam = toLogicalId ? prevList.find((b) => getLightingBeamLogicalId(b) === toLogicalId) || null : null;
+    if (!fromBeam) return; // PART D-2：対応元Beamが前Formation最終状態に存在しない
+
+    // PART C：mode="transition"は直前Formationのtransitioncounts全体（=destCount）。
+    // mode="custom"はこのBeam自身のpositionMoveCounts（Cue間Beam Moveと同じfieldを再利用）。
+    const beamMoveCounts = mode === "transition" ? safeDestCount : getLightingBeam3DPositionMoveCounts(toBeam);
+    if (beamMoveCounts <= 0) return; // PART D-3：custom未設定（0）ならMove対象外
+    const moveStart = clamp(safeDestCount - beamMoveCounts, prevBoundary, safeDestCount); // Area版と同じclamp思想
+    const span = safeDestCount - moveStart;
+    const progress = span > 0 ? clamp((elapsedCounts - moveStart) / span, 0, 1) : elapsedCounts >= safeDestCount ? 1 : 0;
+    // progress=0（moveStart前）でもfromBeam位置のまま先行表示する（Area版と同じ「moveStart前は
+    // from位置に留まる」挙動）。ベースはfromBeam（見た目を保つ）にし、identity/metadataだけ
+    // toBeam側で上書きする（PART G）。
+    // Lighting Beam 3D 幅の動的補間 v1・STEP 4：Cue間Beam Move（interpolateLightingBeam3DPositionState）
+    // と全く同じ考え方で、sourceWidth/targetWidthを同じBoundary Move progressで追加補間する。
+    // 幅は今回からnon-position fieldの扱いから除外し、position（source/target座標）と
+    // 同じ「補間対象」グループへ移す。color/intensity/followPerformerId等は引き続き
+    // from側（前Formation側の見た目）を維持する（STEP 4：幅以外は変更しない）。
+    const fromSourceWidth = fromBeam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH;
+    const toSourceWidth = toBeam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH;
+    const fromTargetWidth = fromBeam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH;
+    const toTargetWidth = toBeam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH;
+    result.push({
+      ...fromBeam,
+      id: toBeam.id,
+      logicalBeamId: toBeam.logicalBeamId,
+      positionMoveMode: toBeam.positionMoveMode,
+      positionMoveCounts: toBeam.positionMoveCounts,
+      source: {
+        ...fromBeam.source,
+        x: lerp(fromBeam.source.x, toBeam.source.x, progress),
+        y: lerp(fromBeam.source.y, toBeam.source.y, progress),
+        z: lerp(fromBeam.source.z, toBeam.source.z, progress),
+      },
+      target: {
+        ...fromBeam.target,
+        x: lerp(fromBeam.target.x, toBeam.target.x, progress),
+        y: lerp(fromBeam.target.y, toBeam.target.y, progress),
+        z: lerp(fromBeam.target.z, toBeam.target.z, progress),
+      },
+      sourceWidth: lerp(fromSourceWidth, toSourceWidth, progress),
+      targetWidth: lerp(fromTargetWidth, toTargetWidth, progress),
+      __matchedFromBeamId: fromBeam.id, // ghost duplicate対策専用の一時field（永続化しない）
+    });
+  });
+  return result;
+}
+
+// Lighting Beam 3D Formation間Move v1・PART J：mergeBoundaryMoveArrivingAreas()と対称な
+// Beam版。Boundary Move対象になった前Formation側Beamは、そのまま残すと静止Beam＋移動中
+// arriving Beamの二重表示になるため、__matchedFromBeamIdで移動元Beamを取り除き、arriving
+// Beamだけを合成する（Fade窓外で使用）。
+function mergeBoundaryMoveArrivingBeams(currentBeams3D, arrivingBeams3D) {
+  const base = Array.isArray(currentBeams3D) ? currentBeams3D : [];
+  const arriving = Array.isArray(arrivingBeams3D) ? arrivingBeams3D : [];
+  if (arriving.length === 0) return base;
+  const takenOverIds = new Set(arriving.map((b) => b.__matchedFromBeamId).filter((id) => typeof id === "string"));
+  const filteredBase = base.filter((b) => !takenOverIds.has(b.id));
+  return [...filteredBase, ...arriving];
+}
+
+// Lighting Fade v3：move phaseの終盤を、次Formationの開始時Lighting（Base Lighting Scene）へ
+// 向けて境界Fadeさせるための薄いオーケストレーション層。resolveKeepPhaseLightingWithBoundaryFade
+// （v2）と対称的な設計にし、resolveLightingCueState()・interpolateLightingIntensityState()・
+// findLastCueAtOrBeforeをそのまま再利用する（新しいLighting interpolation engineは作らない）。
+//   0章：「開始時」はCue化しない。ここでのtoStateはnextScene（次FormationのBase Lighting
+//        Scene）のareas/beams3Dそのもの（getLightingAreas/getLightingBeams3Dで取得）で、
+//        新しいtransition Cueは一切生成しない。
+//   6章A・B・C：nextSceneが無い（次Formation自体が無い／次Formationにlighting Sceneが無い）
+//        場合、またはentryFadeCountsが0/undefined/NaNの場合は、従来のmove resolve結果
+//        （normalResolved）をそのまま返す＝Playback resolve結果が完全に一致する（16章）。
+//   3・6F章：fadeStartは「moveCounts - entryFadeCounts」だが、move中の最後の
+//        transition Cueのcountより前へは遡らない（findLastCueAtOrBeforeで判定、v2の
+//        prevBoundary思想と同じ）。
+//   6D・6E章：moveCounts=0や0除算はspanのガード（span>0 ? ... : 1）で回避し、
+//        entryFadeCounts>moveCountsはclampでmove開始地点までに収める。
+//   Lighting Area Boundary Move v1・PART B・STEP 15：finalPrevAreas（前Formationの最終
+//        Area配列、呼び出し側でresolveFinalLightingStateForSlide()により計算済み）を追加
+//        引数として受け取り、entryFadeの有無に関わらず境界Move（PART B）を独立して評価する。
+function resolveMovePhaseLightingWithEntryFade({
+  baseAreas,
+  baseBeams3D,
+  transitionCues,
+  moveCounts,
+  elapsedCounts,
+  nextScene,
+  finalPrevAreas,
+  finalPrevBeams3D,
+}) {
+  const normalResolved = resolveLightingCueState({ baseAreas, baseBeams3D, cues: transitionCues, elapsedCounts });
+  if (!nextScene) return normalResolved; // 6章A・B：次Formation／次Lighting Sceneが無い
+
+  // PART B・STEP 4A相当：Moveのprev Boundary（move phase内の最後のtransition Cueのcount、
+  // 無ければ0）を、entryFadeCounts分岐より前に用意する（STEP 15：Fade有無に関わらずMove評価）。
+  const lastTransitionCue = findLastCueAtOrBefore(transitionCues, moveCounts);
+  const prevBoundary = lastTransitionCue ? lastTransitionCue.count : 0;
+  const toAreas = getLightingAreas(nextScene);
+  const arrivingAreas = resolveBoundaryMoveArrivingAreas(toAreas, finalPrevAreas, moveCounts, elapsedCounts, prevBoundary);
+  // Lighting Beam 3D Formation間Move v1・PART K：Area版と全く同じタイミング情報
+  // （moveCounts/elapsedCounts/prevBoundary）から、Beam Boundary Moveも並列に評価する。
+  const toBeams3DForMove = getLightingBeams3D(nextScene);
+  const arrivingBeams3D = resolveBoundaryMoveArrivingBeams(toBeams3DForMove, finalPrevBeams3D, moveCounts, elapsedCounts, prevBoundary);
+
+  const entryFadeCounts = Number.isFinite(Number(nextScene.entryFadeCounts)) ? Math.max(0, Number(nextScene.entryFadeCounts)) : 0;
+  if (entryFadeCounts <= 0) {
+    // STEP 15：entryFade未設定/0でも、境界Move対象Areaがあれば先行表示する。対象が1つも
+    // 無ければmergeBoundaryMoveArrivingAreas()はnormalResolved.areasをそのまま返す＝
+    // 表示結果は完全一致する（STEP 20：後方互換）。
+    // Lighting Beam 3D Formation間Move v1・PART L：Beamについても同じ後方互換原則
+    // （Move対象が無ければmergeBoundaryMoveArrivingBeams()はnormalResolved.beams3Dを
+    // そのまま返す＝表示結果は完全一致する）。
+    return {
+      ...normalResolved,
+      areas: mergeBoundaryMoveArrivingAreas(normalResolved.areas, arrivingAreas),
+      beams3D: mergeBoundaryMoveArrivingBeams(normalResolved.beams3D, arrivingBeams3D),
+    };
+  }
+
+  const fadeStart = clamp(moveCounts - entryFadeCounts, prevBoundary, moveCounts); // 6章E・F
+  if (elapsedCounts < fadeStart) {
+    // STEP 5A思想と同じ：まだ境界Fade窓に入っていなくても、境界Moveだけは独立して進む。
+    // Lighting Beam 3D Formation間Move v1・PART M：Beamも同様（Fadeはまだ始めない）。
+    return {
+      ...normalResolved,
+      areas: mergeBoundaryMoveArrivingAreas(normalResolved.areas, arrivingAreas),
+      beams3D: mergeBoundaryMoveArrivingBeams(normalResolved.beams3D, arrivingBeams3D),
+    };
+  }
+
+  const fromState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: transitionCues, elapsedCounts: fadeStart });
+  const span = moveCounts - fadeStart;
+  const progress = span > 0 ? (elapsedCounts - fadeStart) / span : 1; // 6章D：0除算・NaN防止
+  const toBeams3D = getLightingBeams3D(nextScene);
+  const interpolated = interpolateLightingIntensityState(fromState.areas, fromState.beams3D, toAreas, toBeams3D, progress);
+  // Fade窓内では、境界Moveの移動元Area（現在Formation側）はfromState側の「from-only」として
+  // 既存interpolateLightingIntensityState()が自然にfade outし、境界Moveの到着Area（次
+  // Formation側）は「to-only」としてfade inする＝クロスフェードが既存Fadeロジックだけで
+  // 成立するため、ここでの明示的な重複除去（mergeBoundaryMoveArrivingAreas）は不要。x/yだけ
+  // arrivingAreas（Move progress、entryFade progressとは独立に計算済み）へ差し替える
+  // （STEP 14：intensityと位置は独立）。
+  // Formation間Boundary Move × Entry Fade時の静止ghost修正 v1：from-only（Fade Out側、
+  // interpolateLightingIntensityState()がfromArea自身のidをそのまま保持したobject）は
+  // area.id===arrivingArea.id（=toArea.id）では一致しないため、従来はこの分岐だけでは
+  // Move座標が適用されず「Fade Out側だけ元位置に静止する」ghostが発生していた。
+  // area.id===arrivingArea.__matchedFromAreaId（＝resolveBoundaryMoveArrivingAreas()が
+  // 実際に採用したsource Area id）もフォールバックとして併用し、Fade In側・Fade Out側の
+  // 両方へ同じBoundary Move位置をoverlayする。x/y以外のfield（color/shape/width/height/
+  // rotation/intensity/positionMoveMode/positionMoveCounts等）はinterpolated側（from/to
+  // それぞれの見た目＋Fade progress）のまま一切変更しない。
+  const finalAreas = interpolated.areas.map((area) => {
+    const arriving = arrivingAreas.find((a) => a.id === area.id || a.__matchedFromAreaId === area.id);
+    return arriving ? { ...area, x: arriving.x, y: arriving.y } : area;
+  });
+  // Lighting Beam 3D Formation間Move v1・PART N・O：Area版finalAreasと全く同じ理由・同じ
+  // matching（id一致 or __matchedFromBeamId一致）で、Beamについても同じghost防止を最初から
+  // 組み込む。beam.id===arrivingBeam.id（次Formation側／Fade In側）、
+  // beam.id===arrivingBeam.__matchedFromBeamId（前Formation側／Fade Out側）の両方へ、同じ
+  // Boundary Move座標（source.x/y/z・target.x/y/z）をoverlayする。intensity・
+  // color/followPerformerId等はinterpolated側（Fade結果）のまま一切変更しない。
+  // Lighting Beam 3D 幅の動的補間 v1・STEP 5：sourceWidth/targetWidthも同じBoundary Move
+  // overlayへ追加する。これにより「Fade In側だけ幅が変わり、Fade Out側だけ古い幅に残る」
+  // 形状ghostを、Areaの位置ghost修正と全く同じ思想で最初から防止する。
+  const finalBeams3D = interpolated.beams3D.map((beam) => {
+    const arriving = arrivingBeams3D.find((b) => b.id === beam.id || b.__matchedFromBeamId === beam.id);
+    return arriving
+      ? { ...beam, source: arriving.source, target: arriving.target, sourceWidth: arriving.sourceWidth, targetWidth: arriving.targetWidth }
+      : beam;
+  });
+  return { areas: finalAreas, beams3D: finalBeams3D, activeCueId: normalResolved.activeCueId };
+}
+
+function resolveLightingForPhasePosition({ phase, slideIndex, progress, slides, lightingScenes, transitionCounts, transitionLightingCues }) {
+  const slide = slideIndex != null ? slides[slideIndex] : null;
+  if (!slide) return null;
+  if (phase === "preroll") {
+    // Lighting Cue 1カウント目分離 v1・preroll修正：1カウント目Cue（internal count=0）を
+    // 正式に許可したことで、preroll中にelapsedCounts=0をresolveLightingCueState()へ渡すと
+    // 「elapsedCounts(0) >= cue.count(0)」が成立し、1カウント目Cueが誤ってpreroll中（＝
+    // 再生開始・1カウント目到達より前）から発火してしまっていた。
+    // preroll（＝「現在構成を静止表示する」既存の考え方＝Music Sectionのイントロ等、まだ
+    // 1カウント目にすら到達していない期間）は、そもそもCue timeline上の1点ではない。
+    // そのため、resolveLightingCueState()を一切呼ばず、そのFormationの固定Base Lighting
+    // Scene（areas/beams3D）をそのまま返す（count=0 Cueを含め、Cueは一切適用しない）。
+    // resolveLightingCueState()自体・「elapsedCounts >= cue.count」という発火判定・
+    // count=0の意味はここでは一切触れていない（呼び出し自体をやめただけ）。
+    const scene = findLightingSceneBySlideId(lightingScenes, slide.id);
+    return { areas: getLightingAreas(scene), beams3D: getLightingBeams3D(scene), activeCueId: null };
+  }
+  if (phase === "keep") {
+    const scene = findLightingSceneBySlideId(lightingScenes, slide.id);
+    const keepCounts = getKeepCounts(slide);
+    // keepはMath.round()等で丸めず、連続値のままresolveLightingCueState()の
+    // 「elapsedCounts >= cue.count」判定へ渡す（Cue境界のstep発火を正確にするため）。
+    // keep開始の瞬間（progress=0→elapsedCounts=0）に1カウント目Cue（count=0）が発火するのは
+    // 今回の仕様通りの挙動（preroll→keepへ切り替わったタイミング＝1カウント目到達）。
+    const clampedProgress = Number.isFinite(progress) ? clamp(progress, 0, 1) : 0;
+    const elapsedCounts = clampedProgress * keepCounts;
+    // Lighting Fade v2：move開始地点のtransition Cue（count=0）にfadeCounts>0が設定されて
+    // いる場合だけ、keep後半をそのCueへ向けて境界Fadeさせる。それ以外は従来通り
+    // resolveLightingCueState()を1回呼ぶだけの結果と完全に一致する
+    // （resolveKeepPhaseLightingWithBoundaryFade内部のnormalResolvedへのfallbackを参照）。
+    const resolved = resolveKeepPhaseLightingWithBoundaryFade({
+      scene,
+      keepCues: getLightingSceneCues(scene),
+      keepCounts,
+      elapsedCounts,
+      transitionCues: getTransitionLightingCues(transitionLightingCues, slide.id),
+    });
+    return { areas: resolved.areas, beams3D: resolved.beams3D };
+  }
+  if (phase === "move") {
+    // move中はfromSlide（移動元＝slideIndex）のLighting Sceneだけを使う。次Formationの
+    // Lighting Sceneは、moveが完了してphaseがkeepへ切り替わった瞬間に自然に使われる
+    // （Lighting Fade v3のentry Fade窓内を除く。次Formationの開始時Lightingの値を
+    // 「参照」するだけで、次Formationの構造自体は一切変更しない）。
+    const scene = findLightingSceneBySlideId(lightingScenes, slide.id);
+    const keepCounts = getKeepCounts(slide);
+    const keepCues = getLightingSceneCues(scene);
+    // move中のbaseはkeep終了時点（elapsedCounts=keepCounts）のLighting状態
+    // （STEP 2DでtransitionCue追加時に使ったのと全く同じ考え方）。
+    const keepEndState = resolveLightingCueState({
+      baseAreas: getLightingAreas(scene),
+      baseBeams3D: getLightingBeams3D(scene),
+      cues: keepCues,
+      elapsedCounts: keepCounts,
+    });
+    const moveCounts = getTransitionCounts(transitionCounts, slide.id);
+    const clampedProgress = Number.isFinite(progress) ? clamp(progress, 0, 1) : 0;
+    const elapsedCounts = clampedProgress * moveCounts;
+    const transitionCues = getTransitionLightingCues(transitionLightingCues, slide.id);
+    // Lighting Fade v3：次Formationが存在し、そのLighting Sceneにentry Fadeが設定されている
+    // 場合だけ、move終盤を次Formationの開始時Lighting（Base Scene）へ向けて境界Fadeさせる。
+    // それ以外は従来通りresolveLightingCueState()を1回呼ぶだけの結果と完全に一致する
+    // （resolveMovePhaseLightingWithEntryFade内部のnormalResolvedへのfallbackを参照）。
+    const hasNextSlide = slideIndex + 1 < slides.length;
+    const nextSlide = hasNextSlide ? slides[slideIndex + 1] : null;
+    const nextScene = nextSlide ? findLightingSceneBySlideId(lightingScenes, nextSlide.id) : null;
+    // Lighting Area Boundary Move v1・PART B・STEP 7B：境界Move対象Areaの移動元として、
+    // 現在Formationのtransition timelineを最後まで解決した最終Area配列を使う。新しい
+    // 「最終状態計算」は作らず、既存のresolveFinalLightingStateForSlide()（「最終照明を
+    // コピー」v2が使っているのと同じ既存helper）をそのまま再利用する。nextSceneが無い
+    // 場合は境界Move自体が発生しないため計算しない（無駄な計算を避ける）。
+    // Lighting Beam 3D Formation間Move v1・PART K：finalPrevAreasと同じ1回のresolve結果
+    // から、beams3D側も併せて取り出す（新しい別のresolve呼び出しを増やさない）。
+    const finalPrevState = nextScene
+      ? resolveFinalLightingStateForSlide(slide, nextSlide, lightingScenes, transitionLightingCues, transitionCounts)
+      : null;
+    const finalPrevAreas = finalPrevState ? finalPrevState.areas : null;
+    const finalPrevBeams3D = finalPrevState ? finalPrevState.beams3D : null;
+    const resolved = resolveMovePhaseLightingWithEntryFade({
+      baseAreas: keepEndState.areas,
+      baseBeams3D: keepEndState.beams3D,
+      transitionCues,
+      moveCounts,
+      elapsedCounts,
+      nextScene,
+      finalPrevAreas,
+      finalPrevBeams3D,
+    });
+    return { areas: resolved.areas, beams3D: resolved.beams3D };
+  }
+  return null;
+}
+
+// 「照明設定をコピー」v2：指定Formation（slide）のLighting Cue timelineを最後まで進めた
+// 「最終Lighting状態」をresolveする共通pure helper。resolveLightingForPhasePosition()の
+// move分岐が使っている「基本Scene→keep終了状態→transition終了状態」という考え方と
+// 完全に一致させ、新しいCue解決ロジックは作らない（既存のresolveLightingCueState()・
+// getLightingSceneCues()・getTransitionLightingCues()・getKeepCounts()・
+// getTransitionCounts()だけを組み合わせるオーケストレーション層）。
+//   1. 基本Sceneをbaseに、keep Cueをkeep終了時点（elapsedCounts=keepCounts）までresolve。
+//   2. 次Formation（nextSlide）が存在する場合だけ、その結果をbaseに、transition Cueを
+//      move終了時点（elapsedCounts=transitionCounts）までさらにresolveする。
+//   3. 次Formationが存在しない場合はkeep終了状態がそのまま最終状態になる。
+//   4. Cueが1つも無い場合はresolveLightingCueStateの既存fallback（cuesが空ならbaseを
+//      そのまま返す）により、自然に基本Sceneがそのまま返る。
+function resolveFinalLightingStateForSlide(slide, nextSlide, lightingScenes, transitionLightingCues, transitionCounts) {
+  const scene = findLightingSceneBySlideId(lightingScenes, slide.id);
+  const baseAreas = getLightingAreas(scene);
+  const baseBeams3D = getLightingBeams3D(scene);
+  const keepCues = getLightingSceneCues(scene);
+  const keepCounts = getKeepCounts(slide);
+  const keepEndState = resolveLightingCueState({
+    baseAreas,
+    baseBeams3D,
+    cues: keepCues,
+    elapsedCounts: keepCounts,
+  });
+  if (!nextSlide) return keepEndState;
+  const moveCounts = getTransitionCounts(transitionCounts, slide.id);
+  const transitionCues = getTransitionLightingCues(transitionLightingCues, slide.id);
+  return resolveLightingCueState({
+    baseAreas: keepEndState.areas,
+    baseBeams3D: keepEndState.beams3D,
+    cues: transitionCues,
+    elapsedCounts: moveCounts,
+  });
+}
+
+// Lighting Area Formation間logical identity v1・STEP 8：「前の構成から引き継ぐ」実行時、
+// 引き継ぎ元Formationのresolve結果areasの中にlogicalAreaId未設定（＝旧Project・未操作）の
+// Areaがあれば、新しいlogicalAreaIdをlazyに発行し、そのidを持つ全occurrence（Base Scene・
+// keep Cue・transition Cueすべて）へ同じlogicalAreaIdをbackfillするためのpure helper。
+// 「Area.id」は既にFormation内で共有される設計（cloneLightingStateSnapshot参照）のため、
+// 同じidを持つAreaへ同じlogicalAreaIdを書き込むだけでよく、新しい対応付けロジックは作らない。
+// 既にlogicalAreaIdを持つAreaは一切変更しない（上書きしない）。Project全体のPROTOTYPE的な
+// 一括migrationではなく、「引き継ぐ」操作の対象になったAreaだけをその場でbackfillする
+// lazy方式（STEP 13：Projectを開いただけでは発火しない）。
+function backfillLogicalAreaIdsInScene(scene, logicalIdByAreaId) {
+  if (!scene || !logicalIdByAreaId || logicalIdByAreaId.size === 0) return scene;
+  const patchArea = (area) => {
+    if (!area || getLightingAreaLogicalId(area) || !logicalIdByAreaId.has(area.id)) return area;
+    return { ...area, logicalAreaId: logicalIdByAreaId.get(area.id) };
+  };
+  const nextAreas = getLightingAreas(scene).map(patchArea);
+  const nextCues = getLightingSceneCues(scene).map((cue) => ({
+    ...cue,
+    areas: (Array.isArray(cue.areas) ? cue.areas : []).map(patchArea),
+  }));
+  return { ...scene, areas: nextAreas, cues: nextCues };
+}
+
+// Lighting Area Formation間logical identity v1・STEP 8・9・10・11：「前の構成から引き継ぐ」
+// 実行時、transitionLightingCues（現在Formationのtransition Cue列。Sceneオブジェクトの外に
+// 保存されている）側にも同じbackfillを適用するための薄いラッパー。backfillLogicalAreaIdsInScene
+// 自体は変更せず、areas配列だけを持つCue配列へ同じpatchAreaロジックを適用するだけ。
+function backfillLogicalAreaIdsInTransitionCues(transitionCues, logicalIdByAreaId) {
+  const list = Array.isArray(transitionCues) ? transitionCues : [];
+  if (!logicalIdByAreaId || logicalIdByAreaId.size === 0) return list;
+  return list.map((cue) => ({
+    ...cue,
+    areas: (Array.isArray(cue.areas) ? cue.areas : []).map((area) => {
+      if (!area || getLightingAreaLogicalId(area) || !logicalIdByAreaId.has(area.id)) return area;
+      return { ...area, logicalAreaId: logicalIdByAreaId.get(area.id) };
+    }),
+  }));
+}
+
+// Cue間Beam・前の状態との接続 v1・PART F：backfillLogicalAreaIdsInScene()と全く同じ思想
+// （「接続」操作の対象になったBeamだけをその場でbackfillするlazy方式。一括migrationは
+// しない）を、Beam3D／logicalBeamIdへ対称に適用したpure helper。「Beam.id」も既にFormation
+// 内で共有される設計（cloneLightingStateSnapshot参照）のため、同じidを持つBeamへ同じ
+// logicalBeamIdを書き込むだけでよい。既にlogicalBeamIdを持つBeamは一切変更しない。
+function backfillLogicalBeamIdsInScene(scene, logicalIdByBeamId) {
+  if (!scene || !logicalIdByBeamId || logicalIdByBeamId.size === 0) return scene;
+  const patchBeam = (beam) => {
+    if (!beam || getLightingBeamLogicalId(beam) || !logicalIdByBeamId.has(beam.id)) return beam;
+    return { ...beam, logicalBeamId: logicalIdByBeamId.get(beam.id) };
+  };
+  const nextBeams3D = getLightingBeams3D(scene).map(patchBeam);
+  const nextCues = getLightingSceneCues(scene).map((cue) => ({
+    ...cue,
+    beams3D: (Array.isArray(cue.beams3D) ? cue.beams3D : []).map(patchBeam),
+  }));
+  return { ...scene, beams3D: nextBeams3D, cues: nextCues };
+}
+
+// backfillLogicalAreaIdsInTransitionCues()と対称なBeam版の薄いラッパー。transitionLightingCues
+// （Sceneオブジェクトの外に保存されているtransition Cue列）側にも同じbackfillを適用する。
+function backfillLogicalBeamIdsInTransitionCues(transitionCues, logicalIdByBeamId) {
+  const list = Array.isArray(transitionCues) ? transitionCues : [];
+  if (!logicalIdByBeamId || logicalIdByBeamId.size === 0) return list;
+  return list.map((cue) => ({
+    ...cue,
+    beams3D: (Array.isArray(cue.beams3D) ? cue.beams3D : []).map((beam) => {
+      if (!beam || getLightingBeamLogicalId(beam) || !logicalIdByBeamId.has(beam.id)) return beam;
+      return { ...beam, logicalBeamId: logicalIdByBeamId.get(beam.id) };
+    }),
+  }));
+}
+
+// Lighting Area 後付け接続 v1・STEP 3：接続候補として表示すべき「直前Formationの最終的に
+// 見えているLighting Area」一覧を取得するpure helper。単純なBase Scene Area一覧ではなく、
+// 必ずresolveFinalLightingStateForSlide()（keep Cue・transition Cueまで含めた最終状態を
+// resolveする既存helper。「前の構成から引き継ぐ」と全く同じ既存関数を再利用し、新しい
+// resolveロジックは作らない）の結果を使う。理由：直前FormationのAreaがCue途中で移動して
+// いる場合、Boundary Moveの実際の出発点はその最終位置であるため。targetSlideIdの直前
+// Formationが存在しない（最初のFormation）場合は空配列を返す。
+function resolvePreviousFormationFinalAreasForSlide(work, targetSlideId) {
+  const slides = Array.isArray(work.slides) ? work.slides : [];
+  const idx = slides.findIndex((s) => s.id === targetSlideId);
+  if (idx <= 0) return [];
+  const prevSlide = slides[idx - 1];
+  const targetSlide = slides[idx];
+  const scenes = getLightingScenes(work);
+  const finalState = resolveFinalLightingStateForSlide(
+    prevSlide,
+    targetSlide,
+    scenes,
+    work.transitionLightingCues,
+    work.transitionCounts
+  );
+  return finalState.areas;
+}
+
+// Lighting Beam 3D Formation間identity / 前の構成との接続 v1・PART D：
+// resolvePreviousFormationFinalAreasForSlide()と全く同じ考え方で、beams3D版を対称に追加した
+// pure helper。単純な前Formation Base SceneのBeam一覧ではなく、必ず
+// resolveFinalLightingStateForSlide()（Base Scene・keep Cue・transition Cueまで含めた
+// 最終状態をresolveする既存helper）の結果を使う。理由：BeamがCue途中で移動・編集されている
+// 場合、Formation境界時の実際の状態はその最終resolve結果だから（Area版と同一の理由）。
+function resolvePreviousFormationFinalBeamsForSlide(work, targetSlideId) {
+  const slides = Array.isArray(work.slides) ? work.slides : [];
+  const idx = slides.findIndex((s) => s.id === targetSlideId);
+  if (idx <= 0) return [];
+  const prevSlide = slides[idx - 1];
+  const targetSlide = slides[idx];
+  const scenes = getLightingScenes(work);
+  const finalState = resolveFinalLightingStateForSlide(
+    prevSlide,
+    targetSlide,
+    scenes,
+    work.transitionLightingCues,
+    work.transitionCounts
+  );
+  return finalState.beams3D;
+}
+
+// Lighting Cue STEP 2A：Cue snapshot生成用のdeep copy pure helper。
+// cloneLightingSceneContentForSlide()（Formation複製時のLighting Scene複製）と全く同じ
+// deep copyの考え方（{...area}のspread、Beamのsource/targetは個別にspread）を、Cue
+// snapshot生成のためだけに切り出したもの。新しいgeometry計算は一切行わない。
+// Cue snapshot生成時はArea/BeamのIDを維持する方針（今回のCueは「同じLighting要素の
+// 別時点の状態」として扱うため、新規ID発行はしない＝cloneLightingSceneContentForSlideとは
+// 目的が異なる）。object referenceの共有だけを確実に断ち切ることが目的の関数。
+function cloneLightingStateSnapshot(areas, beams3D) {
+  const srcAreas = Array.isArray(areas) ? areas : [];
+  const srcBeams3D = Array.isArray(beams3D) ? beams3D : [];
+  return {
+    areas: srcAreas.map((area) => ({ ...area })),
+    beams3D: srcBeams3D.map((beam) => ({
+      ...beam,
+      source: { ...beam.source },
+      target: { ...beam.target },
+    })),
+  };
+}
+
+// Lighting Area Formation間logical identity v1・STEP 5：「照明状態を貼り付け」が別Formation
+// （コピー元のsourceSlideId ≠ 貼り付け先slideId）へ貼り付けられる場合専用のdeep copy pure
+// helper。cloneLightingStateSnapshot()と同じくobject referenceは断ち切るが、それに加えて
+// Areaのid・logicalAreaIdを新規発行する（Beamはidのみ新規発行、logicalBeamIdは今回未導入）。
+// 別Formationへの貼り付けは「引き継ぐ」ではなく「照明状態の再利用（コピー）」であるため、
+// 時間的連続性を意味するlogicalAreaIdを維持してはならない、という意味論を守るための専用
+// helper（同一Formation内へのpasteは引き続きcloneLightingStateSnapshot()のid維持挙動を使う）。
+function remapLightingStateForCrossFormationPaste(areas, beams3D) {
+  const srcAreas = Array.isArray(areas) ? areas : [];
+  const srcBeams3D = Array.isArray(beams3D) ? beams3D : [];
+  return {
+    areas: srcAreas.map((area) => ({ ...area, id: makeId("lighting-area"), logicalAreaId: makeId("logical-area") })),
+    // Cue間Beam・前の状態との接続 v1・PART A：別Formationへの貼り付けは「引き継ぐ」ではなく
+    // 「照明状態の再利用（コピー）」であるため、Areaと同様にid・logicalBeamIdの両方を
+    // 新規発行する（時間的連続性を意味するlogicalBeamIdを維持してはならない）。
+    beams3D: srcBeams3D.map((beam) => ({
+      ...beam,
+      id: makeId("lighting-beam3d"),
+      logicalBeamId: makeId("logical-beam"),
+      source: { ...beam.source },
+      target: { ...beam.target },
+    })),
+  };
+}
+
+// Lighting要素clipboard統合 v1：selectedLightingItemKeys側のtype tag（"beam3d"、小文字d）と
+// Lighting個別clipboard側のtype tag（"beam3D"、大文字D）の間には既存の食い違いがある。
+// これは保存データschemaの話ではなくUI/clipboard内部のtag名の違いにすぎないため、
+// アプリ全体をrenameせず、この2つの小さな変換関数だけで吸収する。
+function lightingClipboardTypeFromSelectionType(selectionType) {
+  return selectionType === "beam3d" ? "beam3D" : "area";
+}
+function lightingSelectionTypeFromClipboardType(clipboardType) {
+  return clipboardType === "beam3D" ? "beam3d" : "area";
+}
+
+// Lighting要素clipboard統合 v1：Area/Beam1件分のdeep copyを、単体copy・複数copyの両方から
+// 共通で呼べる1箇所に集約する。cloneLightingStateSnapshot()と全く同じ考え方（Areaはspreadの
+// み、Beamはsource/targetも個別にspreadしてobject referenceの共有を断ち切る）だが、こちらは
+// 1件ずつ呼び出す形にして、copiedLightingItemRefのitems配列を組み立てる側から使いやすくする。
+function cloneLightingItemDataByType(type, data) {
+  return type === "beam3D" ? { ...data, source: { ...data.source }, target: { ...data.target } } : { ...data };
+}
+
+const LIGHTING_BEAM_3D_MIN_WIDTH = 0.1; // 舞台座標単位。targetWidth側はこちらでclamp（0以下にならないよう）
+// Lighting UI整理・Prototype卒業・E章：sourceWidthだけは0を許可する（発光元を完全な一点に
+// できるようにするため）。targetWidthの最小値（LIGHTING_BEAM_3D_MIN_WIDTH）とは意図的に
+// 別の定数にしている（sourceWidthだけを0にする、という要求を安全にスコープするため）。
+const LIGHTING_BEAM_3D_MIN_SOURCE_WIDTH = 0;
+const LIGHTING_BEAM_3D_MAX_WIDTH = 10;
+const LIGHTING_BEAM_3D_MIN_Z = 0; // P章：高さの最低値
+const LIGHTING_BEAM_3D_MAX_Z = 40; // Beam高さ上限拡張 v1：安全な上限値の例（20→40。新規Beam初期値20とは別定数のまま）
+const DEFAULT_LIGHTING_BEAM_3D_INTENSITY = 0.75;
+// Lighting UI整理・Prototype卒業・D章：新規Beamのsourcewidth初期値を0.4→0.1へ変更
+// （細く鋭い光の筋という見た目を初期状態から得やすくするため）。targetWidthの初期値は
+// 変更しない。
+const DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH = 0.1;
+const DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH = 1.2;
+
+// 俯瞰客席ビュー・Beam-Performer depth統合 v1：1本のBeam v2をsource→target方向へ何分割して
+// depth比較用のsliceにするか。分割数を増やすほど前後関係の切り替わりが滑らかになるが、
+// SVG要素数（Beam本数×この値）が線形に増えるため、まずは見た目と負荷のバランスを優先し
+// 24分割に留める（Q章：必要以上に増やさない）。
+const LIGHTING_BEAM_3D_DEPTH_SEGMENTS = 24;
+
+// F章：新規Beam v2のdefault。stage width/depthに応じて、固定値が舞台外に大きくはみ出さない
+// よう安全な範囲へclampする（Area・Beam v1のcreateDefault系と同じ考え方）。
+// source.z・target.zの高さ自体はstageサイズに依存しないため、そのままLIGHTING_BEAM_3D_MAX_Zで
+// clampするだけにする。
+function createDefaultLightingBeam3D(stage) {
+  const halfW = stage ? stage.width / 2 : 10;
+  const depth = stage ? stage.depth : 10;
+  const sourceX = clamp(-4, -halfW, halfW);
+  const sourceY = clamp(8, 0, Math.max(depth, 1));
+  const targetX = clamp(0, -halfW, halfW);
+  const targetY = clamp(5, 0, Math.max(depth, 1));
+  return {
+    id: makeId("lighting-beam3d"),
+    // Cue間Beam・前の状態との接続 v1・PART A・identity発行ルール：新規Beamは常に新しい
+    // logicalBeamIdを持つ（Area版と同じ「これから新しく作るBeamは、過去のどのBeamの続きでも
+    // ない」という既定の意味論）。
+    logicalBeamId: makeId("logical-beam"),
+    source: { x: sourceX, y: sourceY, z: clamp(20, LIGHTING_BEAM_3D_MIN_Z, LIGHTING_BEAM_3D_MAX_Z) },
+    target: { x: targetX, y: targetY, z: 0 }, // C章：STEP1ではtarget.zは常に0（舞台床）
+    color: "white",
+    intensity: DEFAULT_LIGHTING_BEAM_3D_INTENSITY,
+    sourceWidth: DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH,
+    targetWidth: DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH,
+    followPerformerId: null, // Lighting Beam 3D 追尾 v1・2章：既定は追尾なし（固定Beam）。既存Beamは
+    // このfieldを持たないため、読み取り側は必ず beam.followPerformerId ?? null で後方互換に扱う。
+  };
+}
+
+// ------------------------------------------------------------------
+// Lighting Beam 3D 追尾 v1：追尾target解決の共通pure helper
+// ------------------------------------------------------------------
+// 新しい独立したSpotlight schemaは作らず、既存Beam schemaへoptional field
+// （followPerformerId）を追加するだけの設計（1・2章）。beam.target自体は常に維持し
+// （3章）、表示時だけ「有効なtarget」をこの関数でderiveする。作品データ（beam.target）は
+// 一切書き換えない（13章：再生中にcommitWorkでtargetを更新しない）。
+//   followPerformerIdが無い／該当placementが見つからない（出演者削除・stage外等＝23・24章）
+//   → 保存済みのbeam.targetをそのまま返す（fallback）。
+//   followPerformerIdがあり、該当placementが見つかる
+//   → そのx/y ＋ 既存beam.target.z（姿勢による高さ変更は今回行わない＝7章）。
+// Top View・Audience View・Exportのいずれもこの1つの関数だけを通し、同じ判定を
+// 二重実装しない（14章）。
+function resolveLightingBeam3DTarget(beam, displayPlacements) {
+  if (!beam) return null;
+  const followId = beam.followPerformerId;
+  if (followId && displayPlacements) {
+    const pos = displayPlacements[followId];
+    if (pos) {
+      return { x: pos.x, y: pos.y, z: beam.target ? beam.target.z : 0 };
+    }
+  }
+  return beam.target;
+}
+
+// Beam配列全体に対してresolveLightingBeam3DTarget()を適用し、「表示用に解決済みの
+// target」を持つ新しい配列を作る薄いラッパー。追尾していないBeam（大多数のケース）は
+// 元のobject referenceをそのまま返すため、無駄な再生成をしない。
+function resolveLightingBeams3DForDisplay(beams3D, displayPlacements) {
+  const list = Array.isArray(beams3D) ? beams3D : [];
+  return list.map((beam) => {
+    const resolvedTarget = resolveLightingBeam3DTarget(beam, displayPlacements);
+    return resolvedTarget === beam.target ? beam : { ...beam, target: resolvedTarget };
+  });
+}
+
+// ------------------------------------------------------------------
+// 照明ビーム・簡易照射面（footprint） v1
+// ------------------------------------------------------------------
+// 「Beamが舞台床のtargetへ到達していることを視覚的に分かりやすくする」ための、表示専用の
+// 派生geometry。workへは一切保存せず、IDも持たず、選択・ドラッグ・copy/paste対象にもしない
+// （C・S章：あくまでBeamのsource/target/targetWidthから毎回計算するだけ）。
+// 中心はbeam.target.x/y（D章）、基本サイズはbeam.targetWidth（E章）を直径として使う。
+// 既存Lighting Areaのgetlightingareastagepoints()と同じ「舞台座標上の多角形近似」という
+// 考え方をそのまま踏襲し、円ではなく回転可能な楕円として、source→target方向（舞台平面上）へ
+// 長軸を向ける（H章）。真上から落ちるBeam（source.x/yとtarget.x/yがほぼ同じ）ほど正円に近く、
+// 斜めのBeamほどBeam方向へ伸びた楕円になる（F・G章）。
+const LIGHTING_BEAM_FOOTPRINT_SEGMENTS = 28; // 既存Areaのellipse近似（28）と同じ分割数
+// I章：斜め具合（angleFactor = 水平距離 / 発光元の高さ）に応じて長径を伸ばす簡易式の係数と
+// 上限。物理的な正確さよりも「真上→円、斜めになるほど徐々に楕円」という連続性を優先する
+// （物理的に完全正確な円錐と床面の交差計算は今回やらない＝Q章）。
+const LIGHTING_BEAM_FOOTPRINT_STRETCH_FACTOR = 1;
+const LIGHTING_BEAM_FOOTPRINT_MAX_ASPECT = 3; // 長径/短径の上限
+const LIGHTING_BEAM_FOOTPRINT_MIN_SOURCE_HEIGHT = 0.5; // source.zが0や極端に小さい場合の安全な下限
+// Lighting Beam 反転 v1・STEP10・11：従来は「target＝必ず舞台床、source＝必ず上空」という
+// 前提で、footprintの中心を常にbeam.target、高さ計算を常にbeam.source.zとしていた。
+// 「発光元と照射先を入れ替える」機能により、床→上空（source側が舞台床）のBeamも作れる
+// ようになったため、この関数だけ「z値がより低い方＝床（footprintの中心・直径の基準）、
+// より高い方＝高さ（斜め具合の計算に使う）」という向きに依存しない判定へ最小限一般化する。
+// 通常の上空→床Beam（source.z > target.z）では、従来通りtarget中心・sourceWidthの意味の
+// まま結果は完全に変わらない（後方互換）。専用の新しいgeometry計算式は追加せず、
+// 既存の計算式へ「どちらが床でどちらが上か」を渡すだけの最小変更に留める。
+function getLightingBeamFootprintStagePoints(beam) {
+  if (!beam || !beam.source || !beam.target) return [];
+  const sourceZ = Number(beam.source.z) || 0;
+  const targetZ = Number(beam.target.z) || 0;
+  const sourceIsFloor = sourceZ <= targetZ; // 同値の場合は従来通りtargetを床扱いにする
+  const floorPoint = sourceIsFloor ? beam.source : beam.target;
+  const floorWidthRaw = sourceIsFloor ? beam.sourceWidth : beam.targetWidth;
+  const skyHeight = sourceIsFloor ? targetZ : sourceZ;
+  const cx = Number(floorPoint.x) || 0;
+  const cy = Number(floorPoint.y) || 0;
+  // E章：targetWidthをそのまま短径（＝真上から見た時の直径）として再利用する。新しい
+  // footprint専用fieldは追加しない。sourceWidthと同じ`??`ベースのfallbackで0を安全に扱う。
+  const floorWidth = Math.max(
+    LIGHTING_BEAM_3D_MIN_WIDTH,
+    floorWidthRaw ?? (sourceIsFloor ? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH : DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH)
+  );
+  const shortRadius = floorWidth / 2;
+
+  const dx = (Number(beam.target.x) || 0) - (Number(beam.source.x) || 0);
+  const dy = (Number(beam.target.y) || 0) - (Number(beam.source.y) || 0);
+  const horizontalDistance = Math.hypot(dx, dy);
+  const sourceHeight = Math.max(skyHeight, LIGHTING_BEAM_FOOTPRINT_MIN_SOURCE_HEIGHT);
+  const angleFactor = horizontalDistance / sourceHeight;
+  const aspect = clamp(1 + angleFactor * LIGHTING_BEAM_FOOTPRINT_STRETCH_FACTOR, 1, LIGHTING_BEAM_FOOTPRINT_MAX_ASPECT);
+  const longRadius = shortRadius * aspect;
+
+  // H章：長軸方向はsource→target方向（舞台平面上）に合わせる。horizontalDistanceがほぼ0
+  // （真上からのBeam）の場合はaspect≒1で見た目上ほぼ正円になるため、角度自体は0のままでよい。
+  const angle = horizontalDistance > 1e-6 ? Math.atan2(dy, dx) : 0;
+  const cosA = Math.cos(angle);
+  const sinA = Math.sin(angle);
+
+  const points = [];
+  for (let i = 0; i < LIGHTING_BEAM_FOOTPRINT_SEGMENTS; i++) {
+    const t = (i / LIGHTING_BEAM_FOOTPRINT_SEGMENTS) * Math.PI * 2;
+    // 回転前（長軸=ローカルx、短軸=ローカルy）の楕円上の点を求めてから、舞台平面上でangleだけ
+    // 回転させ、中心（floorPoint＝床側の点）へ平行移動する。
+    const ex = longRadius * Math.cos(t);
+    const ey = shortRadius * Math.sin(t);
+    points.push({ x: cx + ex * cosA - ey * sinA, y: cy + ex * sinA + ey * cosA });
+  }
+  return points;
+}
+
+// M章：footprintの色はbeam.colorをそのまま使い（lightingAreaColorHex()を再利用）、透明度は
+// 既存のlightingAreaFillOpacity(intensity)をベースにしつつ、Beam本体（同じ
+// lightingAreaFillOpacity(beam.intensity)を直接使っている）より少し落ち着いた薄さにするため
+// 係数を掛けるだけの薄いwrapper。Lighting Areaのopacity計算式自体は変更しない。
+const LIGHTING_BEAM_FOOTPRINT_OPACITY_SCALE = 0.6;
+function lightingBeamFootprintFillOpacity(intensity) {
+  return lightingAreaFillOpacity(intensity) * LIGHTING_BEAM_FOOTPRINT_OPACITY_SCALE;
+}
+
+// Beam v2 1件の任意フィールドをpatchする共通pure helper。updateLightingBeamInScenesと全く
+// 同じパターン（ライブドラッグ更新・確定操作の両方から再利用）だが、対象がbeams3D配列である
+//点だけが異なる。source/targetのネストしたフィールド（x/y/z）を更新する場合は、
+// patchに { source: { ...b.source, x: v } } のような形を渡す（呼び出し側の責務）。
+function updateLightingBeam3DInScenes(lightingScenes, slideId, beamId, patch) {
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  return scenes.map((sc) => {
+    if (!sc || sc.slideId !== slideId) return sc;
+    const beams3D = getLightingBeams3D(sc);
+    const nextBeams3D = beams3D.map((b) => (b.id === beamId ? { ...b, ...(typeof patch === "function" ? patch(b) : patch) } : b));
+    return { ...sc, beams3D: nextBeams3D };
+  });
+}
+
+// ------------------------------------------------------------------
+// Lighting Cue STEP 2C：「現在編集対象がCue snapshotか基本Sceneか」を1箇所で解決する
+// 小さなupdate helper（J・K・L章）。activeCueIdがnull/undefinedの場合は既存の
+// updateLightingAreaInScenes()/updateLightingBeam3DInScenes()へそのまま委譲するため、
+// Cue未選択時の挙動はSTEP 2B以前と完全に同じ。activeCueIdが指定されている場合だけ、
+// 対象Sceneのcues配列から該当Cueを探し、そのCue自身のareas/beams3Dだけをpatchする
+// （基本Scene本体・他Cueには一切影響しない）。大規模な汎用frameworkにはせず、
+// 「Scene検索→Cue検索→immutable update」という最小限の役割だけを持つ。
+function updateActiveLightingAreaInScenes(lightingScenes, slideId, activeCueId, areaId, patch) {
+  if (!activeCueId) return updateLightingAreaInScenes(lightingScenes, slideId, areaId, patch);
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  return scenes.map((sc) => {
+    if (!sc || sc.slideId !== slideId) return sc;
+    const cues = getLightingSceneCues(sc);
+    const nextCues = cues.map((cue) => {
+      if (cue.id !== activeCueId) return cue;
+      const areas = Array.isArray(cue.areas) ? cue.areas : [];
+      const nextAreas = areas.map((a) => (a.id === areaId ? { ...a, ...(typeof patch === "function" ? patch(a) : patch) } : a));
+      return { ...cue, areas: nextAreas };
+    });
+    return { ...sc, cues: nextCues };
+  });
+}
+function updateActiveLightingBeam3DInScenes(lightingScenes, slideId, activeCueId, beamId, patch) {
+  if (!activeCueId) return updateLightingBeam3DInScenes(lightingScenes, slideId, beamId, patch);
+  const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
+  return scenes.map((sc) => {
+    if (!sc || sc.slideId !== slideId) return sc;
+    const cues = getLightingSceneCues(sc);
+    const nextCues = cues.map((cue) => {
+      if (cue.id !== activeCueId) return cue;
+      const beams3D = Array.isArray(cue.beams3D) ? cue.beams3D : [];
+      const nextBeams3D = beams3D.map((b) => (b.id === beamId ? { ...b, ...(typeof patch === "function" ? patch(b) : patch) } : b));
+      return { ...cue, beams3D: nextBeams3D };
+    });
+    return { ...sc, cues: nextCues };
+  });
+}
+
+// ------------------------------------------------------------------
+// Lighting Cue STEP 2D：keep Cue / transition Cue / 基本Sceneのどれが編集対象かを判別する
+// 小さな上位helper群（T章）。STEP 2Cのupdate系pure関数（updateActiveLightingAreaInScenes・
+// updateActiveLightingBeam3DInScenes）自体は一切変更せず、その上に薄いラッパーを追加する
+// だけにとどめる（大規模refactor禁止）。
+//   cueSelection = { phase: "keep" | "transition", cueId } または null（基本Scene編集）。
+// ------------------------------------------------------------------
+
+// Area/Beam CRUD（追加・削除・複製）用：現在の編集対象のareas/beams3D配列をそのまま読み出す。
+// 対象が見つからない場合（Sceneが無い・選択中Cueが既に存在しない等）はnullを返す。
+// 個別照明コピー不具合修正 v1・STEP 8・10：2つのselectedLightingCueSelection
+// （null=開始時 | {phase:"keep"|"transition", cueId}）が同じLighting snapshotを指しているかを
+// 判定する小さなpure helper。Cue snapshot生成時はArea/BeamのIDを維持する設計
+// （cloneLightingStateSnapshot参照）のため、同一Formation内で「開始時のitem」「keep Cue Aの
+// 同idのitem」「transition Cue Bの同idのitem」が同じidを持ちうる。sourceSlideId＋itemIdだけの
+// 比較ではこれらを区別できないため、コピー元判定・トグル解除判定のどちらでもこの
+// sourceSelection比較を併用する（isSelectedLightingItemsCopySourceが元々使っていた比較式を
+// 共通化しただけで、新しい判定ロジックは追加していない）。
+function isSameLightingCueSelection(a, b) {
+  if (a === null || b === null) return a === b;
+  return a.phase === b.phase && a.cueId === b.cueId;
+}
+
+// 「次構成1」reference view v1・STEP 4・6：Area/Beam編集commit handlerが実際に書き込む
+// べきslideIdを解決する共通pure helper。isNextFormationBase=falseなら従来通り現在
+// Formation自身のslideId、trueなら次Formationのslide.id（次Formationが存在しなければ
+// null＝呼び出し側は何もしない）。新しいLighting Cue schemaは一切作らず、常に
+// prev.slides配列から直接slideIdを取得するだけの薄いhelper（設計原則STEP3：Source of
+// Truthは常にfindLightingSceneBySlideId(lightingScenes, nextSlide.id)で取得できる、
+// 次Formationの実Base Sceneそのもの）。
+function resolveActiveLightingTargetSlideId(prev, isNextFormationBase) {
+  const idx = prev.currentSlideIndex;
+  if (!isNextFormationBase) {
+    const slide = prev.slides[idx];
+    return slide ? slide.id : null;
+  }
+  const nextSlide = prev.slides[idx + 1];
+  return nextSlide ? nextSlide.id : null;
+}
+
+function readActiveLightingLists(work, slideId, cueSelection) {
+  if (cueSelection && cueSelection.phase === "transition") {
+    const cues = getTransitionLightingCues(work.transitionLightingCues, slideId);
+    const cue = cues.find((c) => c.id === cueSelection.cueId);
+    if (!cue) return null;
+    return { areas: Array.isArray(cue.areas) ? cue.areas : [], beams3D: Array.isArray(cue.beams3D) ? cue.beams3D : [] };
+  }
+  const scene = findLightingSceneBySlideId(getLightingScenes(work), slideId);
+  if (!scene) return null;
+  if (cueSelection && cueSelection.phase === "keep") {
+    const cues = getLightingSceneCues(scene);
+    const cue = cues.find((c) => c.id === cueSelection.cueId);
+    if (!cue) return null;
+    return { areas: Array.isArray(cue.areas) ? cue.areas : [], beams3D: Array.isArray(cue.beams3D) ? cue.beams3D : [] };
+  }
+  return { areas: getLightingAreas(scene), beams3D: getLightingBeams3D(scene) };
+}
+
+// 上のreadActiveLightingLists()とペアになる書き込み版。areas/beams3Dの両方を丸ごと
+// 差し替えて（片方だけ変更したい場合は、呼び出し側がもう片方に既存値をそのまま渡す）、
+// workのlightingScenes・transitionLightingCuesのうち更新が必要な方だけを差し替えて返す。
+// 対象Scene/Cueが見つからない場合はworkをそのまま返す（何もしない）。
+function writeActiveLightingLists(work, slideId, cueSelection, nextAreas, nextBeams3D) {
+  if (cueSelection && cueSelection.phase === "transition") {
+    const map = work.transitionLightingCues || {};
+    const cues = getTransitionLightingCues(map, slideId);
+    if (!cues.some((c) => c.id === cueSelection.cueId)) return work;
+    const nextCues = cues.map((cue) =>
+      cue.id === cueSelection.cueId ? { ...cue, areas: nextAreas, beams3D: nextBeams3D } : cue
+    );
+    return { ...work, transitionLightingCues: { ...map, [slideId]: nextCues } };
+  }
+  const scenes = getLightingScenes(work);
+  const scene = findLightingSceneBySlideId(scenes, slideId);
+  if (!scene) return work;
+  if (cueSelection && cueSelection.phase === "keep") {
+    const cues = getLightingSceneCues(scene);
+    if (!cues.some((c) => c.id === cueSelection.cueId)) return work;
+    const nextCues = cues.map((cue) =>
+      cue.id === cueSelection.cueId ? { ...cue, areas: nextAreas, beams3D: nextBeams3D } : cue
+    );
+    const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, cues: nextCues } : sc));
+    return { ...work, lightingScenes: nextScenes };
+  }
+  const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, areas: nextAreas, beams3D: nextBeams3D } : sc));
+  return { ...work, lightingScenes: nextScenes };
+}
+
+// 1件のArea/Beamのfield patch用：selectedLightingCueIdがtransition Cueを指している場合は
+// transitionLightingCuesのそのCueのareas/beams3Dだけを差し替え、keep Cueまたは基本Scene編集
+// （activeCueIdがnullの場合）はSTEP 2Cの既存updateActiveLightingAreaInScenes()/
+// updateActiveLightingBeam3DInScenes()へそのまま委譲する（数式の二重実装をしない）。
+function applyActiveLightingUpdate(work, slideId, cueSelection, entityKind, entityId, patch) {
+  const isArea = entityKind === "area";
+  if (cueSelection && cueSelection.phase === "transition") {
+    const map = work.transitionLightingCues || {};
+    const cues = getTransitionLightingCues(map, slideId);
+    const nextCues = cues.map((cue) => {
+      if (cue.id !== cueSelection.cueId) return cue;
+      const list = isArea ? (Array.isArray(cue.areas) ? cue.areas : []) : Array.isArray(cue.beams3D) ? cue.beams3D : [];
+      const nextList = list.map((item) =>
+        item.id === entityId ? { ...item, ...(typeof patch === "function" ? patch(item) : patch) } : item
+      );
+      return isArea ? { ...cue, areas: nextList } : { ...cue, beams3D: nextList };
+    });
+    return { ...work, transitionLightingCues: { ...map, [slideId]: nextCues } };
+  }
+  const activeCueId = cueSelection && cueSelection.phase === "keep" ? cueSelection.cueId : null;
+  const nextScenes = isArea
+    ? updateActiveLightingAreaInScenes(getLightingScenes(work), slideId, activeCueId, entityId, patch)
+    : updateActiveLightingBeam3DInScenes(getLightingScenes(work), slideId, activeCueId, entityId, patch);
+  return { ...work, lightingScenes: nextScenes };
+}
+
+
 // reconcileTransitionCounts/reconcileTransitionPathsと同じ考え方（「新しいslides配列に
 // 実際に存在するslideIdだけを残す」）で、削除されたslideIdを参照する孤児Sceneを除去する。
 // 並べ替え（moveSlide）はslideId自体を変更しないため、この関数を通しても対応関係は
@@ -2732,21 +4669,112 @@ function reconcileLightingScenes(lightingScenes, newSlides) {
 // 新しいid・新しいslideId（newSlideId）を発行して追加する。enabled/noteは引き継ぐ。
 // Project間コピー（insertCrossProjectPastedSlide・performerIdMapありのinsertBulkPastedSlidesIntoWork）
 // からは意図的に呼ばない＝Lighting Sceneをコピーしない（Q章「Project間コピー」の方針）。
+// ------------------------------------------------------------------
+// Lighting Scene copy/paste・共通pure helper
+// ------------------------------------------------------------------
+// Scene 1件分の中身（areas/beams(legacy)/beams3D/enabled/note）を、指定した新しいslideId用に
+// deep copyする（Scene・Area・Beam・Beam v2のidをすべて新規発行）。Formation複製
+// （copyLightingSceneForSlideCopy、すぐ下）が使う共通ロジック
+// （最終照明コピー廃止 v1：以前はLighting Scene単体のコピー＆ペーストからも呼ばれていたが、
+// その機能自体を削除したため、現在はFormation複製専用）。第一引数はScene自体でなくても、
+// {enabled, note, areas, beams, beams3D}という同じ形のプレーンオブジェクトであればよい
+// （getLightingAreas等は`Array.isArray(x.areas)`のような緩い判定のため、Scene・snapshot
+// どちらにも同じ関数がそのまま使える）。
+function cloneLightingSceneContentForSlide(sourceSceneLike, newSlideId) {
+  // Lighting Area Boundary Move v1・STEP 13：従来はBase Areaと各Cue内Areaへそれぞれ独立に
+  // makeId()を呼んでいたため、同じ論理Area（複製前は同一id、Lighting Cue STEP 2Aの
+  // ID維持方針によりBase／keep Cue／transition Cueで共通のid）が、複製後はBase／Cue1／
+  // Cue2で別々の新idになってしまい、複製後Formation内部での「同じAreaのCue間対応」
+  // （Lighting Area Move v1・PART Aが依存する同一id対応付け）が失われる可能性があった。
+  // oldAreaId→newAreaIdのMapを1回だけ作り、Base・全Cueで共有することで、複製後も同じ論理
+  // Areaが同じ新idへ一貫して変換されるようにする（推奨案どおり）。Beamは今回のBoundary
+  // Move対象外のため、従来どおり各occurrenceごとに個別の新idを発行したまま変更しない
+  // （STEP 17・25：最小差分、Beam Move実装禁止）。
+  // Lighting Area Formation間logical identity v1・STEP 3：このMapを、新しいlogicalAreaId
+  // の発行にも流用する（1つのold areaIdにつき、新id・新logicalAreaIdのペアを1組だけ発行し、
+  // Base・全Cueで共有）。このhelperはFormation複製（copyLightingSceneForSlideCopy）から
+  // 呼ばれ、常に「複製元Formationとは別のlogicalAreaId」が正しい（複製は元との時間的
+  // 連続性を意味しないため）。
+  const areaIdMap = new Map();
+  const remapAreaIdentity = (oldId) => {
+    if (!areaIdMap.has(oldId)) areaIdMap.set(oldId, { id: makeId("lighting-area"), logicalAreaId: makeId("logical-area") });
+    return areaIdMap.get(oldId);
+  };
+  const sourceAreas = getLightingAreas(sourceSceneLike);
+  const newAreas = sourceAreas.map((area) => {
+    const identity = remapAreaIdentity(area.id);
+    return { ...area, id: identity.id, logicalAreaId: identity.logicalAreaId };
+  });
+  const sourceBeams = getLightingBeams(sourceSceneLike);
+  const newBeams = sourceBeams.map((beam) => ({ ...beam, id: makeId("lighting-beam") }));
+  const sourceBeams3D = getLightingBeams3D(sourceSceneLike);
+  // Cue間Beam・前の状態との接続 v1・PART A：Formation複製は複製元と時間的連続性を持たない
+  // ため、Areaと同じく複製Beamにも新しいlogicalBeamIdを発行する。Beamは既存方針通りBase
+  // Scene・各Cueで個別に新id/新logicalBeamIdを発行したまま変更しない（STEP 17・25と同じ
+  // 最小差分の考え方。Boundary Move等の対応付けはBeamでは今回未導入のため、Area版の
+  // remapAreaIdentity()のような「Base・Cue間で同じ新id/新logicalIdを共有するMap」は不要）。
+  const newBeams3D = sourceBeams3D.map((beam) => ({
+    ...beam,
+    id: makeId("lighting-beam3d"),
+    logicalBeamId: makeId("logical-beam"),
+    source: { ...beam.source },
+    target: { ...beam.target },
+  }));
+  // Lighting Cue STEP 2A：Formation複製時はCueも一緒に複製する。このcloneLightingSceneContentForSlide
+  // 自体が「areas/beams3DすべてのIDを新規発行する」という既存方針のため、Cue内のarea/beam3Dの
+  // IDも同じ考え方でここでは新規発行する（Cue snapshot生成専用のcloneLightingStateSnapshot()とは
+  // 目的が異なり、IDを維持しない）。Cue自身のIDも既存のentity prefixルールに沿って
+  // makeId("lighting-cue")で新規発行し、複製元Sceneとobject referenceを一切共有しない。
+  const sourceCues = getLightingSceneCues(sourceSceneLike);
+  const newCues = sourceCues.map((cue) => ({
+    id: makeId("lighting-cue"),
+    count: cue.count,
+    // Lighting Cueへ短い名前/メモを付けられる機能・15章：旧Projectのcue.nameは存在しない
+    // ため、typeof判定で安全にfallbackする（一括migrationは行わない）。
+    name: typeof cue.name === "string" ? cue.name : "",
+    // 照明フェード v1・STEP 17：旧Projectのcue.fadeCountsは存在しないため、safe fallbackで
+    // 0（瞬時切替）とする。一括migrationはしない。
+    fadeCounts: Number.isFinite(Number(cue.fadeCounts)) ? Math.max(0, Number(cue.fadeCounts)) : 0,
+    // Lighting Area Boundary Move v1・STEP 13：Cue内Areaのid発行も上のremapAreaIdentity()を
+    // 通し、Base側と同じ新id・新logicalAreaIdへ一貫して変換する（Areaのみ。Beam3Dは従来どおり
+    // 個別発行のまま）。
+    areas: (Array.isArray(cue.areas) ? cue.areas : []).map((area) => {
+      const identity = remapAreaIdentity(area.id);
+      return { ...area, id: identity.id, logicalAreaId: identity.logicalAreaId };
+    }),
+    beams3D: (Array.isArray(cue.beams3D) ? cue.beams3D : []).map((beam) => ({
+      ...beam,
+      id: makeId("lighting-beam3d"),
+      logicalBeamId: makeId("logical-beam"),
+      source: { ...beam.source },
+      target: { ...beam.target },
+    })),
+  }));
+  return {
+    id: makeId("lighting"),
+    slideId: newSlideId,
+    enabled: !!sourceSceneLike.enabled,
+    note: typeof sourceSceneLike.note === "string" ? sourceSceneLike.note : "",
+    // Lighting Fade v3・9章：Formation複製時はentryFadeCountsもLighting Sceneの一部として
+    // 複製する。旧Project・「最終照明をコピー」clipboard（entryFadeCountsを持たない）から
+    // 貼り付けた場合はどちらもsafe fallbackで0になる（10章：最終照明コピーでは
+    // entryFadeCountsを意図的にコピーしない設計のため、clipboard object側にこのfieldを
+    // 追加していない。ここでのfallbackだけで自然に「貼り付け先では0」が実現される）。
+    entryFadeCounts: Number.isFinite(Number(sourceSceneLike.entryFadeCounts))
+      ? Math.max(0, Number(sourceSceneLike.entryFadeCounts))
+      : 0,
+    areas: newAreas,
+    beams: newBeams,
+    beams3D: newBeams3D,
+    cues: newCues,
+  };
+}
+
 function copyLightingSceneForSlideCopy(lightingScenes, oldSlideId, newSlideId) {
   const scenes = Array.isArray(lightingScenes) ? lightingScenes : [];
   const source = findLightingSceneBySlideId(scenes, oldSlideId);
   if (!source) return scenes;
-  // Lighting Area v1・T章：areasもSceneの一部としてdeep copyする。Area.idはコピー先で
-  // 新規発行し（T章の要件）、shape/x/y/width/height/color/intensityはそのまま引き継ぐ。
-  const sourceAreas = getLightingAreas(source);
-  const newAreas = sourceAreas.map((area) => ({ ...area, id: makeId("lighting-area") }));
-  const newScene = {
-    id: makeId("lighting"),
-    slideId: newSlideId,
-    enabled: !!source.enabled,
-    note: typeof source.note === "string" ? source.note : "",
-    areas: newAreas,
-  };
+  const newScene = cloneLightingSceneContentForSlide(source, newSlideId);
   return [...scenes, newScene];
 }
 
@@ -2772,13 +4800,29 @@ function copyLightingScenesForSlidesCopy(lightingScenes, oldSlideIds, newSlideId
 // 方針が異なる（duplicateSlideAt/pasteSlideAfterIndexは「追従のみ」、pasteCopiedSlideは
 // 「常に新しいslideへジャンプ」）ため、ここでは扱わず、戻り値のnewSlideIdを使って
 // 呼び出し側で決定する。副作用は一切持たない（commitWorkのupdater内から呼ばれる前提）。
-function insertSlideCopyAfter(prevSlides, prevTransitionCounts, prevTransitionPaths, sourceSlide, afterIndex) {
+function insertSlideCopyAfter(prevSlides, prevTransitionCounts, prevTransitionPaths, prevTransitionLightingCues, prevTransitionPoses, sourceSlide, afterIndex) {
   const newSlide = { ...deepCopyPlainObject(sourceSlide), id: makeId("slide") };
   const insertAt = afterIndex + 1;
   const nextSlides = [...prevSlides.slice(0, insertAt), newSlide, ...prevSlides.slice(insertAt)];
   const nextTransitionCounts = reconcileTransitionCounts(prevTransitionCounts, prevSlides, nextSlides);
   const nextTransitionPaths = reconcileTransitionPaths(prevTransitionPaths, prevSlides, nextSlides);
-  return { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId: newSlide.id };
+  // Lighting Cue STEP 2D：transitionCounts/transitionPathsと全く同じreconcileルールを
+  // transitionLightingCuesにも適用する（新しく生まれた隣接ペアには旧いtransition Cueを
+  // 一切引き継がせない）。
+  const nextTransitionLightingCues = reconcileTransitionLightingCues(prevTransitionLightingCues, prevSlides, nextSlides);
+  // 移動時の姿勢 v1：同じreconcileルールをtransitionPosesにも適用する。新しく生まれる
+  // 「afterIndexの構成→新しい構成」というペアは、元々存在しなかった隣接関係のため、
+  // 旧いtransition pose設定は一切引き継がれない（Formationコピーによって隣接Transitionの
+  // pose設定を勝手に複製しない、という仕様と自然に一致する）。
+  const nextTransitionPoses = reconcileTransitionPoses(prevTransitionPoses, prevSlides, nextSlides);
+  return {
+    nextSlides,
+    nextTransitionCounts,
+    nextTransitionPaths,
+    nextTransitionLightingCues,
+    nextTransitionPoses,
+    newSlideId: newSlide.id,
+  };
 }
 
 // ------------------------------------------------------------------
@@ -2937,6 +4981,8 @@ function insertSlidesCopyAfter(
   prevSlides,
   prevTransitionCounts,
   prevTransitionPaths,
+  prevTransitionLightingCues,
+  prevTransitionPoses,
   sourceSlides,
   sourceInternalTransitionCounts,
   sourceInternalTransitionPaths,
@@ -2948,6 +4994,8 @@ function insertSlidesCopyAfter(
       nextSlides: prevSlides,
       nextTransitionCounts: prevTransitionCounts,
       nextTransitionPaths: prevTransitionPaths,
+      nextTransitionLightingCues: prevTransitionLightingCues,
+      nextTransitionPoses: prevTransitionPoses,
       newSlideIds: [],
     };
   }
@@ -2984,6 +5032,19 @@ function insertSlidesCopyAfter(
   // 4. 既存reconcileで、貼り付け先Project内の無関係な既存ペアをそのまま維持する。
   let nextTransitionCounts = reconcileTransitionCounts(prevTransitionCounts, prevSlides, nextSlides);
   let nextTransitionPaths = reconcileTransitionPaths(prevTransitionPaths, prevSlides, nextSlides);
+  // Lighting Cue STEP 2D：transitionLightingCuesも同じreconcileへ通す。ただし、すぐ下の
+  // 5番（コピー元で直接隣接していた選択slide同士の内部transitionの移植）はtransitionCounts/
+  // transitionPathsのみを対象とし、transitionLightingCuesへは今回拡張しない（大規模化を避ける
+  // ための意図的なスコープ限定＝Known Issue）。そのため、複数選択一括コピーで内部的に隣接して
+  // いた構成同士のtransition Cueは、他の新しい隣接ペアと同様にreconcileにより既定（空）へ
+  // フォールバックする。
+  const nextTransitionLightingCues = reconcileTransitionLightingCues(prevTransitionLightingCues, prevSlides, nextSlides);
+  // 移動時の姿勢 v1：transitionLightingCuesと同じスコープ限定方針で、内部隣接transitionの
+  // 移植（5番）はtransitionCounts/transitionPathsのみを対象とし、transitionPosesへは
+  // 拡張しない（複数選択一括コピーで内部的に隣接していた構成同士の移動時姿勢は、他の
+  // 新しい隣接ペアと同様にreconcileにより既定＝「開始時の姿勢」へフォールバックする。
+  // Known Issueとして報告する）。
+  const nextTransitionPoses = reconcileTransitionPoses(prevTransitionPoses, prevSlides, nextSlides);
 
   // 5. コピー元で直接隣接していた選択slide同士の内部transitionを、新idへ移植する。
   //    0countも正式値のため、hasOwnPropertyで明示判定する（truthy判定で0を弾かない）。
@@ -3008,7 +5069,7 @@ function insertSlidesCopyAfter(
     }
   }
 
-  return { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideIds };
+  return { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideIds };
 }
 
 // ------------------------------------------------------------------
@@ -3216,6 +5277,13 @@ const FIGURE_ARM_W_RATIO = 0.044; // 腕の太さ。従来0.05から約12%細く
 const FIGURE_LEG_W_RATIO = 0.078; // 脚の太さ。従来0.09から約13%細く
 const FIGURE_LEG_GAP_RATIO = 0.026; // 脚の間隔（中心からの片側オフセット）。従来0.03から約13%細く
 
+// 俯瞰客席ビュー・Performer視認性 v2：これまで頭（<circle>のstroke={THEME.bg}）にしか
+// 付いていなかった黒系輪郭を、胴体・腕・脚にも追加する。色は頭と同じTHEME.bgをそのまま
+// 再利用し、新しい色は増やさない。strokeWidthだけは、腕・脚のような細いパーツに頭と同じ
+// 1.5をそのまま使うと相対的に太く・黒っぽく見えすぎるため、身体パーツ専用にやや細い値へ
+// 分ける（身長「小」で表示された場合でも輪郭が形を潰さない太さを優先）。
+const FIGURE_BODY_STROKE_WIDTH = 1;
+
 function FrontFigure({ color, selected, warn, heightPx, pose, refHeightPx }) {
   if (pose === POSE_KNEELING) {
     return <FrontFigureKneeling color={color} selected={selected} warn={warn} heightPx={heightPx} refHeightPx={refHeightPx} />;
@@ -3258,18 +5326,22 @@ function FrontFigure({ color, selected, warn, heightPx, pose, refHeightPx }) {
           rx={8}
         />
       )}
-      {/* 脚 */}
-      <rect x={-legGap - legW} y={hipY} width={legW} height={H - Math.abs(hipY)} rx={legW * 0.3} fill={color} />
-      <rect x={legGap} y={hipY} width={legW} height={H - Math.abs(hipY)} rx={legW * 0.3} fill={color} />
-      {/* 腕 */}
-      <rect x={-torsoW - armW} y={shoulderY} width={armW} height={Math.abs(hipY - shoulderY) * 0.95} rx={armW * 0.3} fill={color} opacity={0.9} />
-      <rect x={torsoW} y={shoulderY} width={armW} height={Math.abs(hipY - shoulderY) * 0.95} rx={armW * 0.3} fill={color} opacity={0.9} />
-      {/* 胴体 */}
+      {/* 脚：黒系輪郭追加（Performer視認性 v2）。色はTHEME.bg（頭のstrokeと同じ）を再利用。 */}
+      <rect x={-legGap - legW} y={hipY} width={legW} height={H - Math.abs(hipY)} rx={legW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      <rect x={legGap} y={hipY} width={legW} height={H - Math.abs(hipY)} rx={legW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      {/* 腕：黒系輪郭追加。あわせて、Performer視認性 v2（俯瞰客席ビューのPerformerを完全不透明で
+          比較検証するSTEP）に合わせ、depthとは無関係だった固定opacity={0.9}は外し、
+          他の身体パーツと同じ不透明度にする。 */}
+      <rect x={-torsoW - armW} y={shoulderY} width={armW} height={Math.abs(hipY - shoulderY) * 0.95} rx={armW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      <rect x={torsoW} y={shoulderY} width={armW} height={Math.abs(hipY - shoulderY) * 0.95} rx={armW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      {/* 胴体：黒系輪郭追加。 */}
       <path
         d={`M ${-torsoW} ${shoulderY} L ${torsoW} ${shoulderY} L ${torsoW * 0.8} ${hipY} L ${-torsoW * 0.8} ${hipY} Z`}
         fill={color}
+        stroke={THEME.bg}
+        strokeWidth={FIGURE_BODY_STROKE_WIDTH}
       />
-      {/* 頭 */}
+      {/* 頭（既存。輪郭は変更前から存在） */}
       <circle cx={0} cy={headCy} r={headR} fill={color} stroke={THEME.bg} strokeWidth={1.5} />
     </g>
   );
@@ -3403,22 +5475,32 @@ function FrontFigureKneeling({ color, selected, warn, heightPx, refHeightPx }) {
           rx={8}
         />
       )}
-      {/* 長い脚（画面左＝人形自身の右脚）：腰から床までまっすぐ伸びる1本のみ。 */}
+      {/* 長い脚（画面左＝人形自身の右脚）：腰から床までまっすぐ伸びる1本のみ。
+          Performer視認性 v2：<line>にはstroke（=線自体の色）しか無いため、rect/pathと同じ
+          「fill+stroke」の輪郭表現ができない。そこで、まず同じ経路を少し太く・THEME.bg色で
+          下敷きとして描き、その上に元の太さ・色の脚を重ねることで、rect/pathの黒系輪郭と
+          同じ見た目（脚の縁だけ黒くふちどられて見える）を再現する。 */}
+      <line x1={hipXLong} y1={hipY} x2={hipXLong} y2={0} stroke={THEME.bg} strokeWidth={legW + FIGURE_BODY_STROKE_WIDTH * 2} strokeLinecap="round" />
       <line x1={hipXLong} y1={hipY} x2={hipXLong} y2={0} stroke={color} strokeWidth={legW} strokeLinecap="round" />
       {/* 短い脚（画面右＝人形自身の左脚）：腰から床までの半分程度で止める1本＋その先の
           小さな斜めパーツ1本（後方へ折り畳まれた足の記号）。長い脚との長さの違いが
-          「片膝をついている」ことを伝える主な手がかりになる。 */}
+          「片膝をついている」ことを伝える主な手がかりになる。こちらも同じ下敷き方式で輪郭を付ける。 */}
+      <line x1={hipXShort} y1={hipY} x2={hipXShort} y2={shortLegEndY} stroke={THEME.bg} strokeWidth={legW + FIGURE_BODY_STROKE_WIDTH * 2} strokeLinecap="round" />
       <line x1={hipXShort} y1={hipY} x2={hipXShort} y2={shortLegEndY} stroke={color} strokeWidth={legW} strokeLinecap="round" />
+      <line x1={hipXShort} y1={shortLegEndY} x2={diagEndX} y2={diagEndY} stroke={THEME.bg} strokeWidth={legW * 0.9 + FIGURE_BODY_STROKE_WIDTH * 2} strokeLinecap="round" />
       <line x1={hipXShort} y1={shortLegEndY} x2={diagEndX} y2={diagEndY} stroke={color} strokeWidth={legW * 0.9} strokeLinecap="round" />
-      {/* 腕（ニュートラル。standingと同じ考え方で肩から下ろす） */}
-      <rect x={-torsoW - armW} y={shoulderY} width={armW} height={armH} rx={armW * 0.3} fill={color} opacity={0.9} />
-      <rect x={torsoW} y={shoulderY} width={armW} height={armH} rx={armW * 0.3} fill={color} opacity={0.9} />
-      {/* 胴体 */}
+      {/* 腕（ニュートラル。standingと同じ考え方で肩から下ろす）：黒系輪郭追加。あわせて、
+          Performer視認性 v2に合わせ、depthとは無関係だった固定opacity={0.9}は外した。 */}
+      <rect x={-torsoW - armW} y={shoulderY} width={armW} height={armH} rx={armW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      <rect x={torsoW} y={shoulderY} width={armW} height={armH} rx={armW * 0.3} fill={color} stroke={THEME.bg} strokeWidth={FIGURE_BODY_STROKE_WIDTH} />
+      {/* 胴体：黒系輪郭追加。 */}
       <path
         d={`M ${-torsoW} ${shoulderY} L ${torsoW} ${shoulderY} L ${torsoW * 0.8} ${hipY} L ${-torsoW * 0.8} ${hipY} Z`}
         fill={color}
+        stroke={THEME.bg}
+        strokeWidth={FIGURE_BODY_STROKE_WIDTH}
       />
-      {/* 頭 */}
+      {/* 頭（既存。輪郭は変更前から存在） */}
       <circle cx={0} cy={headCy} r={headR} fill={color} stroke={THEME.bg} strokeWidth={1.5} />
     </g>
   );
@@ -3603,11 +5685,18 @@ const TopView = forwardRef(function TopView(
     // 同じ色）にフォールバックし、既存の見た目を一切変えない後方互換設計にする。
     floorColorKey = "black",
     // Lighting Area v1・C・M章：平面図はArea編集可能ビュー。showLightingAreasは
-    // lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled
-    // をApp側で計算済みの単一boolean（表示条件の判定ロジックをTopView側で重複させない）。
+    // showLighting && currentLightingScene && currentLightingScene.enabled
+    // をApp側で計算済みの単一boolean（表示条件の判定ロジックをTopView側で重複させない。
+    // Lighting UI整理・Prototype卒業・Q章：Project-level lightingEnabledは表示条件として
+    // 使用しない）。
     lightingAreas = [],
     showLightingAreas = false,
     selectedLightingAreaId = null,
+    // Lighting複数選択 v1：Area/Beamの複数選択集合。[{type:"area"|"beam3d", id}]。
+    // ステージ上のselected表現（stroke強調）を、単一選択（selectedLightingAreaId/
+    // selectedLightingBeam3DId）だけでなくこの集合のメンバーシップにも反応させるために使う。
+    // 新しいデザインは作らず、既存のselected表現をそのまま複数要素へ適用するだけ。
+    selectedLightingItemKeys = [],
     onSelectLightingArea,
     onLightingAreaDrag,
     onLightingAreaDragStart,
@@ -3616,6 +5705,24 @@ const TopView = forwardRef(function TopView(
     // Undo履歴の確定自体はonLightingAreaDragEnd（既存のendWorkBatch）をそのまま再利用する
     // （move/resizeで別々のバッチ機構を作らない）。
     onLightingAreaResize,
+    // Lighting Beam v2・正式実装 STEP1・J・K章：平面図ではBeam v2本体（3D polygon）は
+    // 描画せず、source/targetマーカー＋ガイド線だけを表示・編集する。lightingBeams3Dは
+    // 現在のSceneのbeams3D一覧、showLightingBeams3Dは表示条件（Areaと同一）を
+    // App側で計算済みの単一boolean（旧Beam v1のprops・pointer handlerはLighting UI整理・
+    // Prototype卒業により削除済み）。
+    lightingBeams3D = [],
+    showLightingBeams3D = false,
+    selectedLightingBeam3DId = null,
+    onSelectLightingBeam3D,
+    onLightingBeam3DSourceDrag,
+    onLightingBeam3DTargetDrag,
+    onLightingBeam3DDragStart,
+    onLightingBeam3DDragEnd,
+    // Lighting Beam 3D 追尾 編集用可視化 v1・26・27章：Appで既にderive済みの表示専用データ
+    // （{beamId, performerId, type, from, to, waypoint?} | null）をそのまま受け取るだけ。
+    // TopView側でLighting work dataや出演者transition pathを検索し直さない（Appでderive→
+    // TopViewで描画、という既存設計を踏襲）。
+    trackingBeamPath = null,
   },
   ref
 ) {
@@ -3869,7 +5976,7 @@ const TopView = forwardRef(function TopView(
     svg.setPointerCapture(e.pointerId);
     const area = lightingAreas.find((a) => a.id === areaId);
     if (!area) return;
-    onSelectLightingArea && onSelectLightingArea(areaId);
+    onSelectLightingArea && onSelectLightingArea(areaId, e.shiftKey);
     const loc = clientToContentPoint(e.clientX, e.clientY);
     const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
     dragState.current = {
@@ -3881,6 +5988,64 @@ const TopView = forwardRef(function TopView(
       moved: false,
     };
     onLightingAreaDragStart && onLightingAreaDragStart();
+  };
+
+  // Lighting Beam v1・R章：Area本体ドラッグと全く同じパターンで"lightingBeam"モードを
+  // dragStateへ追加する。新しいpointer systemは作らない。stopPropagationにより、Beamを
+  // 掴んだ時に出演者drag・Area drag・背景panが同時発火しないようにする。
+  // 旧Lighting Beam v1のpointerDownハンドラは、TopViewでのBeam v1描画・編集機能ごと
+  // 削除した（Lighting UI整理・Prototype卒業）。
+
+  // Lighting Beam v2・正式実装 STEP1・K章：Beam v1のpointerDownと全く同じパターンで、
+  // "lightingBeam3DSource" / "lightingBeam3DTarget" という2つの新しいdragStateモードを
+  // 追加する（新しいpointer systemは作らない）。stopPropagationにより、marker上での
+  // pointerDownが背景pan・出演者drag・Area drag・Beam v1 dragへ伝播しないようにする。
+  const handleLightingBeam3DSourcePointerDown = (e, beamId) => {
+    e.stopPropagation();
+    if (locked) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    svg.setPointerCapture(e.pointerId);
+    const beam = lightingBeams3D.find((b) => b.id === beamId);
+    if (!beam) return;
+    onSelectLightingBeam3D && onSelectLightingBeam3D(beamId, e.shiftKey);
+    const loc = clientToContentPoint(e.clientX, e.clientY);
+    const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
+    dragState.current = {
+      mode: "lightingBeam3DSource",
+      pointerId: e.pointerId,
+      beamId,
+      initialPoint: { x: beam.source.x, y: beam.source.y },
+      anchorStart,
+      moved: false,
+    };
+    onLightingBeam3DDragStart && onLightingBeam3DDragStart();
+  };
+  const handleLightingBeam3DTargetPointerDown = (e, beamId) => {
+    e.stopPropagation();
+    if (locked) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    const beam = lightingBeams3D.find((b) => b.id === beamId);
+    if (!beam) return;
+    // Lighting Beam 3D 追尾 v1・26章：追尾中はtarget側のdragを無効にする（dragを許すと
+    // 表示が出演者位置へ戻ってしまい操作が分かりにくいため）。sourceのdragは対象外
+    // （handleLightingBeam3DSourcePointerDownは変更していない）。ただし選択自体は
+    // 従来通り行う（追尾中でも選択してBeam詳細UIを開けるようにする）。
+    onSelectLightingBeam3D && onSelectLightingBeam3D(beamId, e.shiftKey);
+    if (beam.followPerformerId) return;
+    svg.setPointerCapture(e.pointerId);
+    const loc = clientToContentPoint(e.clientX, e.clientY);
+    const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
+    dragState.current = {
+      mode: "lightingBeam3DTarget",
+      pointerId: e.pointerId,
+      beamId,
+      initialPoint: { x: beam.target.x, y: beam.target.y },
+      anchorStart,
+      moved: false,
+    };
+    onLightingBeam3DDragStart && onLightingBeam3DDragStart();
   };
 
   // Area resize v1・J・L章：既存のlightingArea move用dragStateステートマシンへ
@@ -3895,7 +6060,7 @@ const TopView = forwardRef(function TopView(
     svg.setPointerCapture(e.pointerId);
     const area = lightingAreas.find((a) => a.id === areaId);
     if (!area) return;
-    onSelectLightingArea && onSelectLightingArea(areaId);
+    onSelectLightingArea && onSelectLightingArea(areaId, e.shiftKey);
     const loc = clientToContentPoint(e.clientX, e.clientY);
     const anchorStart = loc ? { x: fromScreenX(loc.x), y: fromScreenY(loc.y) } : { x: 0, y: 0 };
     dragState.current = {
@@ -3903,7 +6068,7 @@ const TopView = forwardRef(function TopView(
       pointerId: e.pointerId,
       areaId,
       dir,
-      initialArea: { shape: area.shape, width: area.width, height: area.height },
+      initialArea: { shape: area.shape, width: area.width, height: area.height, rotation: area.rotation },
       anchorStart,
       moved: false,
     };
@@ -3977,6 +6142,28 @@ const TopView = forwardRef(function TopView(
       return;
     }
 
+    if (st.mode === "lightingBeam3DSource" || st.mode === "lightingBeam3DTarget") {
+      // Lighting Beam v2・正式実装 STEP1・K章：Beam v1のdragと全く同じ「アンカーからの
+      // 連続移動量」方式。高さ（z）はドラッグでは変更しない（P章：数値入力のみ）ため、
+      // ここではx/yだけを更新する。
+      const loc = clientToContentPoint(e.clientX, e.clientY);
+      if (!loc) return;
+      const curX = fromScreenX(loc.x);
+      const curY = fromScreenY(loc.y);
+      const dx = curX - st.anchorStart.x;
+      const dy = curY - st.anchorStart.y;
+      if (!st.moved && (Math.abs(dx) > 0.02 || Math.abs(dy) > 0.02)) st.moved = true;
+      if (!st.moved) return;
+      const nextX = st.initialPoint.x + dx;
+      const nextY = st.initialPoint.y + dy;
+      if (st.mode === "lightingBeam3DSource") {
+        onLightingBeam3DSourceDrag && onLightingBeam3DSourceDrag(st.beamId, nextX, nextY);
+      } else {
+        onLightingBeam3DTargetDrag && onLightingBeam3DTargetDrag(st.beamId, nextX, nextY);
+      }
+      return;
+    }
+
     if (st.mode === "lightingAreaResize") {
       // Area resize v1・F・G章：既存のscreen→stage座標変換（clientToContentPoint +
       // fromScreenX/fromScreenY）をそのまま再利用し、リサイズ専用の座標変換は作らない。
@@ -3992,15 +6179,22 @@ const TopView = forwardRef(function TopView(
       if (!st.moved && (Math.abs(dx) > 0.02 || Math.abs(dy) > 0.02)) st.moved = true;
       if (!st.moved) return;
       const { dir, initialArea } = st;
-      if (initialArea.shape === "circle") {
+      if (normalizeLightingAreaShape(initialArea.shape) === "circle") {
         // D章：円は右側1ハンドルのみ。水平方向の移動量だけでwidth/height（同値）を決める。
         onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width + 2 * dx);
         return;
       }
-      if (dir === "e") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width + 2 * dx);
-      else if (dir === "w") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width - 2 * dx);
-      else if (dir === "s") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height + 2 * dy);
-      else if (dir === "n") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height - 2 * dy);
+      // Lighting Area 回転 v1・9章：楕円が回転している場合、pointerの舞台座標系での移動量
+      // (dx,dy)を、getLightingAreaStagePoints/getLightingAreaResizeHandlesと全く同じ
+      // rotatePointAroundCenter()を使って楕円のローカル（未回転）座標系へ逆回転（-rotation）
+      // してから、既存のe/w/n/s計算へそのまま渡す。回転していない場合はrotatePointAroundCenter
+      // 自体がno-opのため、既存挙動と完全に一致する（新しいgeometry engineは作らない）。
+      const rotation = Number(initialArea.rotation) || 0;
+      const local = rotatePointAroundCenter({ x: dx, y: dy }, { x: 0, y: 0 }, -rotation);
+      if (dir === "e") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width + 2 * local.x);
+      else if (dir === "w") onLightingAreaResize && onLightingAreaResize(st.areaId, "width", initialArea.width - 2 * local.x);
+      else if (dir === "s") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height + 2 * local.y);
+      else if (dir === "n") onLightingAreaResize && onLightingAreaResize(st.areaId, "height", initialArea.height - 2 * local.y);
       return;
     }
 
@@ -4062,6 +6256,14 @@ const TopView = forwardRef(function TopView(
     if (st.mode === "lightingArea") {
       dragState.current = null;
       onLightingAreaDragEnd && onLightingAreaDragEnd();
+      return;
+    }
+
+    if (st.mode === "lightingBeam3DSource" || st.mode === "lightingBeam3DTarget") {
+      dragState.current = null;
+      // Y章：1回のドラッグ＝Undo履歴1件。move用と同じonLightingBeam3DDragEnd
+      // （既存のendWorkBatch）をそのまま再利用する。
+      onLightingBeam3DDragEnd && onLightingBeam3DDragEnd();
       return;
     }
 
@@ -4325,16 +6527,21 @@ const TopView = forwardRef(function TopView(
 
         {/* Lighting Area v1・M章：照明Areaレイヤー。描画順は「stage floor/grid → Lighting Area →
             transition trajectory → performers」（M章）。showLightingAreasはApp側で
-            lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled
+            showLighting && currentLightingScene && currentLightingScene.enabled
             を判定済みのbooleanのため、ここでは条件判定ロジックを重複させない。平面図はArea編集
-            可能ビュー（C章）のため、各Areaにpointer downハンドラを付ける。 */}
+            可能ビュー（C章）のため、各Areaにpointer downハンドラを付ける。
+            Lighting Area整理 v1・D・E章：通常時は色付きstrokeを一切出さず、fill＋
+            intensity由来のfillOpacityだけで「照明」に見えるようにする。選択中だけ、
+            照明色ではないUI選択色（THEME.accent）のアウトラインを付け、どのAreaを編集中か
+            分かるようにする（E章：selection outlineはintensityとは独立した編集UI）。 */}
         {showLightingAreas && (
           <g>
             {lightingAreas.map((area) => {
               const stagePoints = getLightingAreaStagePoints(area);
               if (stagePoints.length === 0) return null;
               const pointsAttr = stagePoints.map((p) => `${toScreenX(p.x)},${toScreenY(p.y)}`).join(" ");
-              const isSelected = area.id === selectedLightingAreaId;
+              const isSelected =
+                area.id === selectedLightingAreaId || selectedLightingItemKeys.some((k) => k.type === "area" && k.id === area.id);
               const fillColor = lightingAreaColorHex(area.color);
               return (
                 <polygon
@@ -4342,9 +6549,9 @@ const TopView = forwardRef(function TopView(
                   points={pointsAttr}
                   fill={fillColor}
                   fillOpacity={lightingAreaFillOpacity(area.intensity)}
-                  stroke={isSelected ? THEME.accent : fillColor}
-                  strokeOpacity={isSelected ? 0.9 : 0.5}
-                  strokeWidth={isSelected ? 2.5 : 1}
+                  stroke={isSelected ? THEME.accent : "none"}
+                  strokeOpacity={isSelected ? 0.9 : 0}
+                  strokeWidth={isSelected ? 2.5 : 0}
                   style={{ cursor: locked ? "default" : "move" }}
                   onPointerDown={(e) => handleLightingAreaPointerDown(e, area.id)}
                 />
@@ -4373,6 +6580,167 @@ const TopView = forwardRef(function TopView(
                   onPointerDown={(e) => handleLightingAreaResizeHandlePointerDown(e, selectedArea.id, h.dir)}
                 />
               ));
+            })()}
+          </g>
+        )}
+
+        {/* 照明ビーム・簡易照射面（footprint） v1・K章：Beam targetの位置に自動計算される
+            表示専用の円／楕円を、Lighting Areaと同じ「床レイヤー」としてBeamの発光元/照射先
+            マーカーより先に描く。IDを持たず、選択・resize handle・編集マーカーは一切付けない
+            （workへは保存しない・選択/ドラッグ対象にもしない＝S章）。showLightingBeams3Dは
+            showLightingAreasと同じ「照明を表示」ON/OFF＋Scene.enabledから導出済みのbooleanの
+            ため、新しいON/OFF stateは追加していない（O章）。 */}
+        {showLightingBeams3D && (
+          <g pointerEvents="none" aria-hidden="true">
+            {lightingBeams3D.map((beam) => {
+              const footprintPoints = getLightingBeamFootprintStagePoints(beam);
+              if (footprintPoints.length === 0) return null;
+              const pointsAttr = footprintPoints.map((p) => `${toScreenX(p.x)},${toScreenY(p.y)}`).join(" ");
+              const fillColor = lightingAreaColorHex(beam.color);
+              return (
+                <polygon
+                  key={`footprint-${beam.id}`}
+                  points={pointsAttr}
+                  fill={fillColor}
+                  fillOpacity={lightingBeamFootprintFillOpacity(beam.intensity)}
+                />
+              );
+            })}
+          </g>
+        )}
+
+        {/* 旧Lighting Beam v1（角度・長さ・太さで舞台床に貼り付く帯）は、Lighting UI整理・
+            Prototype卒業により正式版「3D照明ビーム」へ統合されたため、TopViewでの描画・
+            編集機能は削除した（保存データ自体は既存Formation copyでのみ後方互換のため
+            そのままdeep copyされる。詳細はgetLightingBeams()のコメントを参照）。 */}
+
+        {/* Lighting Beam v2・正式実装 STEP1・J章：平面図では3D Beam本体（polygon）は描かず、
+            発光元（source）・照射先（target）の編集用マーカーと、その間を結ぶ点線ガイドだけを
+            表示する。source＝塗りつぶしcircle、target＝外枠circle、という区別（J章）。
+            どちらもBeamの色をそのまま使い（Q章：新しい色mapは作らない）、選択中だけ
+            THEME.accentのアウトラインで強調する（Areaの選択outlineと同じ考え方）。 */}
+        {showLightingBeams3D && (
+          <g>
+            {lightingBeams3D.map((beam) => {
+              const isSelected =
+                beam.id === selectedLightingBeam3DId || selectedLightingItemKeys.some((k) => k.type === "beam3d" && k.id === beam.id);
+              const beamColor = lightingAreaColorHex(beam.color);
+              const srcX = toScreenX(beam.source.x);
+              const srcY = toScreenY(beam.source.y);
+              const tgtX = toScreenX(beam.target.x);
+              const tgtY = toScreenY(beam.target.y);
+              const markerRadius = 7 * sizeComp;
+              return (
+                <g key={beam.id}>
+                  <line
+                    x1={srcX}
+                    y1={srcY}
+                    x2={tgtX}
+                    y2={tgtY}
+                    stroke={beamColor}
+                    strokeOpacity={0.5}
+                    strokeWidth={1.5}
+                    strokeDasharray="4 3"
+                    pointerEvents="none"
+                  />
+                  {/* target：照射先（外枠circle） */}
+                  <circle
+                    cx={tgtX}
+                    cy={tgtY}
+                    r={markerRadius}
+                    fill={THEME.panelBg}
+                    fillOpacity={0.85}
+                    stroke={isSelected ? THEME.accent : beamColor}
+                    strokeWidth={isSelected ? 2.5 : 1.5}
+                    style={{ cursor: locked ? "default" : "move" }}
+                    onPointerDown={(e) => handleLightingBeam3DTargetPointerDown(e, beam.id)}
+                  />
+                  {/* source：発光元（塗りつぶしcircle） */}
+                  <circle
+                    cx={srcX}
+                    cy={srcY}
+                    r={markerRadius}
+                    fill={beamColor}
+                    stroke={isSelected ? THEME.accent : "none"}
+                    strokeWidth={isSelected ? 2.5 : 0}
+                    style={{ cursor: locked ? "default" : "move" }}
+                    onPointerDown={(e) => handleLightingBeam3DSourcePointerDown(e, beam.id)}
+                  />
+                </g>
+              );
+            })}
+          </g>
+        )}
+
+        {/* Lighting Beam 3D 追尾 編集用可視化 v1：単一選択中の追尾Beamについてだけ、targetが
+            「現在Formation→次Formation」でどう動くかを始点・終点・軌跡として表示する（1・2章）。
+            App側で既にderive済みのtrackingBeamPathをそのまま描画するだけで、Lighting work
+            data・出演者transition pathの検索はここでは一切行わない（26・27章）。舞台上には
+            「追尾」等の文字バッジを一切表示しない（3章：幾何情報のみ）。sourceは軌跡に含めない
+            （22章：Beam guide line＝source→targetとは完全に別レイヤー）。
+            出演者の既存移動軌跡（transitionPaths、直後のブロック）と全く同じgeometry計算
+            （type/from/to/waypoint、App側でcomputeTransitionPaths()を再利用して算出済み）を
+            描画するだけだが、見分けがつくようstrokeDasharrayを付けて区別する（14・31章：
+            出演者軌跡自体のデザインは変更しない）。矢印はtrajectoryArrowPoints()を再利用し、
+            Lighting専用の矢印geometryは作らない（13章）。始点／終点markerはpointerEvents:none
+            の小さな円にし（21章：完全な表示専用、pointer handlerは付けない）、既存のBeam
+            target編集marker（塗りつぶし無し・半径大）とはサイズ・塗りで区別する。 */}
+        {trackingBeamPath && (
+          <g pointerEvents="none">
+            {(() => {
+              const beamColor = lightingAreaColorHex(trackingBeamPath.color);
+              const x1 = toScreenX(trackingBeamPath.from.x);
+              const y1 = toScreenY(trackingBeamPath.from.y);
+              const x2 = toScreenX(trackingBeamPath.to.x);
+              const y2 = toScreenY(trackingBeamPath.to.y);
+              const isCurve = trackingBeamPath.type === "curve" && trackingBeamPath.waypoint;
+              const wx = isCurve ? toScreenX(trackingBeamPath.waypoint.x) : null;
+              const wy = isCurve ? toScreenY(trackingBeamPath.waypoint.y) : null;
+              // 10章：直線かつ完全に静止（from===to）の場合は線・矢印を描かず、始点/終点
+              // markerだけを同じ位置に重ねて表示する（クラッシュ・空描画を避けるための
+              // 最小分岐で、新しいgeometry方式は作らない）。
+              const hasMovement = isCurve || x1 !== x2 || y1 !== y2;
+              const arrowSize = 9;
+              const arrowPts = hasMovement
+                ? isCurve
+                  ? trajectoryArrowPoints(wx, wy, x2, y2, arrowSize)
+                  : trajectoryArrowPoints(x1, y1, x2, y2, arrowSize)
+                : null;
+              const markerRadius = 5;
+              return (
+                <>
+                  {hasMovement &&
+                    (isCurve ? (
+                      <path
+                        d={`M ${x1} ${y1} Q ${wx} ${wy} ${x2} ${y2}`}
+                        fill="none"
+                        stroke={beamColor}
+                        strokeWidth={2}
+                        strokeDasharray="5 4"
+                        strokeLinecap="round"
+                        opacity={0.85}
+                      />
+                    ) : (
+                      <line
+                        x1={x1}
+                        y1={y1}
+                        x2={x2}
+                        y2={y2}
+                        stroke={beamColor}
+                        strokeWidth={2}
+                        strokeDasharray="5 4"
+                        strokeLinecap="round"
+                        opacity={0.85}
+                      />
+                    ))}
+                  {arrowPts && <polygon points={arrowPts} fill={beamColor} opacity={0.85} />}
+                  {/* 始点：outlineのみの小さな円（11章） */}
+                  <circle cx={x1} cy={y1} r={markerRadius} fill="none" stroke={beamColor} strokeWidth={1.5} />
+                  {/* 終点：塗りつぶしの小さな円（12章：始点と区別。既存target markerとは
+                      半径・塗り方が異なるため紛らわしくならない＝21章） */}
+                  <circle cx={x2} cy={y2} r={markerRadius} fill={beamColor} stroke={THEME.bg} strokeWidth={1} />
+                </>
+              );
             })()}
           </g>
         )}
@@ -4586,7 +6954,7 @@ const TopView = forwardRef(function TopView(
 // 渡す。サムネイル自体は画像を生成・保存せず、渡されたplacementsから毎回SVGとして描画するだけ
 // なので、構成名変更・配置変更・構成追加/削除/並べ替え・Copy/Pasteのいずれにも自動的に追従する
 // （16〜21章）。
-function FormationThumbnail({ stage, zones, performers, placements }) {
+function FormationThumbnail({ stage, zones, performers, placements, lightingAreas = [], lightingBeams3D = [] }) {
   const halfW = stage.width / 2;
   const bounds = computeFormationThumbnailBounds(stage);
   const toScreenX = (xUnits) => stageViewToScreenX(bounds, xUnits);
@@ -4673,8 +7041,51 @@ function FormationThumbnail({ stage, zones, performers, placements }) {
         strokeWidth={1.2}
         opacity={0.6}
       />
+      {/* 構成一覧サムネイルLighting反映・STEP4A：Lighting Area。geometryは既存の
+          getLightingAreaStagePoints()をそのまま使い、新しい座標変換は作らない。
+          このコンポーネントが既に持つtoScreenX/toScreenY（stageViewToScreenX/Y、
+          TopView Export等と同じstage単位の座標系）へそのまま通す。色・opacityも
+          既存のlightingAreaColorHex()・lightingAreaFillOpacity()を再利用し、
+          サムネイル専用の補正（薄くする等）は今回は加えない。Performerより
+          必ず前に描画されないよう、Performerブロックより前に置く（TopViewと同じ
+          「Areaは常にPerformerより下のレイヤー」という概念を踏襲）。 */}
+      {lightingAreas.map((area) => {
+        const stagePoints = getLightingAreaStagePoints(area);
+        if (stagePoints.length === 0) return null;
+        const pointsAttr = stagePoints.map((p) => `${toScreenX(p.x)},${toScreenY(p.y)}`).join(" ");
+        return (
+          <polygon
+            key={`thumb-area-${area.id}`}
+            points={pointsAttr}
+            fill={lightingAreaColorHex(area.color)}
+            fillOpacity={lightingAreaFillOpacity(area.intensity)}
+            stroke="none"
+          />
+        );
+      })}
+      {/* 構成一覧サムネイルLighting反映・STEP4A：Beam footprint。Beam本体（24 slice）・
+          source/targetマーカー・guide line・depth sortは今回追加しない（サムネイルでは
+          情報過多・描画負荷増になるため）。geometryは既存のgetLightingBeamFootprintStagePoints()
+          をそのまま使う。色・opacityもTopView Export・Audience Exportと同じ
+          lightingAreaColorHex()・lightingBeamFootprintFillOpacity()を再利用する。 */}
+      {lightingBeams3D.map((beam) => {
+        const footprintPoints = getLightingBeamFootprintStagePoints(beam);
+        if (footprintPoints.length === 0) return null;
+        const pointsAttr = footprintPoints.map((p) => `${toScreenX(p.x)},${toScreenY(p.y)}`).join(" ");
+        return (
+          <polygon
+            key={`thumb-beam-footprint-${beam.id}`}
+            points={pointsAttr}
+            fill={lightingAreaColorHex(beam.color)}
+            fillOpacity={lightingBeamFootprintFillOpacity(beam.intensity)}
+            stroke="none"
+          />
+        );
+      })}
       {/* 出演者：色付き○＋白い数字のみ。選択枠・警告枠・軌跡・waypointは表示しない（6章）。
-          人物マーカー表示の改善・PART A・7章：TopViewと同じTopPerformerMarkerを共有する。 */}
+          人物マーカー表示の改善・PART A・7章：TopViewと同じTopPerformerMarkerを共有する。
+          構成一覧サムネイルLighting反映・STEP4A：Lighting Area/footprintより後ろに描画し、
+          Performerの判読性を優先する（8章）。 */}
       {performers.map((p) => {
         const pos = placements[p.id];
         if (!pos) return null;
@@ -4738,6 +7149,12 @@ const EXPORT_PIXEL_RATIO = 2;
 // 移動軌跡）は完全に別実装であり、この定数はCanvas Export専用（renderTopFormationExport・
 // renderAudienceFormationExport）にしか影響しない。
 const EXPORT_TRAJECTORY_ALPHA = 0.45;
+// 追尾スポット軌跡Export v1・55章：追尾Beam軌跡（線・曲線・矢印・始点/終点marker）専用の
+// Canvas Export透明度。出演者trajectoryのEXPORT_TRAJECTORY_ALPHA（0.45）と同じ意味・
+// 同じ仕組み（save/restoreで閉じ込め、後続描画へ漏らさない）だが、Lighting Beam footprint等
+// より目立ちすぎず、かつBeam色が判別できる程度に少し高めの値にする。EXPORT_TRAJECTORY_ALPHA
+// 自体は変更しない（出演者軌跡の意味は今回のスコープ外）。
+const EXPORT_LIGHTING_TRACKING_PATH_ALPHA = 0.55;
 // Export表示倍率 v1・PART B：auto-fit（＝100%）を基準に、ユーザーがExport Center上で
 // 微調整できる「構図倍率」。EXPORT_PIXEL_RATIO（Canvasの実ピクセル密度＝解像度）とは
 // 完全に別概念で、こちらは「同じ解像度のまま、構図をどれだけ寄せる／引くか」を決める。
@@ -4801,15 +7218,26 @@ function buildFormationExportModel({
   // 既にfallback済みの値が渡ってくる想定）。
   lightingScenes, // Lighting Area Export v1：work.lightingScenes（getLightingScenes()で
   // 既にfallback済みの配列が渡ってくる想定）。
+  showLightingTrackingPaths, // 追尾スポット軌跡Export v1・18〜20章：Export Centerの「追尾スポット軌跡」
+  // checkboxの値。UI state（App側exportShowLightingTrackingPaths）がそのまま渡ってくる想定で、
+  // work/Project schemaには一切保存しない。既存fieldへは影響しない新規追加field。
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
   }
 
+  // Header表示ルール整理 v1・11〜13章：Formation全体のcount（そのFormationが保持される時間＋
+  // 次Formationへの移動時間）は、既存のLighting Cue編集UIが使っているのと全く同じ定義
+  // （totalCounts = keep + move、18630行目付近を参照）を再利用する。新しいcount定義は作らない。
+  // 最終Formation（次が無い）はmove=0のまま（13章：勝手に0や1を足さない）。
+  const hasNextSlideForHeader = slideIndex + 1 < slides.length;
+  const formationTotalCounts =
+    getKeepCounts(slide) + (hasNextSlideForHeader ? getTransitionCounts(transitionCounts, slide.id) : 0);
+
   // 10章：音楽位置は構成一覧と全く同じ方法（resolveSlideMusicPosition）で取得する。
   // 位置計算ロジックはここでは一切持たず、既存関数の戻り値を整形するだけ（二重実装しない）。
   const resolvedMusicPosition = resolveSlideMusicPosition(slides, slideIndex, musicSections, transitionCounts);
-  const musicPosition = formatExportMusicPositionLabel(resolvedMusicPosition, musicSections, showMusicTime);
+  const musicPosition = formatExportMusicPositionLabel(resolvedMusicPosition, musicSections, showMusicTime, formationTotalCounts);
 
   // UI Stability & Bottom Navigation v1・PART C：軌跡消失regressionの根本原因は、ここが
   // 「対象構成→次構成」を自前でハードコードしており、編集画面が実際に使っている
@@ -4834,8 +7262,16 @@ function buildFormationExportModel({
 
   return {
     slideNumber: slideIndex + 1,
+    // Header表示ルール整理 v1・34・35章：「No.X/Y」のYを描くための表示専用field。
+    // Project全体のFormation総数（Export対象数ではなく元slides配列全体の長さ）で、
+    // work/Project schemaへは一切保存しない一時的なdisplay metadata。
+    slideTotal: slides.length,
     slideName: slide.name || "",
     musicPosition,
+    // Header表示ルール整理 v1・37章：2行目の「（計Nカウント）」を再構築せずに参照できるよう、
+    // 算出済みの値をそのままdisplay-only fieldとしても保持しておく（musicPosition.textには
+    // 既に組み込み済みだが、他の用途で必要になった場合に備えて残す）。
+    formationTotalCounts,
     stage,
     zones,
     // 出演者表示サイズ v1・PART N：Project全体で1つの表示設定をExport Modelにも含める
@@ -4865,6 +7301,50 @@ function buildFormationExportModel({
       const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
       if (!scene || !scene.enabled) return [];
       return getLightingAreas(scene);
+    })(),
+    // 照明ビームExport対応・STEP①：lightingAreasと全く同じ条件判定パターン
+    // （lightingEnabled && 対象SceneのScene.enabled）を再利用する。新しい判定ロジックは
+    // 作らず、Beam v2 schema（source/target/sourceWidth/targetWidth/color/intensity）は
+    // 一切変更しない。条件を満たさない場合は常に空配列にすることで、renderer側は
+    // 「lightingBeams3D.length > 0か」だけを見ればよい（既存getLightingBeams3D()という
+    // 既存helperをそのまま再利用し、scene.beams3Dへの直接アクセスは行わない）。
+    lightingBeams3D: (() => {
+      if (!lightingEnabled) return [];
+      const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
+      if (!scene || !scene.enabled) return [];
+      // Lighting Beam 3D 追尾 v1・28章：通常Formation Exportは1構成＝1枚の静止画のため、
+      // アニメーションではなくそのFormation自身のslide.placementsを使ってresolveする
+      // （displayPlacementsのような再生中の一時座標は存在しないため参照しない）。Top View /
+      // Audience Viewと全く同じresolveLightingBeams3DForDisplay()を再利用し、Export専用の
+      // 追尾判定は作らない（14章）。対象出演者が見つからない場合は既存のbeam.targetへ
+      // fallbackする（23章）。Lighting CueごとのExportは今回のスコープ外のため、
+      // 従来通りbase SceneのgetLightingBeams3D()のみを対象にする。
+      return resolveLightingBeams3DForDisplay(getLightingBeams3D(scene), slide.placements || {});
+    })(),
+    // 追尾スポット軌跡Export v1・2〜3・11〜17章：selectionには一切依存せず、対象Formationの
+    // Base Lighting Scene内に存在するfollowPerformerId付きBeamすべてを対象にする（固定Beamは
+    // resolveLightingBeamTrackingPaths側で自動的にskipされる）。lightingAreas/lightingBeams3D
+    // と全く同じ条件判定パターン（lightingEnabled && Scene.enabled）に揃え、showOption
+    // （showLightingTrackingPaths）がfalsyな場合も含め、条件を満たさなければ常に空配列にする
+    // （28章：renderer側はlength>0かだけを見ればよい）。参照方向は常に「対象Formation→次
+    // Formation」固定（12章：出演者側のtrajectoryModeには一切連動させない）。pathConfigは
+    // そのFormation→次Formationの出演者移動設定そのもの（17章：effectiveTransitionPathConfig
+    // [slide.id]）を使う。geometry計算自体はresolveLightingBeamTrackingPaths()（内部で
+    // computeTransitionPaths()を再利用）へ完全に委譲し、ここでLighting専用の幾何計算は
+    // 一切行わない（4・7章）。
+    lightingBeamTrackingPaths: (() => {
+      if (!showLightingTrackingPaths || !lightingEnabled) return [];
+      const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
+      if (!scene || !scene.enabled) return [];
+      const nextSlide = slides[slideIndex + 1];
+      if (!nextSlide) return []; // 13章：最終Formationは追尾軌跡なし
+      const pathConfig = (effectiveTransitionPathConfig && effectiveTransitionPathConfig[slide.id]) || null;
+      return resolveLightingBeamTrackingPaths({
+        beams: getLightingBeams3D(scene),
+        fromPlacements: slide.placements || {},
+        toPlacements: nextSlide.placements || {},
+        pathConfig,
+      });
     })(),
   };
 }
@@ -4896,6 +7376,7 @@ function buildFormationExportModels({
   stageAppearance, // Export舞台色反映 v1：buildFormationExportModelへそのまま伝播するだけ
   lightingEnabled, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
   lightingScenes, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
+  showLightingTrackingPaths, // 追尾スポット軌跡Export v1・27章：buildFormationExportModelへそのまま伝播するだけ
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -4922,9 +7403,494 @@ function buildFormationExportModels({
         stageAppearance,
         lightingEnabled,
         lightingScenes,
+        showLightingTrackingPaths,
       })
     )
     .filter((m) => m !== null);
+}
+
+// ------------------------------------------------------------------
+// Lighting Cue Export v1：buildLightingCueExportModels()
+// ------------------------------------------------------------------
+// 選択中の1Formationについて、「開始時 → keep Cue（display count昇順）→ transition Cue
+// （Formation全体display count昇順）」の時間順で、それぞれの時点の「実際に見えるLighting状態」＋
+// 「その時点の出演者配置」を1カットずつ持つExport Model配列を作る（1・5・6章）。
+// 新しいCue適用engineは作らず、既存のresolveLightingCueState()をそのまま再利用する（10章）。
+// 開始時カットは、既存buildFormationExportModel()の結果（placements=slide.placements、
+// lightingAreas/lightingBeams3D=base Scene）をそのまま使う（11章：通常Exportと全く同じ
+// フィールドを二重実装しない）。musicPosition・performers・stage・zones・stageAppearance・
+// performerDisplayScale等の共通フィールドも、この開始時model（baseModel）を土台に
+// spreadするだけで、buildFormationExportModel()自体は一切変更しない（24章）。
+function buildLightingCueExportModels({
+  slide,
+  slideIndex,
+  slides,
+  performers,
+  stage,
+  zones,
+  musicSections,
+  transitionCounts,
+  effectiveTransitionPathConfig,
+  transitionPoses,
+  performerDisplayScale,
+  showMusicTime,
+  stageAppearance,
+  lightingScenes,
+  transitionLightingCues,
+  showTrajectory, // Lighting Cue Export 軌跡対応 v1・35章：Export Centerの「移動軌跡」checkboxの値
+  trajectoryMode, // 同・35章：「次に」/「前に」。既存exportTrajectoryModeをそのまま共有する
+  showLightingTrackingPaths, // 同・35章：Export Centerの「追尾スポット軌跡」checkboxの値
+}) {
+  if (!slide || !Array.isArray(slides)) return [];
+  const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
+  // 34・35章：Lighting Sceneが無い、またはenabled===falseのFormationは対象外（呼び出し側
+  // ＝Export Center UIでボタン自体をdisabledにする想定だが、念のためここでも空配列で守る）。
+  if (!scene || !scene.enabled) return [];
+
+  // 開始時カットのベースとなるModel（軌跡・追尾は下で個別に上書きするため、ここでは常に
+  // showTrajectory:falseで生成する＝baseModel自体は「軌跡なしの土台」のまま維持）。
+  const baseModel = buildFormationExportModel({
+    slide,
+    slideIndex,
+    slides,
+    performers,
+    stage,
+    zones,
+    musicSections,
+    transitionCounts,
+    effectiveTransitionPathConfig,
+    showTrajectory: false,
+    trajectoryMode: "next",
+    performerDisplayScale,
+    showMusicTime,
+    stageAppearance,
+    lightingEnabled: true,
+    lightingScenes,
+  });
+  if (!baseModel) return [];
+
+  const keep = getKeepCounts(slide);
+  const hasNext = slideIndex < slides.length - 1;
+  const move = hasNext ? getTransitionCounts(transitionCounts, slide.id) : 0;
+  const nextSlide = hasNext ? slides[slideIndex + 1] : null;
+
+  const baseAreas = getLightingAreas(scene);
+  const baseBeams3D = getLightingBeams3D(scene);
+  // 38章：過去Projectの重複Cueも自動削除・mergeせず、既存resolveLightingCueState()の
+  // 現在の挙動（同countが複数あれば安定sortの「後勝ち」）へそのまま従う。
+  const keepCues = [...getLightingSceneCues(scene)].sort((a, b) => a.count - b.count);
+  const transitionCues = hasNext
+    ? [...getTransitionLightingCues(transitionLightingCues, slide.id)].sort((a, b) => a.count - b.count)
+    : [];
+
+  // Lighting Cue Export 軌跡対応 v1・0・3・17章：pathConfigはこのFormation→次Formationの
+  // 出演者移動設定そのもの（通常Formation Exportと同じeffectiveTransitionPathConfig[slide.id]）。
+  // 「current Formation→next Formation」の元のfull pathは、Cueごとに再計算せずここで1回だけ
+  // computeTransitionPaths()を呼んで求める（2章：Cue位置からのやり直し禁止）。transition Cueの
+  // 各カットはこのfullTransitionPathsをsliceTransitionPathsAtProgress()で分割するだけにする。
+  const pathConfig = (hasNext && effectiveTransitionPathConfig && effectiveTransitionPathConfig[slide.id]) || null;
+  const fullTransitionPaths =
+    hasNext && nextSlide ? computeTransitionPaths(slide.placements, nextSlide.placements, pathConfig) : [];
+
+  // 開始時・keep Cueの移動軌跡（11・12章）："次に"ならfull path、"前に"は常に[]
+  // （開始時より前のTransitionへは遡らない＝0章）。
+  const trajectoryForStartOrKeep = trajectoryMode === "next" && showTrajectory ? fullTransitionPaths : [];
+
+  // 追尾スポット軌跡のfull path（Cue時点のresolved beams3Dを渡して都度求める、20〜21章）。
+  // beamsAtThisMomentはそのカット時点でresolveLightingCueState()が返した生のbeams3D
+  // （followPerformerId/colorがそのCueの状態を反映済み＝18・19・25・26章）を渡す。
+  const trackingPathsForStartOrKeep = (beamsAtThisMoment) => {
+    if (!showLightingTrackingPaths || trajectoryMode !== "next" || !hasNext || !nextSlide) return [];
+    return resolveLightingBeamTrackingPaths({
+      beams: beamsAtThisMoment,
+      fromPlacements: slide.placements,
+      toPlacements: nextSlide.placements,
+      pathConfig,
+    });
+  };
+
+  const cuts = [];
+
+  // 1. 開始時（8章：ラベルは常に「開始時」固定）。39章：開始時のresolved Beam状態は
+  // Base Scene自体（baseBeams3D）と一致する（Cueがまだ何も適用されていない時点のため）。
+  cuts.push({
+    ...baseModel,
+    lightingCueLabel: "開始時",
+    lightingCueDisplayCount: null,
+    // Lighting Cueへ短い名前/メモを付けられる機能・17章：開始時はCueではなくBase Sceneのため
+    // 名前対象外。常に空文字にする。
+    lightingCueName: "",
+    // 照明フェード v1・STEP 22：開始時はCueではなくBase Sceneのためfade対象外。常に0。
+    lightingCueFadeCounts: 0,
+    // Lighting Fade v3・13章：開始フェードのdisplay専用metadata。scene.entryFadeCountsを
+    // safe fallbackした値をそのまま渡すだけで、開始時ページのlightingAreas/lightingBeams3D
+    // （baseModelから既にspread済み）はBase Sceneの完成状態のまま変更しない
+    // （entry Fadeの途中状態はresolveせずExport modelへ渡さない）。
+    lightingCueEntryFadeCounts: Number.isFinite(Number(scene.entryFadeCounts)) ? Math.max(0, Number(scene.entryFadeCounts)) : 0,
+    transitionPaths: trajectoryForStartOrKeep,
+    lightingBeamTrackingPaths: trackingPathsForStartOrKeep(baseBeams3D),
+  });
+
+  // 2. keep Cue（7章：displayCount = cue.count + 1、既存UIの表示変換式をそのまま再利用）。
+  //    15章：出演者は静止＝そのFormationのslide.placementsを使う。40章：keep Cueの軌跡も
+  //    開始時と全く同じ「次に→full／前に→[]」（出演者はまだcurrent Formation上にいるため）。
+  keepCues.forEach((cue) => {
+    const displayCount = cue.count + 1;
+    const resolved = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: cue.count });
+    cuts.push({
+      ...baseModel,
+      lightingCueLabel: `${displayCount}カウント目`,
+      lightingCueDisplayCount: displayCount,
+      // Lighting Cueへ短い名前/メモを付けられる機能・17章：cue.name（旧Projectはundefinedの
+      // ため後方互換fallback）をtrimして渡すだけ。lightingCueLabelの意味は変更しない。
+      lightingCueName: typeof cue.name === "string" ? cue.name.trim() : "",
+      // 照明フェード v1・STEP 22：cue.fadeCounts（旧Projectはundefinedのためsafe fallback）を
+      // そのまま渡す。Export Cueページ自体はCue地点で完成した状態のまま描く（STEP 23）。
+      lightingCueFadeCounts: Number.isFinite(Number(cue.fadeCounts)) ? Math.max(0, Number(cue.fadeCounts)) : 0,
+      placements: slide.placements || {},
+      // 19・20章：追尾BeamはこのカットのplacementsでresolveLightingBeams3DForDisplay()を通す。
+      lightingAreas: resolved.areas,
+      lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, slide.placements || {}),
+      transitionPaths: trajectoryForStartOrKeep,
+      // 18章：keep Cue時点でresolveされた生のbeams3D（resolved.beams3D）をfollow判定に使う
+      // （resolveLightingBeams3DForDisplay適用後のtarget解決済みリストではなく、生のリスト）。
+      lightingBeamTrackingPaths: trackingPathsForStartOrKeep(resolved.beams3D),
+    });
+  });
+
+  // 3. transition Cue（7章：displayCount = keepCounts + cue.count + 1）。
+  //    13章：Base Scene→keep終了時点→そのtransition Cueまで、という既存Playbackと同じ
+  //    2段resolveLightingCueState()呼び出し（addLightingCueForCurrentSceneCommit・
+  //    resolveLightingForPhasePositionのmove分岐と同じ考え方＝新しい別timelineを作らない）。
+  //    16〜18章：出演者位置は、そのCueのlocal countから求めたprogress（= localCount / move、
+  //    Playbackのelapsed/moveCountsという既存の意味と完全に一致。+1/-1補正は加えない）で、
+  //    既存のinterpolatePlacementsWithPaths()をそのまま使う（新しい補間計算を作らない）。
+  if (hasNext && nextSlide) {
+    const keepEndState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: keep });
+    const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, slide.id);
+    transitionCues.forEach((cue) => {
+      const displayCount = keep + cue.count + 1;
+      const resolved = resolveLightingCueState({
+        baseAreas: keepEndState.areas,
+        baseBeams3D: keepEndState.beams3D,
+        cues: transitionCues,
+        elapsedCounts: cue.count,
+      });
+      // 65章：既存のlocal transition cue.countとmoveから算出しているprogressをそのまま使う
+      // （displayCountから逆算しない）。
+      const progress = move > 0 ? clamp(cue.count / move, 0, 1) : 0;
+      const cutPlacements = interpolatePlacementsWithPaths(
+        slide.placements,
+        nextSlide.placements,
+        progress,
+        pathConfig,
+        transitionPoseConfig
+      );
+      // 13〜15章：transition Cueの移動軌跡は、Cueごとに再計算しない同一のfullTransitionPaths
+      // をprogress地点でsliceTransitionPathsAtProgress()により分割するだけ（2章：curveの
+      // 元waypointを使い回して再計算しない）。
+      const slicedTransitionPaths = showTrajectory
+        ? sliceTransitionPathsAtProgress(fullTransitionPaths, progress, trajectoryMode)
+        : [];
+      // 18・20・21・22章：追尾スポット軌跡は、そのCueで新たにresolveされた生のbeams3D
+      // （resolved.beams3D）からfull pathを都度求め、同じsliceTransitionPathsAtProgress()で
+      // 分割する（出演者用と全く同じsegment slicing helperを再利用＝Bezier分割の二重実装禁止）。
+      const slicedTrackingPaths = showLightingTrackingPaths
+        ? sliceTransitionPathsAtProgress(
+            resolveLightingBeamTrackingPaths({
+              beams: resolved.beams3D,
+              fromPlacements: slide.placements,
+              toPlacements: nextSlide.placements,
+              pathConfig,
+            }),
+            progress,
+            trajectoryMode
+          )
+        : [];
+      cuts.push({
+        ...baseModel,
+        lightingCueLabel: `${displayCount}カウント目`,
+        lightingCueDisplayCount: displayCount,
+        // Lighting Cueへ短い名前/メモを付けられる機能・17章：keep Cueと同じくcue.nameを
+        // trimして渡すだけ。
+        lightingCueName: typeof cue.name === "string" ? cue.name.trim() : "",
+        // 照明フェード v1・STEP 22：keep Cueと同じくcue.fadeCountsをsafe fallbackして渡すだけ。
+        lightingCueFadeCounts: Number.isFinite(Number(cue.fadeCounts)) ? Math.max(0, Number(cue.fadeCounts)) : 0,
+        placements: cutPlacements,
+        lightingAreas: resolved.areas,
+        lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, cutPlacements),
+        transitionPaths: slicedTransitionPaths,
+        lightingBeamTrackingPaths: slicedTrackingPaths,
+      });
+    });
+  }
+
+  return cuts;
+}
+
+// ------------------------------------------------------------------
+// Lighting Cue Export 複数Formation対応 v1：buildLightingCueExportModelsForSlides()
+// ------------------------------------------------------------------
+// 完成済みの1 Formation用builder（buildLightingCueExportModels()）を、対象slideIndices全体へ
+// 束ねるだけの薄い上位pure helper（7・8章）。Lighting Cue resolve・Transition path分割・
+// 追尾Beam判定等のロジックは一切コピーせず、各Formationについてそのままbuildを委譲するだけ
+// （8章：Lighting Cue resolveを上位helperへコピーしない）。
+//   ・slideIndicesは必ず「元のslides配列上の正しいindex」を渡すこと（62・63・65章：selected
+//     subsetから抽出したFormationでも、各buildLightingCueExportModels()呼び出しには常に
+//     完全なslides配列をそのまま渡す。これによりnextSlide解決は「作品本来の隣接Formation」を
+//     基準にでき、選択から除外されたFormationがあっても軌跡・Lighting continuityが
+//     select前後で変質しない＝64・65・66章）。
+//   ・buildFormationExportModels()と同じ「重複排除＋昇順ソート」を行い、クリックした選択順
+//     ではなく必ずslide配列順（Formation表示順）で処理する（9章）。
+//   ・各Formation内部のCue順（開始時→keep→transition、時系列）は既存builderの戻り値の順序を
+//     そのまま維持する（10章）。
+//   ・Lighting Sceneが無い/enabled===falseのFormationは、既存builder自身が[]を返すことで
+//     自然にresultから除外される（23・24章：ここで追加のフィルタ処理は行わない。エラーにも
+//     しない）。
+function buildLightingCueExportModelsForSlides({
+  slideIndices,
+  slides,
+  performers,
+  stage,
+  zones,
+  musicSections,
+  transitionCounts,
+  effectiveTransitionPathConfig,
+  transitionPoses,
+  performerDisplayScale,
+  showMusicTime,
+  stageAppearance,
+  lightingScenes,
+  transitionLightingCues,
+  showTrajectory,
+  trajectoryMode,
+  showLightingTrackingPaths,
+}) {
+  if (!Array.isArray(slides) || slides.length === 0) return [];
+  const orderedIndices = Array.isArray(slideIndices)
+    ? Array.from(new Set(slideIndices))
+        .filter((i) => Number.isInteger(i) && i >= 0 && i < slides.length)
+        .sort((a, b) => a - b)
+    : [];
+  const result = [];
+  orderedIndices.forEach((slideIndex) => {
+    const slide = slides[slideIndex];
+    if (!slide) return;
+    const models = buildLightingCueExportModels({
+      slide,
+      slideIndex,
+      slides,
+      performers,
+      stage,
+      zones,
+      musicSections,
+      transitionCounts,
+      effectiveTransitionPathConfig,
+      transitionPoses,
+      performerDisplayScale,
+      showMusicTime,
+      stageAppearance,
+      lightingScenes,
+      transitionLightingCues,
+      showTrajectory,
+      trajectoryMode,
+      showLightingTrackingPaths,
+    });
+    result.push(...models);
+  });
+  return result;
+}
+// buildFormationExportFilename()と同じ「安全な数値パディング」の考え方を踏襲しつつ、
+// どのCueかが分かる別パターンにする。Formation番号の直後に「Lighting Cue Export内での
+// 時系列上の出力順」を2桁以上zero-paddingした連番（cutIndex、0=開始時）を挟むことで、
+// ファイル名の文字列順が常に実際の時系列順と一致するようにする（ファイル名順序修正 v1）。
+// この連番はCueの実countとは別物で、buildLightingCueExportModels()が返す配列の並び順
+// （時系列順）をそのまま使うだけであり、新しい永続データやstateは持たない。
+// 開始時（displayCount===null）はformation_012_00_start.png、
+// Cueはformation_012_02_count_17.pngのように、Cueの実際のFormation全体display countは
+// 引き続きファイル名にも残す（内部local countは出さない＝32章、この方針は維持）。
+// 0.5カウント精度対応 v1：0.5を含むdisplayCountでも4.5 Cueと5 Cueが同じfilenameへ衝突しない
+// よう、Math.round()を廃止し、0.5刻みを識別できる文字列へ変換する（例：4.5→"04_5"、5→"05"）。
+// 整数部は従来通り2桁ゼロ埋め、0.5を含む場合だけ末尾に"_5"を付ける単純な方式。
+function formatLightingCueExportCountToken(displayCount) {
+  const safe = Number.isFinite(Number(displayCount)) ? Math.max(0, Number(displayCount)) : 0;
+  const wholePart = Math.floor(safe);
+  const hasHalf = safe - wholePart >= 0.5 - 1e-9 && safe - wholePart < 1;
+  const wholeStr = String(Math.max(1, wholePart)).padStart(2, "0");
+  return hasHalf ? `${wholeStr}_5` : wholeStr;
+}
+function buildLightingCueExportFilename(slideNumber, cutIndex, displayCount) {
+  const num = String(Math.max(1, Math.round(slideNumber || 1))).padStart(3, "0");
+  const orderNum = String(Math.max(0, Math.round(cutIndex || 0))).padStart(2, "0");
+  if (displayCount == null) return `formation_${num}_${orderNum}_start.png`;
+  const countNum = formatLightingCueExportCountToken(displayCount);
+  return `formation_${num}_${orderNum}_count_${countNum}.png`;
+}
+// ZIP/PDFファイル名。既存buildFormationExportZipFilename/PdfFilenameと同じ
+// sanitizeExportFilenameName()を再利用し、危険文字の除去ロジックを二重実装しない。
+// Lighting Cue Export 複数Formation対応 v1・20章：slideNumberを渡した場合（scope==="current"、
+// 単一Formationのみ）は、従来通りFormation番号入りの名前を維持し「現在の構成では従来と同じ
+// 結果」を保証する。slideNumberを省略した場合（複数Formation）は、通常Formation Exportの
+// buildFormationExportZipFilename/PdfFilenameと同じ、Formation番号を含まない汎用名にする。
+function buildLightingCueExportZipFilename(projectName, slideNumber) {
+  const safeName = sanitizeExportFilenameName(projectName) || "formation";
+  if (slideNumber == null) return `${safeName}_lighting_cues.zip`;
+  const num = String(Math.max(1, Math.round(slideNumber || 1))).padStart(3, "0");
+  return `${safeName}_formation_${num}_lighting_cues.zip`;
+}
+function buildLightingCueExportPdfFilename(projectName, slideNumber) {
+  const safeName = sanitizeExportFilenameName(projectName) || "formation";
+  if (slideNumber == null) return `${safeName}_lighting_cues.pdf`;
+  const num = String(Math.max(1, Math.round(slideNumber || 1))).padStart(3, "0");
+  return `${safeName}_formation_${num}_lighting_cues.pdf`;
+}
+
+// ------------------------------------------------------------------
+// 出演者一覧 Export v1：renderPerformerListExportToCanvas()
+// ------------------------------------------------------------------
+// 通常Formation Export・Lighting Cue Exportのどちらからも共通で使える、独立したpure
+// Canvas renderer（8・9・20・24章：Formation rendererを再利用せず、「共通Canvas Export
+// デザイン」＝Canvasサイズ・背景色・THEME・devicePixelRatioの考え方だけをrenderFormation
+// ExportToCanvas()から踏襲する）。Stage geometryを一切持たないため、Lighting・Lighting
+// Cue・followPerformerId・Area・Beamは参照しない（29章）。作品データは変更しないpure関数
+// （引数のperformers/projectNameだけから決定的にCanvasを作る）。
+//   performers   Project全員のperformer配列（現在Formationに配置されているかは問わない＝25章）
+//   projectName  ヘッダーに表示するProject名
+// 戻り値：HTMLCanvasElement（renderFormationExportToCanvas()と同じEXPORT_PNG_WIDTH×
+// EXPORT_PNG_HEIGHT・EXPORT_PIXEL_RATIO倍の実ピクセルサイズ）。将来performer_list.pngとして
+// downloadCanvasAsPng()へそのまま渡すだけで単体PNG出力にもなる構造（17章）。
+function renderPerformerListExportToCanvas(performers, projectName) {
+  const canvas = document.createElement("canvas");
+  canvas.width = EXPORT_PNG_WIDTH * EXPORT_PIXEL_RATIO;
+  canvas.height = EXPORT_PNG_HEIGHT * EXPORT_PIXEL_RATIO;
+  const ctx = canvas.getContext && canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(EXPORT_PIXEL_RATIO, EXPORT_PIXEL_RATIO);
+
+  ctx.fillStyle = THEME.bg;
+  ctx.fillRect(0, 0, EXPORT_PNG_WIDTH, EXPORT_PNG_HEIGHT);
+
+  const PADDING = 40;
+  // Header（10章：「出演者一覧」を大きく、その下にProject名）。既存drawFormationExportHeader
+  // とはfont sizeの並び順が異なる別デザインのため、共有関数化はせずここに閉じて持つ
+  // （出演者一覧はFormation情報を一切持たないため、無理に共通ヘッダー関数へ合わせない）。
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.fillStyle = THEME.text;
+  ctx.font = "bold 34px sans-serif";
+  ctx.fillText("出演者一覧", PADDING, PADDING);
+  ctx.fillStyle = THEME.textDim;
+  ctx.font = "22px sans-serif";
+  ctx.fillText(String(projectName || ""), PADDING, PADDING + 46);
+
+  const HEADER_H = 100;
+  const listArea = {
+    x: PADDING,
+    y: PADDING + HEADER_H,
+    w: EXPORT_PNG_WIDTH - PADDING * 2,
+    h: EXPORT_PNG_HEIGHT - (PADDING + HEADER_H) - PADDING,
+  };
+
+  const list = Array.isArray(performers) ? performers : [];
+  if (list.length === 0) {
+    // 26章：0人でもクラッシュせず、案内文だけの空一覧を返す。
+    ctx.fillStyle = THEME.textDim;
+    ctx.font = "20px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("出演者が登録されていません", listArea.x + listArea.w / 2, listArea.y + listArea.h / 2);
+    return canvas;
+  }
+
+  // 4章：performer.number昇順。同番号等の異常データでも安全な数値比較（Number.isFinite）で
+  // クラッシュしない。現在のperformers配列の並び順には依存しない。
+  const sorted = [...list].sort((a, b) => {
+    const an = Number.isFinite(a && a.number) ? a.number : 0;
+    const bn = Number.isFinite(b && b.number) ? b.number : 0;
+    return an - bn;
+  });
+
+  // 6・7章：人数に応じて列数を自動調整する（複雑なresponsive layout engineは作らず、
+  // 段階的なしきい値だけで決める）。100人（MAX_PERFORMERS）でもクラッシュしないよう、
+  // 列数の上限を設けた上でfont sizeも行の高さに応じて縮小する。
+  const count = sorted.length;
+  const columns = count <= 10 ? 2 : count <= 45 ? 3 : 4;
+  const rows = Math.ceil(count / columns);
+  const rowHeight = listArea.h / rows;
+  const fontSize = clamp(rowHeight * 0.55, 11, 20);
+  const colWidth = listArea.w / columns;
+  const markerRadius = clamp(fontSize * 0.3, 4, 7);
+
+  ctx.textBaseline = "middle";
+  sorted.forEach((p, idx) => {
+    const col = Math.floor(idx / rows);
+    const row = idx % rows;
+    const colX = listArea.x + col * colWidth;
+    const rowY = listArea.y + row * rowHeight + rowHeight / 2;
+
+    // 11章：色marker（小さすぎて色が分からなくならないよう、fontSizeに応じた半径を確保）。
+    ctx.beginPath();
+    ctx.fillStyle = (p && p.color) || THEME.textDim;
+    ctx.arc(colX + markerRadius + 2, rowY, markerRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 12章：番号はboldで強調。
+    const numberText = String(Number.isFinite(p && p.number) ? p.number : "?");
+    ctx.font = `bold ${fontSize}px sans-serif`;
+    ctx.fillStyle = THEME.text;
+    ctx.textAlign = "left";
+    const numX = colX + markerRadius * 2 + 10;
+    ctx.fillText(numberText, numX, rowY);
+    const numWidth = ctx.measureText(numberText).width;
+
+    // 13章：長い名前は列幅に収まるよう末尾を省略（複雑なwrap engineは作らない）。
+    const name = getPerformerName(p) || "";
+    ctx.font = `${fontSize}px sans-serif`;
+    const nameX = numX + numWidth + 10;
+    const maxNameWidth = colX + colWidth - nameX - 14;
+    let displayName = name;
+    if (maxNameWidth > 0 && ctx.measureText(displayName).width > maxNameWidth) {
+      while (displayName.length > 0 && ctx.measureText(displayName + "…").width > maxNameWidth) {
+        displayName = displayName.slice(0, -1);
+      }
+      displayName = displayName.length > 0 ? `${displayName}…` : "…";
+    }
+    ctx.fillText(displayName, nameX, rowY);
+  });
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+
+  return canvas;
+}
+
+// 将来の出演者一覧単体PNG保存（17章）に備えたファイル名helper。既存の
+// sanitizeExportFilenameName()を再利用し、危険文字の除去ロジックを二重実装しない。
+// 今回のPDF先頭ページ追加では使わないが、将来downloadCanvasAsPng()へそのまま渡せる形に
+// しておく。
+function buildPerformerListExportFilename(projectName) {
+  const safeName = sanitizeExportFilenameName(projectName) || "formation";
+  return `${safeName}_performer_list.png`;
+}
+// 出演者一覧単体Export v1・7章：PDF版のファイル名。PNG版と同じsanitizeExportFilenameName()を
+// 再利用し、危険文字の除去ロジックを二重実装しない（新しいfilename helperの重複追加を避ける
+// ため、既存のbuildPerformerListExportFilename()とペアになる最小限の追加）。
+function buildPerformerListExportPdfFilename(projectName) {
+  const safeName = sanitizeExportFilenameName(projectName) || "formation";
+  return `${safeName}_performer_list.pdf`;
+}
+
+// PDF helper共通化 v1（21章）：Canvas→PNG Blob→PDFページ、という既存3箇所すべてで共通の
+// 変換ステップを1つの小さなasync pure helperへ切り出す。既存の通常PDF・Lighting Cue PDFの
+// ループ自体は変更せず（不要なリファクタリングをしない＝21章）、今回追加する出演者一覧
+// ページの追加にだけこの関数を使う。
+async function appendCanvasToPdf(pdfDoc, canvas) {
+  const blob = await canvasToPngBlob(canvas);
+  const pngBytes = new Uint8Array(await blob.arrayBuffer());
+  const pngImage = await pdfDoc.embedPng(pngBytes);
+  // 22章：既存Formation PDFページと同じEXPORT_PNG_WIDTH×EXPORT_PNG_HEIGHTをそのまま
+  // ページサイズとして使う（1ページ目だけ縦横比が変わることを避ける）。
+  const page = pdfDoc.addPage([EXPORT_PNG_WIDTH, EXPORT_PNG_HEIGHT]);
+  page.drawImage(pngImage, { x: 0, y: 0, width: EXPORT_PNG_WIDTH, height: EXPORT_PNG_HEIGHT });
+  return page;
 }
 
 // 構成一覧の音楽位置表示（formatFormationListMusicLabel）と同じ考え方で、
@@ -4941,7 +7907,13 @@ function buildFormationExportModels({
 // Auto Chainどちらの結果でも同じ形のオブジェクトのため、Auto Chainの構成でも同じ経路で
 // 時間表示の対象になる。showMusicTimeがfalse、またはmusicAnchorToTimeSecがnull/非有限値
 // （参照先Section不明等）の場合は、音楽位置の表示自体は変えず、時間部分だけを追加しない。
-function formatExportMusicPositionLabel(resolved, musicSections, showMusicTime) {
+// Header表示ルール整理 v1・8〜16章：第4引数totalCounts（optional）を追加。このFormationが
+// 「ここから始まる」ことを示すため、カウント位置の末尾・音源内時間の末尾へ「〜」を付け、
+// Formation全体のcount（keepCounts＋moveCounts、呼び出し側＝buildFormationExportModelで算出
+// 済みの値をそのまま受け取るだけ）を「（計Nカウント）」として挿入する。曲番号・手動/自動注記・
+// エイト/カウント表記（formatMusicAnchorEighthCountLabel）・時間表示（formatTime）の生成
+// ロジックは一切変更せず、そのまま再利用する（新しい文字列生成を追加しない）。
+function formatExportMusicPositionLabel(resolved, musicSections, showMusicTime, totalCounts) {
   if (!resolved || !resolved.anchor) {
     return {
       text: "♫ 音楽位置 未設定",
@@ -4956,12 +7928,24 @@ function formatExportMusicPositionLabel(resolved, musicSections, showMusicTime) 
   const section = Array.isArray(musicSections) ? musicSections.find((s) => s.id === resolved.anchor.sectionId) || null : null;
   const sectionName = section ? section.name : "（不明な楽曲）";
   const base = `♫ ${sectionName}　${formatMusicAnchorEighthCountLabel(resolved.anchor.eighthNumber, resolved.anchor.countOffset)}`;
-  // 11章：手動/自動を必ず強調する必要はないため、自動計算の場合だけ控えめな注記を添える。
-  let text = resolved.isManual ? base : `${base}（自動）`;
+  // Export音楽位置ラベル「（自動）」表記削除 v1・STEP 2：手動・自動どちらでもbaseをそのまま
+  // 表示文字列の土台として使う（従来は自動計算時だけ`${base}（自動）`としていた注記を削除）。
+  // resolved.isManual自体・戻り値のisManual fieldは維持し、音楽位置の計算ロジック
+  // （Auto Chain・手動/自動Anchorの判定）には一切影響させない（Export表示文言だけの変更）。
+  let text = base;
+  // 9章：このFormationの開始地点であることを示す「〜」。
+  text = `${text}〜`;
+  // 10・11・12・13章：Formation全体のcount（keepCounts＋moveCounts）。既存のCue編集UI
+  // （totalCounts = keep + move）と同じ定義の値を呼び出し側から受け取るだけで、ここでは
+  // 新しいcount計算を行わない。
+  if (totalCounts != null && Number.isFinite(totalCounts)) {
+    text = `${text}（計${totalCounts}カウント）`;
+  }
   const absoluteTimeSec = showMusicTime ? musicAnchorToTimeSec(resolved.anchor, musicSections) : null;
   const hasValidAbsoluteTimeSec = absoluteTimeSec != null && Number.isFinite(absoluteTimeSec);
   if (showMusicTime && hasValidAbsoluteTimeSec) {
-    text = `${text}　｜　${formatTime(absoluteTimeSec)}`;
+    // 9章：音源内時間の末尾にも「〜」。
+    text = `${text}　｜　${formatTime(absoluteTimeSec)}〜`;
   }
   return {
     text,
@@ -5112,7 +8096,11 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   const displayScale = renderOptions && typeof renderOptions.displayScale === "number" ? renderOptions.displayScale : 1;
 
   const PADDING = 40;
-  const HEADER_H = 100;
+  // Lighting Cue Export v1・26章：Cue Export時（model.lightingCueLabelがある場合）だけ、
+  // Header内にもう1行（Lighting Cue label）を追加するため高さを増やす。通常Export
+  // （lightingCueLabelが無い）ではHEADER_Hは従来通り100のまま＝既存の構図は一切変わらない
+  // （27章）。
+  const HEADER_H = model.lightingCueLabel ? 130 : 100;
 
   // 19章：背景は透明PNGにせず、既存THEMEをそのまま再利用したダークテーマの背景にする。
   ctx.fillStyle = THEME.bg;
@@ -5120,7 +8108,11 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
 
   // ヘッダー：構成番号・構成名・音楽位置（4・10・11・17章：top/audience両方の共通部分。
   // 今回タイトル周りのデザインは変更しない）。
-  drawFormationExportHeader(ctx, model, PADDING);
+  // Lighting Cue PDF 表示改善 v1：renderOptions.lightingCuePdfMetaはLighting Cue PDF生成時
+  // だけApp側から渡される、PDF専用の一時的なdisplay metadata（work/Project schemaには一切
+  // 保存しない）。PNG/ZIP/通常PDFの既存呼び出しはこのfieldを渡さないため、undefinedのまま
+  // drawFormationExportHeader側の追加描画がすべてスキップされ、既存の見た目を完全に維持する。
+  drawFormationExportHeader(ctx, model, PADDING, renderOptions && renderOptions.lightingCuePdfMeta);
 
   const stageAreaRect = {
     x: PADDING,
@@ -5134,21 +8126,97 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   } else {
     renderTopFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, showPerformerNames, displayScale });
   }
+  // Lighting Cue PDF ページ番号 v1・②：Lighting Cue PDF生成時だけ、右下へ小さくページ番号を
+  // 上乗せする。既存の描画順・構図には一切影響しない最後の1手（PNG/ZIP/通常PDFではmetaが
+  // 無いためスキップされる）。
+  if (renderOptions && renderOptions.lightingCuePdfMeta && renderOptions.lightingCuePdfMeta.pageNumber != null) {
+    drawExportPageNumberOverlay(ctx, renderOptions.lightingCuePdfMeta.pageNumber, renderOptions.lightingCuePdfMeta.totalPages);
+  }
   return true;
 }
 
-// top/audience共通のヘッダー（構成番号・構成名・音楽位置）描画。17章：デザインは維持。
-function drawFormationExportHeader(ctx, model, PADDING) {
+// top/audience共通のヘッダー（Formation番号・総数・構成名・音楽位置）描画。
+// Header表示ルール整理 v1：第4引数pdfMeta（optional）は、Lighting Cue PDF生成時だけApp側から
+// 渡されるPDF専用の一時的なdisplay metadata。省略時（PNG/ZIP/通常PDF/Lighting Cue PNG・ZIP）は
+// Formation境界accent描画がスキップされるだけで、1〜3行目の文言ルール自体は全Export共通。
+function drawFormationExportHeader(ctx, model, PADDING, pdfMeta) {
   ctx.textBaseline = "top";
   ctx.textAlign = "left";
-  ctx.fillStyle = THEME.text;
+  // 2・3・4・5・6章：1行目は全Export共通で「No.{Formation番号}/{Formation総数}　{構成名}」。
+  // Formation番号・総数はどちらも既存slideNumber/slideTotal（Export対象数ではなくProject全体の
+  // Formation総数）をそのまま使い、新しい番号計算は二重実装しない。構成名も既存slide.nameを
+  // そのまま使い、自動変換はしない。
+  // ①Formation境界強調（25〜28章）：新しいFormationの最初のページ（pdfMeta.isFormationStart、
+  // Lighting Cue PDF専用）だけ、titleをTHEME.accentへ強調し、title下に少し長め・少し太めの
+  // accent lineを追加する（29章：PNG/ZIPへは広げない＝pdfMetaが無ければ常にfalse）。
+  const emphasizeFormationStart = !!(pdfMeta && pdfMeta.isFormationStart);
+  ctx.fillStyle = emphasizeFormationStart ? THEME.accent : THEME.text;
   ctx.font = "bold 34px sans-serif";
-  const titleText = `構成 ${model.slideNumber}　${model.slideName || ""}`.trim();
+  const titleText = `No.${model.slideNumber}/${model.slideTotal}　${model.slideName || ""}`.trim();
   ctx.fillText(titleText, PADDING, PADDING);
+  if (emphasizeFormationStart) {
+    ctx.strokeStyle = THEME.accent;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(PADDING, PADDING + 40);
+    ctx.lineTo(PADDING + 380, PADDING + 40);
+    ctx.stroke();
+  }
 
+  // 8〜16章：2行目は全Export共通。musicPosition.text自体が既に「〜」「（計Nカウント）」を
+  // 含む形でformatExportMusicPositionLabel()から返ってくるため、ここでの文字列組み立ては
+  // 一切行わない（曲番号・自動/手動注記・エイト/カウント表記・音源内時間の生成ロジックは
+  // すべてformatExportMusicPositionLabel側にそのまま残る）。
   ctx.fillStyle = model.musicPosition.isUnset ? THEME.textDim : THEME.accent;
   ctx.font = "22px sans-serif";
   ctx.fillText(model.musicPosition.text, PADDING, PADDING + 46);
+
+  // 17・18・19・20章：3行目はLighting Cue Export固有（model.lightingCueLabelがある場合だけ）。
+  // 通常Exportのmodelにはこのfieldが存在しないため、この分岐自体が実行されず、既存Headerの
+  // 見た目は完全に維持される。表示は「キュー　{lightingCueLabel}」固定で、"17カウント目"・
+  // "開始時"という文字列は既存model.lightingCueLabelをそのまま使い、新しいCue count文字列
+  // 生成は行わない。2行目（22px）より2〜4px小さい19pxにし、視覚階層（1行目=識別・2行目=
+  // 時間情報・3行目=このページ固有のCue情報）を作る。色は既存のaccent系のまま維持。
+  if (model.lightingCueLabel) {
+    ctx.fillStyle = THEME.accent;
+    ctx.font = "bold 19px sans-serif";
+    // Lighting Cueへ短い名前/メモを付けられる機能・18章：model.lightingCueNameが存在する
+    // 場合だけ「｜　名前」を追記する。lightingCueLabel（時点表示）とcue.name（ユーザー入力名）
+    // は別fieldのまま、ここで文字列として合成するだけ。デザイン（19px/bold/accent/y位置）は
+    // 変更しない。
+    // 照明フェード v1・STEP 21：model.lightingCueFadeCountsが0より大きい場合だけ「｜　フェード
+    // Nカウント」を追記する。0（または未定義のsafe fallback後の0）なら何も追加しない
+    // （「フェード 0カウント」という表示はしない）。名前と同様、ここでは文字列として
+    // 合成するだけで、デザイン（19px/bold/accent/y位置）は変更しない。
+    const fadeCounts = Number.isFinite(Number(model.lightingCueFadeCounts)) ? Number(model.lightingCueFadeCounts) : 0;
+    // Lighting Fade v3・12章：開始時ページ（lightingCueLabel==="開始時"）だけ、
+    // lightingCueEntryFadeCountsが1以上の場合に「｜　開始フェード Nカウント」を追記する。
+    // 通常Cueの「｜　フェード Nカウント」表示ロジックはそのまま維持し、変更しない。
+    const entryFadeCounts = Number.isFinite(Number(model.lightingCueEntryFadeCounts)) ? Number(model.lightingCueEntryFadeCounts) : 0;
+    let cueHeaderText = `キュー　${model.lightingCueLabel}`;
+    if (model.lightingCueName) cueHeaderText += `　｜　${model.lightingCueName}`;
+    if (fadeCounts > 0) cueHeaderText += `　｜　フェード ${fadeCounts}カウント`;
+    if (model.lightingCueLabel === "開始時" && entryFadeCounts > 0) cueHeaderText += `　｜　開始フェード ${entryFadeCounts}カウント`;
+    ctx.fillText(cueHeaderText, PADDING, PADDING + 46 + 32);
+  }
+}
+
+// Lighting Cue PDF ページ番号 v1・②：PDF出力時だけ、既に描画済みのCanvasへ右下に小さく
+// 「pageNumber / totalPages」を上乗せするだけの薄いoverlay helper。canvas.width/height・
+// ctx.scale()等には一切触れず（既にrenderer側が設定済みのEXPORT_PIXEL_RATIOスケールと論理
+// 座標系をそのまま利用する）、Formation Canvas・出演者一覧Canvasのどちらへも同じ関数で使える
+// （Formation用/出演者一覧用に別実装を作らない）。work・Project schemaへは一切触れない、
+// PDF生成時だけの表示専用metadata。
+function drawExportPageNumberOverlay(ctx, pageNumber, totalPages) {
+  if (!ctx || pageNumber == null || totalPages == null) return;
+  const PADDING = 40;
+  ctx.save();
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = THEME.textDim;
+  ctx.fillText(`${pageNumber} / ${totalPages}`, EXPORT_PNG_WIDTH - PADDING, EXPORT_PNG_HEIGHT - 14);
+  ctx.restore();
 }
 
 // ------------------------------------------------------------------
@@ -5349,6 +8417,35 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     ctx.restore();
   }
 
+  // 照明ビームExport対応・STEP①：平面図Exportへfootprintのみを追加する。Beam本体
+  // （24 slice polygon）・source/targetマーカー・source-target guide lineは編集操作用UIの
+  // 性格が強いため、今回はExportしない（TopView編集画面でもBeam本体そのものは描画して
+  // いない＝4719行目コメント参照）。footprintのみが「表示専用の視覚要素」に該当するため、
+  // Lighting Areaと全く同じ構造（stage-space points → toX/toY → Canvas path）で追加する。
+  // 新しいgeometryは作らず、既存のgetLightingBeamFootprintStagePoints()をそのまま再利用し、
+  // 色・opacityも編集画面と同じlightingAreaColorHex()・lightingBeamFootprintFillOpacity()を
+  // 共有する（数式の二重実装をしない）。model.lightingBeams3Dはbuild側で既にLighting
+  // ON/OFF・Scene enabled判定済みの配列のため、ここでも条件判定は一切行わない。
+  if (model.lightingBeams3D && model.lightingBeams3D.length > 0) {
+    ctx.save();
+    model.lightingBeams3D.forEach((beam) => {
+      const footprintPoints = getLightingBeamFootprintStagePoints(beam);
+      if (footprintPoints.length === 0) return;
+      ctx.beginPath();
+      footprintPoints.forEach((p, i) => {
+        const sx = toX(p.x);
+        const sy = toY(p.y);
+        if (i === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = lightingAreaColorHex(beam.color);
+      ctx.globalAlpha = lightingBeamFootprintFillOpacity(beam.intensity);
+      ctx.fill();
+    });
+    ctx.restore();
+  }
+
   // 可視出演者（PART B・11・12・13・14章：showWaitingAreasに応じてここでフィルタする。
   // buildFormationExportModel()自体は常に全出演者を返すため、「何を見せるか」の判断は
   // このrenderer側に一本化されている＝v1.1バグの再発防止）。
@@ -5413,6 +8510,84 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     }
   });
   ctx.restore();
+
+  // 描画順8.5：追尾スポット軌跡（追尾スポット軌跡Export v1・29〜37・42章）。編集画面の
+  // trackingBeamPath描画（Lighting Beam 3D 追尾 編集用可視化 v1）と全く同じgeometry・意味を
+  // Canvasへ移植しただけで、新しいgeometry計算は一切行わない。model.lightingBeamTrackingPaths
+  // はbuildFormationExportModel側で既にshowLightingTrackingPaths ON/OFF・Lighting ON/OFF・
+  // Scene enabled判定済みの配列（条件を満たさない場合は常に[]）のため、ここでは条件判定を
+  // 一切行わず「配列を描くだけ」にする（28章と同じ設計）。出演者移動軌跡の直後・出演者
+  // マーカーより前に描画することで、「補助情報として出演者マーカーより背面」という優先順位を
+  // 守る（37章）。矢印はtrajectoryArrowPoints()を再利用し、Lighting専用の矢印計算はしない
+  // （33章）。ctx.save()/restore()でsetLineDash・globalAlphaを閉じ込め、後続の出演者・
+  // Lighting描画へ一切漏れないようにする（32章）。色はlightingAreaColorHex()（既存Beam描画と
+  // 同じcolor helper）を再利用する（31章）。sourceは軌跡に含めない（42章：targetの移動だけを
+  // 示すguideのため、Beam sourceは一切参照しない）。
+  if (model.lightingBeamTrackingPaths && model.lightingBeamTrackingPaths.length > 0) {
+    ctx.save();
+    ctx.globalAlpha = EXPORT_LIGHTING_TRACKING_PATH_ALPHA;
+    model.lightingBeamTrackingPaths.forEach((path) => {
+      const beamColor = lightingAreaColorHex(path.color);
+      const x1 = toX(path.from.x);
+      const y1 = toY(path.from.y);
+      const x2 = toX(path.to.x);
+      const y2 = toY(path.to.y);
+      const isCurve = path.type === "curve" && path.waypoint;
+      const wx = isCurve ? toX(path.waypoint.x) : null;
+      const wy = isCurve ? toY(path.waypoint.y) : null;
+      // 36章：直線かつ完全に静止（from===to）の場合は線・矢印を描かず、始点/終点markerだけ
+      // 同じ位置に重ねて表示する（編集画面のtrackingBeamPathと同じ分岐）。
+      const hasMovement = isCurve || x1 !== x2 || y1 !== y2;
+      const markerRadius = 5 * fit.scale;
+
+      if (hasMovement) {
+        ctx.strokeStyle = beamColor;
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        ctx.setLineDash([6, 5]); // 30章：出演者軌跡（実線）と明確に区別する破線
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        if (isCurve) {
+          ctx.quadraticCurveTo(wx, wy, x2, y2); // 34章：waypoint付きは既存出演者軌跡と同じ二次ベジェ
+        } else {
+          ctx.lineTo(x2, y2);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]); // このBeam分の破線設定を次の描画へ持ち越さない
+
+        const arrowSize = 10;
+        const arrowPts = isCurve
+          ? trajectoryArrowPoints(wx, wy, x2, y2, arrowSize)
+          : trajectoryArrowPoints(x1, y1, x2, y2, arrowSize);
+        if (arrowPts) {
+          const pts = arrowPts.split(" ").map((pair) => pair.split(",").map(Number));
+          ctx.fillStyle = beamColor;
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          ctx.lineTo(pts[1][0], pts[1][1]);
+          ctx.lineTo(pts[2][0], pts[2][1]);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // 始点：outlineのみの小さな円（35章：編集画面と同じ意味）
+      ctx.beginPath();
+      ctx.arc(x1, y1, markerRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // 終点：塗りつぶしの小さな円（35章：始点と区別。編集画面と同じくTHEME.bgの縁取りを付ける）
+      ctx.beginPath();
+      ctx.arc(x2, y2, markerRadius, 0, Math.PI * 2);
+      ctx.fillStyle = beamColor;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = THEME.bg;
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
 
   // 出演者名 v1.1・PART I・K：「出演者番号は名前より必ず前面」というルールをCanvas Exportでも
   // 保証するため、SVG側（TopView）と同じ2-pass描画に統一する。
@@ -5729,9 +8904,37 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
     ctx.restore();
   }
 
-  // 可視出演者・可視軌跡（PART B・14章と同じisPerformerVisibleForExport()を再利用。
-  // buildFormationExportModel()自体は常に全出演者を返すため、「何を見せるか」の判断は
-  // top/audience両rendererで共通のこの一つの関数に一本化されている）。
+  // 照明ビームExport対応・STEP②：俯瞰客席ExportへBeam footprintを追加する。geometryは
+  // 平面図Export（STEP①）と全く同じ既存のgetLightingBeamFootprintStagePoints()を再利用し、
+  // 新しいfootprint計算式は作らない。footprintはstage座標を返すpure helperのため、Areaと
+  // 全く同じくこのrenderer既存のproject()（projectAudiencePoint＋Canvas fit変換）へそのまま
+  // 通す。色はlightingAreaColorHex()、opacityはlightingBeamFootprintFillOpacity()を再利用する
+  // （編集画面のfootprint描画・平面図Exportのfootprint描画と同一）。Lighting Areaと同じく
+  // Performerより後ろの固定レイヤーとし、depth sortには参加させない。
+  if (model.lightingBeams3D && model.lightingBeams3D.length > 0) {
+    ctx.save();
+    model.lightingBeams3D.forEach((beam) => {
+      const footprintPoints = getLightingBeamFootprintStagePoints(beam);
+      if (footprintPoints.length === 0) return;
+      ctx.beginPath();
+      footprintPoints.forEach((p, i) => {
+        const sp = project(p.x, p.y);
+        if (i === 0) ctx.moveTo(sp.sx, sp.sy);
+        else ctx.lineTo(sp.sx, sp.sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = lightingAreaColorHex(beam.color);
+      ctx.globalAlpha = lightingBeamFootprintFillOpacity(beam.intensity);
+      ctx.fill();
+    });
+    ctx.restore();
+  }
+
+  // 照明ビームExport対応・STEP③：Beam sliceとPerformerのdepth統合。編集画面の
+  // depthMergedItems（7149〜7171行目）と全く同じ考え方をExport側へ最小移植する。
+  // 描画順の並べ替え（trajectoryをBeam/Performer統合ブロックより前へ移動）のみで、
+  // trajectory自体の描画コードは変更しない。Lighting Area・Beam footprintは
+  // 引き続きdepth統合の対象外の固定床レイヤーとし、順序も変更しない。
   const visiblePerformers = model.performers.filter((p) => isPerformerVisibleForExport(model.placements[p.id], showWaitingAreas));
   const visibleIds = new Set(visiblePerformers.map((p) => p.id));
   const visibleTransitionPaths = model.transitionPaths.filter((p) => visibleIds.has(p.id));
@@ -5741,6 +8944,9 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   // Export品質改善・PART F〜I：固定値0.55ではなく、平面図Export側と共通のEXPORT_TRAJECTORY_ALPHAを
   // 使う（線・矢印とも同じ透明度＝PART H）。ctx.save()/restore()で囲み、この透明度が
   // 後続の出演者描画（各performerごとのopacity設定）へ漏れないようにする（PART I）。
+  // 照明ビームExport対応・STEP③：編集画面の描画順（Lighting Area→footprint→trajectory→
+  // depth統合）に合わせ、このtrajectoryブロックをBeam本体描画より前へ移動した
+  // （trajectoryの描画コード自体・EXPORT_TRAJECTORY_ALPHA等は一切変更していない）。
   ctx.save();
   ctx.globalAlpha = EXPORT_TRAJECTORY_ALPHA;
   visibleTransitionPaths.forEach((path) => {
@@ -5780,25 +8986,156 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   });
   ctx.restore();
 
-  // 描画順3：出演者（奥から手前の順。OverheadAudienceViewのsortedと同じ並び方で、
-  // PNGには選択状態が無いためselected分の並べ替えのみ省略している）。
-  const sorted = visiblePerformers
+  // 描画順2.5：追尾スポット軌跡（追尾スポット軌跡Export v1・38〜41・42章）。平面図Export
+  // （STEP①相当）と全く同じmodel.lightingBeamTrackingPaths配列をそのまま使い、新しい
+  // geometry計算は一切行わない（39・40章：project(from)/project(to)/project(waypoint)へ
+  // 通すだけ）。矢印もproject済み座標をtrajectoryArrowPoints()へ渡すだけで、新しい遠近矢印
+  // ロジックは作らない（40章）。描画順は「Beam slice + Performerのdepth統合」より前、出演者
+  // より後ろのguide layerとする（41章）。ctx.save()/restore()でsetLineDash・globalAlphaを
+  // 閉じ込め、後続のBeam slice/Performer描画へ一切漏れないようにする。
+  if (model.lightingBeamTrackingPaths && model.lightingBeamTrackingPaths.length > 0) {
+    ctx.save();
+    ctx.globalAlpha = EXPORT_LIGHTING_TRACKING_PATH_ALPHA;
+    model.lightingBeamTrackingPaths.forEach((path) => {
+      const beamColor = lightingAreaColorHex(path.color);
+      const fromP = project(path.from.x, path.from.y);
+      const toP = project(path.to.x, path.to.y);
+      const isCurve = path.type === "curve" && path.waypoint;
+      const wpP = isCurve ? project(path.waypoint.x, path.waypoint.y) : null;
+      const hasMovement = isCurve || fromP.sx !== toP.sx || fromP.sy !== toP.sy;
+      const markerRadius = 5;
+
+      if (hasMovement) {
+        ctx.strokeStyle = beamColor;
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        ctx.setLineDash([6, 5]);
+        ctx.beginPath();
+        ctx.moveTo(fromP.sx, fromP.sy);
+        if (isCurve) {
+          ctx.quadraticCurveTo(wpP.sx, wpP.sy, toP.sx, toP.sy);
+        } else {
+          ctx.lineTo(toP.sx, toP.sy);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        const arrowSize = 9;
+        const arrowPts = isCurve
+          ? trajectoryArrowPoints(wpP.sx, wpP.sy, toP.sx, toP.sy, arrowSize)
+          : trajectoryArrowPoints(fromP.sx, fromP.sy, toP.sx, toP.sy, arrowSize);
+        if (arrowPts) {
+          const pts = arrowPts.split(" ").map((pair) => pair.split(",").map(Number));
+          ctx.fillStyle = beamColor;
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          ctx.lineTo(pts[1][0], pts[1][1]);
+          ctx.lineTo(pts[2][0], pts[2][1]);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // 始点：outlineのみの小さな円
+      ctx.beginPath();
+      ctx.arc(fromP.sx, fromP.sy, markerRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // 終点：塗りつぶしの小さな円
+      ctx.beginPath();
+      ctx.arc(toP.sx, toP.sy, markerRadius, 0, Math.PI * 2);
+      ctx.fillStyle = beamColor;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = THEME.bg;
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  // 描画順3：Beam slice + Performerのdepth統合（照明ビームExport対応・STEP③）。
+  // 編集画面のdepthMergedItems（同ファイル7149〜7171行目）と全く同じ考え方をそのまま
+  // 移植する。Beam geometry（24 slice・projection・widthDirection・sourceWidth/
+  // targetWidth・fit変換）はSTEP②のものを一切変更せず、depthYだけを追加で受け取る。
+  // Performer側もSTEP②.5のstyle（opacity=1・全身輪郭・drawExportPerformerAudience()）を
+  // 一切変更せず、depthYにplacements[id].yをそのまま使うだけにする（poseによる補正なし）。
+
+  // Beam slice item化：STEP②のループ構造をそのまま使い、描画を即座に行わず配列へ積む。
+  const beamItems = [];
+  if (model.lightingBeams3D && model.lightingBeams3D.length > 0) {
+    const beamSegments = LIGHTING_BEAM_3D_DEPTH_SEGMENTS;
+    model.lightingBeams3D.forEach((beam, beamIdx) => {
+      const fillColor = lightingAreaColorHex(beam.color);
+      const fillOpacity = lightingAreaFillOpacity(beam.intensity);
+      for (let i = 0; i < beamSegments; i++) {
+        const t0 = i / beamSegments;
+        const t1 = (i + 1) / beamSegments;
+        const { points, depthY } = getLightingBeam3DScreenSlicePolygon(beam, bounds, model.stage.depth, t0, t1);
+        beamItems.push({
+          kind: "beamSlice",
+          key: `${beam.id || beamIdx}-slice-${i}`,
+          points,
+          depthY,
+          fillColor,
+          fillOpacity,
+        });
+      }
+    });
+  }
+
+  // Performer item化：STEP②.5のsorted生成をそのまま使い、単独sortはせずitem化だけ行う。
+  const performerItems = visiblePerformers
     .map((p) => ({ p, pos: model.placements[p.id] }))
     .filter((v) => !!v.pos)
-    .sort((a, b) => b.pos.y - a.pos.y);
+    .map((v) => ({ kind: "performer", key: v.p.id, depthY: v.pos.y, p: v.p, pos: v.pos }));
 
-  sorted.forEach(({ p, pos }) => {
-    const { sx, sy, scale, opacity } = project(pos.x, pos.y);
-    // heightPx：OverheadAudienceViewのp.height * scale * sizeCompと同じ考え方。PNGは
-    // ズーム操作が無い固定画角のため、bounds空間→Canvas pxへのfit.scaleだけを追加で掛ける。
-    const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
-    // 身長 v2・PART E〜G：X方向（体格）の基準はDEFAULT_PERFORMER_HEIGHT固定で計算し、
-    // 実際のp.heightによる横幅の変化を防ぐ（OverheadAudienceView・SVG版と同じ考え方）。
-    const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
-    ctx.globalAlpha = opacity;
-    drawExportPerformerAudience(ctx, sx, sy, heightPx, p, getPlacementPose(pos), refHeightPx);
-    ctx.globalAlpha = 1;
+  // 編集画面のdepthMergedItemsと全く同じ比較関数（同ファイル7162〜7169行目）。
+  // 奥（depthYが大きい）ほど先に描画し、同depth（差がTIE_BREAK_EPSILON以下）の場合は
+  // Performerを後ろ（＝画面上で手前）にする。Beam同士・Performer同士は0を返し、
+  // Array.prototype.sortの安定ソートにより元の配列順（生成順）をそのまま維持する
+  // （新しいtie-breakを追加しない＝16章）。
+  const depthMergedItems = [...beamItems, ...performerItems];
+  const TIE_BREAK_EPSILON = 1e-6;
+  depthMergedItems.sort((a, b) => {
+    const diff = b.depthY - a.depthY;
+    if (Math.abs(diff) > TIE_BREAK_EPSILON) return diff;
+    if (a.kind === b.kind) return 0;
+    return a.kind === "performer" ? 1 : -1;
   });
+
+  // Beam sliceとPerformerを交互に描画する可能性があるため、item処理ごとに必要な
+  // Canvas state（globalAlpha・fillStyle）を毎回明示的に設定する（13章：状態の
+  // 引き継ぎに依存しない）。drawExportPerformerAudience()内部のsave()/restore()は
+  // 変更していない。ブロック全体をsave()/restore()で囲み、終了後は必ずglobalAlpha=1へ戻す。
+  ctx.save();
+  depthMergedItems.forEach((item) => {
+    if (item.kind === "beamSlice") {
+      ctx.beginPath();
+      item.points.forEach((p, idx) => {
+        const sx = stageAreaX + fit.offsetX + fit.scale * p.x;
+        const sy = stageAreaY + fit.offsetY + fit.scale * p.y;
+        if (idx === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = item.fillColor;
+      ctx.globalAlpha = item.fillOpacity;
+      ctx.fill();
+      return;
+    }
+    // Performer：本体＋番号はdrawExportPerformerAudience()内部で連続して描画される
+    // （既存構造。STEP②.5のstyleは一切変更していない）。番号だけを後でまとめて
+    // 描画する構造にはしない（9章：奥の人物の番号が手前を貫通しないようにするため）。
+    const { p, pos } = item;
+    const { sx, sy, scale } = project(pos.x, pos.y);
+    const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
+    const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
+    ctx.globalAlpha = 1;
+    drawExportPerformerAudience(ctx, sx, sy, heightPx, p, getPlacementPose(pos), refHeightPx);
+  });
+  ctx.globalAlpha = 1;
+  ctx.restore();
 
   ctx.restore();
 }
@@ -5860,15 +9197,17 @@ function drawExportPerformerStanding(ctx, sx, sy, H, R, color) {
   ctx.translate(sx, sy);
   ctx.fillStyle = color;
 
-  // 脚
-  drawExportRoundRect(ctx, -legGap - legW, hipY, legW, legH, legW * 0.3);
-  drawExportRoundRect(ctx, legGap, hipY, legW, legH, legW * 0.3);
-  // 腕
-  ctx.globalAlpha *= 0.9;
-  drawExportRoundRect(ctx, -torsoW - armW, shoulderY, armW, armH, armW * 0.3);
-  drawExportRoundRect(ctx, torsoW, shoulderY, armW, armH, armW * 0.3);
-  ctx.globalAlpha /= 0.9;
-  // 胴体
+  // 脚：Performer視認性 v2・Export style統一 v1：編集画面のFrontFigure（SVG）と同じく、
+  // THEME.bg・FIGURE_BODY_STROKE_WIDTHで輪郭を付ける（drawExportRoundRectのoptional引数を
+  // 使うだけで、他の呼び出し箇所には影響しない）。
+  drawExportRoundRect(ctx, -legGap - legW, hipY, legW, legH, legW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  drawExportRoundRect(ctx, legGap, hipY, legW, legH, legW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  // 腕：編集画面（Performer視認性 v2）は他の身体パーツと同じ不透明度・同じ輪郭にしている
+  // ため、Export側に残っていたglobalAlpha*=0.9という腕だけの追加透過も撤去し、脚・胴体・
+  // 頭と同じTHEME.bg輪郭を付ける。
+  drawExportRoundRect(ctx, -torsoW - armW, shoulderY, armW, armH, armW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  drawExportRoundRect(ctx, torsoW, shoulderY, armW, armH, armW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  // 胴体：脚・腕と同じTHEME.bg輪郭を追加する。
   ctx.beginPath();
   ctx.moveTo(-torsoW, shoulderY);
   ctx.lineTo(torsoW, shoulderY);
@@ -5876,7 +9215,10 @@ function drawExportPerformerStanding(ctx, sx, sy, H, R, color) {
   ctx.lineTo(-torsoW * 0.8, hipY);
   ctx.closePath();
   ctx.fill();
-  // 頭
+  ctx.lineWidth = FIGURE_BODY_STROKE_WIDTH;
+  ctx.strokeStyle = THEME.bg;
+  ctx.stroke();
+  // 頭（既存。輪郭は変更前から存在するため、ここは変更しない）
   ctx.beginPath();
   ctx.arc(0, headCy, headR, 0, Math.PI * 2);
   ctx.fillStyle = color;
@@ -5897,22 +9239,47 @@ function drawExportPerformerKneeling(ctx, sx, sy, H, R, color) {
 
   ctx.save();
   ctx.translate(sx, sy);
-  ctx.strokeStyle = color;
   ctx.lineCap = "round";
 
-  // 長い脚（画面左＝人形自身の右脚）：腰から床までまっすぐ伸びる1本のみ。
+  // 長い脚（画面左＝人形自身の右脚）：編集画面のFrontFigureKneelingと同じ「THEME.bgの
+  // 太い下敷き線→実色の細い線」の2重描画で輪郭を再現する（<line>はfillを持てないため
+  // 採用されている手法を、そのままCanvasへ移植する。追加太さはFIGURE_BODY_STROKE_WIDTHを
+  // 基準にし、新しい独自の輪郭幅は作らない＝Export style統一 v1）。
+  ctx.strokeStyle = THEME.bg;
+  ctx.lineWidth = legW + FIGURE_BODY_STROKE_WIDTH * 2;
+  ctx.beginPath();
+  ctx.moveTo(hipXLong, hipY);
+  ctx.lineTo(hipXLong, 0);
+  ctx.stroke();
+  ctx.strokeStyle = color;
   ctx.lineWidth = legW;
   ctx.beginPath();
   ctx.moveTo(hipXLong, hipY);
   ctx.lineTo(hipXLong, 0);
   ctx.stroke();
 
-  // 短い脚（画面右＝人形自身の左脚）：腰から床までの半分程度で止める1本＋その先の
-  // 小さな斜めパーツ1本（後方へ折り畳まれた足の記号）。
+  // 短い脚（画面右＝人形自身の左脚）：同じ2重描画。
+  ctx.strokeStyle = THEME.bg;
+  ctx.lineWidth = legW + FIGURE_BODY_STROKE_WIDTH * 2;
   ctx.beginPath();
   ctx.moveTo(hipXShort, hipY);
   ctx.lineTo(hipXShort, shortLegEndY);
   ctx.stroke();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = legW;
+  ctx.beginPath();
+  ctx.moveTo(hipXShort, hipY);
+  ctx.lineTo(hipXShort, shortLegEndY);
+  ctx.stroke();
+
+  // 短い脚の先の膝下斜めパーツ：同じ2重描画（太さはlegW*0.9を基準にする点も編集画面と同じ）。
+  ctx.strokeStyle = THEME.bg;
+  ctx.lineWidth = legW * 0.9 + FIGURE_BODY_STROKE_WIDTH * 2;
+  ctx.beginPath();
+  ctx.moveTo(hipXShort, shortLegEndY);
+  ctx.lineTo(diagEndX, diagEndY);
+  ctx.stroke();
+  ctx.strokeStyle = color;
   ctx.lineWidth = legW * 0.9;
   ctx.beginPath();
   ctx.moveTo(hipXShort, shortLegEndY);
@@ -5920,12 +9287,11 @@ function drawExportPerformerKneeling(ctx, sx, sy, H, R, color) {
   ctx.stroke();
 
   ctx.fillStyle = color;
-  // 腕（ニュートラル）
-  ctx.globalAlpha *= 0.9;
-  drawExportRoundRect(ctx, -torsoW - armW, shoulderY, armW, armH, armW * 0.3);
-  drawExportRoundRect(ctx, torsoW, shoulderY, armW, armH, armW * 0.3);
-  ctx.globalAlpha /= 0.9;
-  // 胴体
+  // 腕（ニュートラル）：standingと同じくTHEME.bg輪郭を付け、Export側に残っていた腕だけの
+  // globalAlpha*=0.9も撤去する（編集画面はPerformer視認性 v2で全身同じ不透明度・同じ輪郭）。
+  drawExportRoundRect(ctx, -torsoW - armW, shoulderY, armW, armH, armW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  drawExportRoundRect(ctx, torsoW, shoulderY, armW, armH, armW * 0.3, THEME.bg, FIGURE_BODY_STROKE_WIDTH);
+  // 胴体：standingと同じTHEME.bg輪郭を追加する。
   ctx.beginPath();
   ctx.moveTo(-torsoW, shoulderY);
   ctx.lineTo(torsoW, shoulderY);
@@ -5933,7 +9299,10 @@ function drawExportPerformerKneeling(ctx, sx, sy, H, R, color) {
   ctx.lineTo(-torsoW * 0.8, hipY);
   ctx.closePath();
   ctx.fill();
-  // 頭
+  ctx.lineWidth = FIGURE_BODY_STROKE_WIDTH;
+  ctx.strokeStyle = THEME.bg;
+  ctx.stroke();
+  // 頭（既存。輪郭は変更前から存在するため、ここは変更しない）
   ctx.beginPath();
   ctx.arc(0, headCy, headR, 0, Math.PI * 2);
   ctx.fillStyle = color;
@@ -5947,7 +9316,11 @@ function drawExportPerformerKneeling(ctx, sx, sy, H, R, color) {
 
 // 角丸矩形の塗りつぶしだけを行う小さな汎用helper（drawExportPerformerAudienceの
 // 脚・腕の描画で使う。r（角丸半径）はw/2・h/2を超えないようclampする）。
-function drawExportRoundRect(ctx, x, y, w, h, r) {
+// 俯瞰客席Export・Performer style統一 v1：strokeColor/strokeWidthを省略可能な引数として
+// 追加した。省略時（他の呼び出し箇所が万一増えた場合も含む）は従来通りfillのみで、
+// 挙動は一切変わらない。呼び出し側が明示的に両方を渡した時だけ、fillの直後にstrokeも
+// 行う（drawExportRoundRect自体の既定動作は変更しない＝安全側の最小変更）。
+function drawExportRoundRect(ctx, x, y, w, h, r, strokeColor, strokeWidth) {
   const rr = Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2));
   ctx.beginPath();
   ctx.moveTo(x + rr, y);
@@ -5961,6 +9334,11 @@ function drawExportRoundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + rr, y, rr);
   ctx.closePath();
   ctx.fill();
+  if (strokeColor && strokeWidth) {
+    ctx.lineWidth = strokeWidth;
+    ctx.strokeStyle = strokeColor;
+    ctx.stroke();
+  }
 }
 
 // ------------------------------------------------------------------
@@ -6115,6 +9493,242 @@ function projectAudiencePoint(bounds, stageDepth, xUnits, yUnits) {
 }
 
 // ------------------------------------------------------------------
+// Lighting Beam v2・3D Prototype（F〜H章）
+// ------------------------------------------------------------------
+// 既存のprojectAudiencePoint()（舞台床上の2D座標(x,y)の疑似遠近投影）は一切変更しない。
+// ここでは「3D点(x,y,z)を俯瞰ビューへ投影する最小helper」だけを追加する。
+//
+// 考え方（G章）：まず(x,y)を既存project()と全く同じ計算（projectAudiencePoint）で
+// 舞台床上へ投影し、その後zの高さぶんだけ画面Y方向へ持ち上げる。
+// 「奥へ1単位進むごとに画面上へ持ち上がるpx量」として既に存在するPERSPECTIVE.liftPerDepthUnit
+// を、z方向の持ち上げにもそのまま再利用する（G章：新しい固定px値を乱用しない・既存の奥行き
+// scaleを参考にする）。さらにprojectAudiencePoint()が返すscale（奥にあるほど小さくなる
+// 既存の縮小率）を掛けることで、奥にあるBeamほど持ち上がる量も一緒に縮み、遠近感と矛盾しない
+// ようにしている。
+function projectAudiencePoint3D(bounds, stageDepth, xUnits, yUnits, zUnits) {
+  const base = projectAudiencePoint(bounds, stageDepth, xUnits, yUnits);
+  const liftPx = (zUnits || 0) * PERSPECTIVE.liftPerDepthUnit * base.scale;
+  return { ...base, sy: base.sy - liftPx };
+}
+
+// 旧「3Dビーム試作」（LIGHTING_BEAM_3D_PROTOTYPE・getLightingBeam3DPrototypeScreenPolygon）は
+// 正式版「3D照明ビーム」が実用化されたため、Lighting UI整理・Prototype卒業により削除した。
+// projectAudiencePoint3D()（すぐ上）は、正式版のgetLightingBeam3DScreenPolygon()が
+// 引き続き使用するため削除していない（Prototype専用コードだけを削除し、正式版が依存する
+// 3D projection helperは残す、という判断）。
+
+// ------------------------------------------------------------------
+// Lighting Beam v2・正式実装 STEP1・H章：正式Beam v2用のrenderer非依存pure helper
+// ------------------------------------------------------------------
+// 3D projection→画面座標→投影後の画面空間でpolygon化、という考え方。正式schemaが持つ
+// beam.sourceWidth / beam.targetWidthをそのまま使う。既存のprojectAudiencePoint()・
+// projectAudiencePoint3D()は一切変更せず、その上に薄く追加するだけ。
+function getLightingBeam3DScreenPolygon(beam, bounds, stageDepth) {
+  const src = projectAudiencePoint3D(bounds, stageDepth, beam.source.x, beam.source.y, beam.source.z);
+  const tgt = projectAudiencePoint3D(bounds, stageDepth, beam.target.x, beam.target.y, beam.target.z || 0);
+  const dx = tgt.sx - src.sx;
+  const dy = tgt.sy - src.sy;
+  const len = Math.hypot(dx, dy) || 1;
+  const perpX = -dy / len;
+  const perpY = dx / len;
+  // Lighting UI整理・Prototype卒業・E章：sourceWidth=0を正式な値として扱う。
+  // 「beam.sourceWidth || DEFAULT...」だと0がfalse扱いされてdefaultへ戻ってしまうため、
+  // 必ず `??`（値がnull/undefinedの場合だけdefaultへ）を使う。0の場合は発光元が完全な
+  // 一点になり、三角形のBeamとして描画される（W章の要件）。
+  const sourceWidth = Math.max(LIGHTING_BEAM_3D_MIN_SOURCE_WIDTH, beam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH);
+  const targetWidth = Math.max(LIGHTING_BEAM_3D_MIN_WIDTH, beam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH);
+  const srcHalf = (sourceWidth * UNIT_CM * 0.5) * src.scale;
+  const tgtHalf = (targetWidth * UNIT_CM * 0.5) * tgt.scale;
+  const points = [
+    { x: src.sx + perpX * srcHalf, y: src.sy + perpY * srcHalf },
+    { x: src.sx - perpX * srcHalf, y: src.sy - perpY * srcHalf },
+    { x: tgt.sx - perpX * tgtHalf, y: tgt.sy - perpY * tgtHalf },
+    { x: tgt.sx + perpX * tgtHalf, y: tgt.sy + perpY * tgtHalf },
+  ];
+  return { points, src, tgt };
+}
+
+// ------------------------------------------------------------------
+// 俯瞰客席ビュー・Beam幅3D方向 v1
+// ------------------------------------------------------------------
+// stage-space化（前STEP）で、Beam本体とfootprintの向き・接地感は改善したが、上手→下手・
+// 下手→上手のような横方向Beamでは、幅方向が舞台平面(XY)上のperpendicular＝ほぼY方向（奥行き）
+// に限定されてしまい、極端に細い「板」に見える問題が残っていた。
+// 原因：この疑似遠近projection（projectAudiencePoint/projectAudiencePoint3D）では、
+// 奥行き(Y)・高さ(Z)方向の画面上の変化量（PERSPECTIVE.liftPerDepthUnit基準、約26px/単位）が、
+// 横方向(X)の変化量（widthScale・UNIT_CM基準）よりずっと小さい。そのため、Y方向だけに幅を
+// 持たせると、Beamの向きによって画面上の見た目の太さが大きく変わってしまう。
+// 今回は、Beamの3D進行方向 D = target-source に対して垂直な方向の中から、疑似カメラの
+// view方向とのcross productによって「画面上で幅として見えやすい」3D方向を選ぶ（H章）。
+// 本格的な3D camera systemは作らず、view方向は固定ベクトルの簡易近似にとどめる（H章）。
+// view方向(0, 1, -1)（正規化）は、「客席後方・上方から、奥（+Y）へ見下ろしながら見ている」
+// という現在のprojectAudiencePoint()の挙動（+Yも-Zも、どちらも画面上でほぼ同程度「上」へ
+// 動く＝どちらもliftPerDepthUnit基準）に基づく簡易近似。
+const LIGHTING_BEAM_WIDTH_VIEW_DIR = (() => {
+  const len = Math.hypot(0, 1, -1);
+  return { x: 0, y: 1 / len, z: -1 / len };
+})();
+
+function cross3(a, b) {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+
+// Beam進行方向D=(dx,dy,dz)に垂直で、画面上で「幅」として見えやすい3D単位ベクトルを求める
+// pure helper。D・widthDirection ≈ 0 を満たす（J章）。
+//   ・D自体がほぼゼロ長（source≒target）→ 舞台X方向へfallback（F章：NaN禁止）。
+//   ・Dがview方向とほぼ平行（cross積がほぼゼロベクトル）→ 舞台X軸との外積へfallback。
+//   ・それでもゼロに近い場合（理論上到達しないはずの保険）→ 最終的に舞台X方向を返す。
+// 真上Beam（dx=dy=0）では、この式が自動的に(1,0,0)＝舞台X方向を返す（cross((0,0,-h),
+// viewDir) は常にX軸方向のみになるため）。M章が要求する「真上Beamは安定した横方向」を、
+// 特別分岐を書かずに満たせる。
+function computeLightingBeam3DWidthDirection(dx, dy, dz) {
+  const dLen = Math.hypot(dx, dy, dz);
+  if (dLen < 1e-6) {
+    return { x: 1, y: 0, z: 0 };
+  }
+  const d = { x: dx / dLen, y: dy / dLen, z: dz / dLen };
+
+  let w = cross3(d, LIGHTING_BEAM_WIDTH_VIEW_DIR);
+  let wLen = Math.hypot(w.x, w.y, w.z);
+  if (wLen < 1e-6) {
+    w = cross3(d, { x: 1, y: 0, z: 0 });
+    wLen = Math.hypot(w.x, w.y, w.z);
+  }
+  if (wLen < 1e-6) {
+    return { x: 1, y: 0, z: 0 };
+  }
+  return { x: w.x / wLen, y: w.y / wLen, z: w.z / wLen };
+}
+
+// ------------------------------------------------------------------
+// 俯瞰客席ビュー・Beam専用projection v1
+// ------------------------------------------------------------------
+// 前STEPの設計調査で判明したとおり、共通のprojectAudiencePoint()は
+//   t = clamp(yUnits / stageDepth, -0.4, 1.6)
+//   tClamped = clamp(t, 0, 1)
+// という2段のhard clamp／piecewise構造を持っており、scale・widthScaleが舞台の内外
+// （t<0・0<=t<=1・t>1）で挙動を変える。舞台外にBeam sourceを置いた場合、24 sliceの一部が
+// この境界をまたぐため、俯瞰客席ビュー上でBeamが折れ曲がって見える（くねる）原因になっていた。
+// projectAudiencePoint()/projectAudiencePoint3D()自体は、Performer・Lighting Area・
+// footprint・grid・待機エリア・Exportなど俯瞰ビューのほぼ全要素と共有されているため、今回は
+// 一切変更しない（絶対に触らない）。代わりに、Beam本体のslice投影だけに使う専用の
+// projectionを追加し、
+//   ・舞台内（0<=y<=stageDepth）では、tを一切clampしない点を除き、共通projectionと
+//     完全に同じ式（lerpの係数・liftPerDepthUnit等の定数もすべて共有）を使う。舞台内では
+//     元々t自体が0〜1に収まるため、共通projectionのtClampedと同じ値になり、結果は事実上
+//     同一になる（D・M章：舞台内Beam・target位置をほぼ変えない）。
+//   ・舞台外では、scale・widthScale・sy（screen Y）のいずれも、同じ線形の式（lerp／
+//     liftPerDepthUnitベースの一次式）をそのまま延長するだけで、別の式へ切り替えたり
+//     途中でclampして止めたりしない（F・G・H章：舞台内の傾きをそのまま滑らかに外挿する）。
+//   ・tだけ、現実的な想定範囲（stageDepthの0.5倍程度の舞台外＝t≒±0.5〜1.5）よりずっと
+//     広い[-2, 3]という安全域でclampし、scale・widthScaleも[0.15, 2.5]でclampする。これは
+//     極端に遠いsource（例：stageDepthの数十倍先）でも画面座標がNaN/Infinityへ発散しない
+//     ようにするための最終的なフェイルセーフであり、S章で確認範囲とされた「stageDepthの
+//     0.5倍程度の舞台外」には一切影響しない（後述V章の数値チェックで確認）。
+function projectLightingBeamAudiencePoint(bounds, stageDepth, xUnits, yUnits) {
+  const centerXcm = (bounds.minX + bounds.maxX) / 2;
+  const floorY = bounds.totalH - bounds.bottomMargin;
+  const depth = Math.max(stageDepth, 1);
+  const t = clamp(yUnits / depth, -2, 3); // 舞台内(0<=t<=1)ではclampされない。舞台外のみの安全域。
+  const rawScale = lerp(1, PERSPECTIVE.depthScaleMin, t);
+  const rawWidthScale = lerp(1, PERSPECTIVE.widthScaleMin, t);
+  const scale = clamp(rawScale, 0.15, 2.5);
+  const widthScale = clamp(rawWidthScale, 0.15, 2.5);
+  const xCm = xUnits * UNIT_CM;
+  const sx = bounds.leftMargin + (centerXcm + (xCm - centerXcm) * widthScale - bounds.minX);
+  const sy = floorY - t * (depth * PERSPECTIVE.liftPerDepthUnit);
+  return { sx, sy, scale };
+}
+
+// projectAudiencePoint3D()と同じ考え方（z方向の持ち上げにliftPerDepthUnit・scaleを
+// 再利用する）だが、内部で使う2D投影だけをprojectLightingBeamAudiencePoint()へ差し替えた
+// Beam専用版。
+function projectLightingBeamAudiencePoint3D(bounds, stageDepth, xUnits, yUnits, zUnits) {
+  const base = projectLightingBeamAudiencePoint(bounds, stageDepth, xUnits, yUnits);
+  const liftPx = (zUnits || 0) * PERSPECTIVE.liftPerDepthUnit * base.scale;
+  return { ...base, sy: base.sy - liftPx };
+}
+
+// ------------------------------------------------------------------
+// 俯瞰客席ビュー・Beam-Performer depth統合 v1：Beam v2 depth slice geometry
+// ------------------------------------------------------------------
+// getLightingBeam3DScreenPolygon()（Beam全体を1枚のpolygonにする既存関数）はそのまま残し、
+// ここではBeam上の区間 [t0, t1]（0=source, 1=target）だけを1枚のpolygonにするpure helperを
+// 追加する。呼び出し側（OverheadAudienceView）がこれをLIGHTING_BEAM_3D_DEPTH_SEGMENTS個
+// 呼び出して並べることで、1本のBeamを複数sliceへ分割する。
+// x/y/z/widthはすべてsource→target間をt0・t1でそれぞれ線形補間し（D章）、投影は
+// Beam専用のprojectLightingBeamAudiencePoint3D()を使う（舞台外sourceでのくねり軽減 v1）。
+// sourceWidth=0の`??`ベースの扱い・targetWidthのclampは既存getLightingBeam3DScreenPolygon()と
+// 完全に同じロジックを使う（E章：sourceWidth=0対応を壊さない）。
+//
+// 俯瞰客席ビュー・Beam幅geometry stage-space化 v1：
+// 従来は「中心線（p0/p1）を先にscreen-spaceへ投影し、投影後の画面上の垂線方向へwidth/2を
+// 足す」方式だった。今回は、Beam footprint（getLightingBeamFootprintStagePoints）と同じ
+// 考え方で、「まず舞台／3D座標（stage-space）側で左右の輪郭点を作ってから、その左右点
+// そのものを投影する」方式を維持しつつ、幅方向をXY平面だけの
+// perpendicularから、上記computeLightingBeam3DWidthDirection()による3D方向へ変更した。
+// widthDirectionはbeam.source/target（t0/t1に依存しない）だけで決まるため、この関数が
+// 24回呼ばれても常にBeam全体で同じ方向を共有する（STEP4/L章：sliceごとに別々の方向を
+// 計算しない）。
+// 単位について：x0/y0/z0/x1/y1/z1（stage-space）とwidth0/width1（stage単位のtargetWidth等を
+// そのまま補間した値）は既に同じ「舞台座標の単位系」（1単位=90cm）のため、footprintの
+// geometry helperと同様、cm換算（UNIT_CM）やscale倍率は一切手動で行わず、そのまま
+// projectLightingBeamAudiencePoint3D()（内部でUNIT_CM換算・widthScale・depth scaleを
+// まとめて処理する）に委譲する。
+function getLightingBeam3DScreenSlicePolygon(beam, bounds, stageDepth, t0, t1) {
+  const targetZ = beam.target.z || 0;
+  const x0 = lerp(beam.source.x, beam.target.x, t0);
+  const y0 = lerp(beam.source.y, beam.target.y, t0);
+  const z0 = lerp(beam.source.z, targetZ, t0);
+  const x1 = lerp(beam.source.x, beam.target.x, t1);
+  const y1 = lerp(beam.source.y, beam.target.y, t1);
+  const z1 = lerp(beam.source.z, targetZ, t1);
+
+  // STEP F/G/L：Beam全体（source→target、xyz）の3D方向から、1本のBeamにつき1つだけ
+  // widthDirectionを求める。t0/t1には依存しないため、この関数が24回呼ばれても常に同じ値になる。
+  const widthDir = computeLightingBeam3DWidthDirection(
+    beam.target.x - beam.source.x,
+    beam.target.y - beam.source.y,
+    targetZ - beam.source.z
+  );
+
+  // E章：既存getLightingBeam3DScreenPolygon()と全く同じ`??`ベースのfallback（sourceWidth=0を
+  // 有効な値として扱う）。`||`へ戻さない。
+  const sourceWidth = Math.max(LIGHTING_BEAM_3D_MIN_SOURCE_WIDTH, beam.sourceWidth ?? DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH);
+  const targetWidth = Math.max(LIGHTING_BEAM_3D_MIN_WIDTH, beam.targetWidth ?? DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH);
+  const width0 = lerp(sourceWidth, targetWidth, t0);
+  const width1 = lerp(sourceWidth, targetWidth, t1);
+  const half0 = width0 / 2; // stage単位のまま（cm換算はprojectAudiencePoint3D側に任せる）
+  const half1 = width1 / 2;
+
+  // STEP K：中心点ではなく、左右の3D点（stage-space、x/y/zすべてwidthDirection方向へ
+  // オフセット）を先に作ってから、その4点それぞれを個別にprojectAudiencePoint3D()へ通す。
+  const left0 = projectLightingBeamAudiencePoint3D(bounds, stageDepth, x0 + widthDir.x * half0, y0 + widthDir.y * half0, z0 + widthDir.z * half0);
+  const right0 = projectLightingBeamAudiencePoint3D(bounds, stageDepth, x0 - widthDir.x * half0, y0 - widthDir.y * half0, z0 - widthDir.z * half0);
+  const left1 = projectLightingBeamAudiencePoint3D(bounds, stageDepth, x1 + widthDir.x * half1, y1 + widthDir.y * half1, z1 + widthDir.z * half1);
+  const right1 = projectLightingBeamAudiencePoint3D(bounds, stageDepth, x1 - widthDir.x * half1, y1 - widthDir.y * half1, z1 - widthDir.z * half1);
+
+  const points = [
+    { x: left0.sx, y: left0.sy },
+    { x: right0.sx, y: right0.sy },
+    { x: right1.sx, y: right1.sy },
+    { x: left1.sx, y: left1.sy },
+  ];
+
+  // F章：depth比較用の値。slice中央地点（舞台座標のy＝奥行き）をPerformerのplacements[id].yと
+  // 同じ基準で比較できるようにする。保存はせず、描画のたびにここで計算するだけ（STEP8：
+  // depthYの考え方・depth sortロジック自体は変更していない）。
+  const midT = (t0 + t1) / 2;
+  const depthY = lerp(beam.source.y, beam.target.y, midT);
+
+  return { points, depthY };
+}
+
+// ------------------------------------------------------------------
 // UI Stability & Bottom Navigation v1・PART D/E/F：Audience Stage Guideのgeometry共通化
 // ------------------------------------------------------------------
 // 俯瞰客席ビュー（画面：OverheadAudienceView）と俯瞰PNG（renderAudienceFormationExport）の
@@ -6159,6 +9773,16 @@ function buildAudienceStageGuideGeometry(stage) {
   return { gridVertical, gridHorizontal, centerLine, centerCross, widthTicks, depthTicks };
 }
 
+// ------------------------------------------------------------------
+// 俯瞰客席ビュー・Performer視認性 v2
+// ------------------------------------------------------------------
+// v1では、project()（projectAudiencePoint）が返す奥行きフェードopacity（PERSPECTIVE.opacityMin
+// =0.55が最奥）を、俯瞰客席ビューのPerformerだけremapOverheadPerformerOpacity()で0.95〜1へ
+// 再マッピングしていた。今回（v2）は比較検証のため、俯瞰客席ビューのPerformer本体を選択・
+// 非選択を問わず完全不透明（opacity 1.0固定）にする方針へ変更したため、そのremap用helperは
+// 使用箇所が無くなった（renderPerformerBody側は下記のとおり固定値1を使う）。PERSPECTIVE や
+// project()自体（Exportとも共有）は今回も変更していない。
+
 const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   {
     stage,
@@ -6184,6 +9808,13 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     // Lighting Area v1・W章：俯瞰客席ビューは表示専用（編集・ドラッグ・選択は平面図のみ＝C章）。
     lightingAreas = [],
     showLightingAreas = false,
+    // Lighting Beam v2・正式実装 STEP1・T・U章：正式3D Beamは俯瞰客席ビューでは表示専用
+    // （編集は平面図＋sidebarで行う）。lightingBeams3Dは現在のSceneのbeams3D一覧、
+    // showLightingBeams3Dは表示条件（Areaと同じ基本条件）。
+    // 旧Beam v1・3D Prototype用のprops（lightingBeams/showLightingBeams/show3DBeamPrototype等）
+    // は、Lighting UI整理・Prototype卒業により削除済み。
+    lightingBeams3D = [],
+    showLightingBeams3D = false,
   },
   ref
 ) {
@@ -6304,6 +9935,151 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     arr.forEach((v) => (selectedIdSet.has(v.p.id) ? selected.push(v) : rest.push(v)));
     return [...rest, ...selected];
   }, [visiblePerformers, placements, selectedIdSet]);
+
+  // 俯瞰客席ビュー・Beam-Performer depth統合 v1・I章：選択中Performerは既存仕様どおり
+  // 常に最前面へ描画する（＝depth比較の対象に含めない）ため、`sorted`（既に「非選択→選択」の
+  // 順で並んでいる）から非選択分だけを取り出す。filter()はArrayの元の順序を保つため、
+  // restSortedは「非選択Performerをdepth（奥→手前）順に並べたもの」に等しい。
+  const restSorted = useMemo(
+    () => sorted.filter((v) => !selectedIdSet.has(v.p.id)),
+    [sorted, selectedIdSet]
+  );
+  const selectedSorted = useMemo(
+    () => sorted.filter((v) => selectedIdSet.has(v.p.id)),
+    [sorted, selectedIdSet]
+  );
+
+  // 俯瞰客席ビュー・Beam-Performer depth統合 v1・C章：正式Beam v2 1本を
+  // LIGHTING_BEAM_3D_DEPTH_SEGMENTS個のdepth sliceへ分割する。色・intensity（不透明度）は
+  // Beam全体の値をそのまま使う（D章：colorやintensity自体を補間しない）。
+  const lightingBeam3DSlices = useMemo(() => {
+    if (!showLightingBeams3D || !lightingBeams3D || lightingBeams3D.length === 0) return [];
+    const slices = [];
+    const segments = LIGHTING_BEAM_3D_DEPTH_SEGMENTS;
+    lightingBeams3D.forEach((beam) => {
+      const fillColor = lightingAreaColorHex(beam.color);
+      const fillOpacity = lightingAreaFillOpacity(beam.intensity);
+      for (let i = 0; i < segments; i++) {
+        const t0 = i / segments;
+        const t1 = (i + 1) / segments;
+        const { points, depthY } = getLightingBeam3DScreenSlicePolygon(beam, bounds, stage.depth, t0, t1);
+        slices.push({ key: `${beam.id}-slice-${i}`, points, depthY, fillColor, fillOpacity });
+      }
+    });
+    return slices;
+  }, [showLightingBeams3D, lightingBeams3D, bounds, stage.depth]);
+
+  // 俯瞰客席ビュー・Beam-Performer depth統合 v1・G・H章：非選択Performerと正式Beam v2の
+  // depth sliceを、舞台上のy（奥行き）を共通の基準にして1つのrenderItems配列へまとめ、
+  // 「奥→手前」の順にソートする。選択中Performerはここには含めず、この後で別途最前面に描画する
+  // （I章）。
+  const depthMergedItems = useMemo(() => {
+    const performerItems = restSorted.map((v) => ({
+      kind: "performer",
+      key: v.p.id,
+      depthY: v.pos.y,
+      p: v.p,
+      pos: v.pos,
+    }));
+    const beamItems = lightingBeam3DSlices.map((s) => ({ kind: "beamSlice", ...s }));
+    const items = [...performerItems, ...beamItems];
+    // H章：Beam sliceとPerformerのdepthYが同じ・非常に近い場合は、視認性のためPerformerを
+    // Beamより前面にする（tie-break）。EPSILON以下の差は「同depth」とみなす。
+    // 本格的な3D交差判定は行わない（R章）。
+    const TIE_BREAK_EPSILON = 1e-6;
+    items.sort((a, b) => {
+      const diff = b.depthY - a.depthY; // 奥（yが大きい）ほど先に描画
+      if (Math.abs(diff) > TIE_BREAK_EPSILON) return diff;
+      if (a.kind === b.kind) return 0;
+      // 同depth：Performer側を配列の後ろ（＝描画が後＝画面上で手前）へ
+      return a.kind === "performer" ? 1 : -1;
+    });
+    return items;
+  }, [restSorted, lightingBeam3DSlices]);
+
+  // 俯瞰客席ビュー・Beam-Performer depth統合 v1：Performer本体（FrontFigure）のJSXを
+  // 生成する共通関数。従来1箇所だったsorted.map(...)の中身を、depth統合レイヤー・選択中
+  // Performerレイヤーの両方から呼べるようそのまま切り出しただけで、投影計算・サイズ計算・
+  // クリック／選択操作のロジックは一切変更していない。
+  // 俯瞰客席ビュー・Performer視認性 v2：<g>のopacityは、project()が返す奥行きフェード値
+  // （Export等と共有）を使わず、選択・非選択を問わず固定で1（完全不透明）にする。
+  // これにより、Beam sliceとの前後関係（Beamが人物より奥なら透けて混ざらない・手前なら
+  // Beamが人物の前に出る）がより明確に見えるかどうかを比較検証する（G章：Beam側のdepth
+  // sort・tie-breakロジック自体には触れていない）。
+  const renderPerformerBody = (p, pos) => {
+    const { sx, sy, scale } = project(pos.x, pos.y);
+    // 出演者表示サイズ v1.1・PART E：俯瞰客席ビューは「身長 小・中・大」だけで人物サイズ・
+    // 身長差を表現する設計のため、performerDisplayScale（平面図専用の表示設定）は
+    // ここでは一切参照しない（v1で誤って反映していた掛け算を撤去した）。
+    const heightPx = p.height * scale * sizeComp;
+    // 身長 v2・PART E〜G：X方向（体格）の基準はDEFAULT_PERFORMER_HEIGHT固定で計算し、
+    // 実際のp.heightによる横幅の変化を防ぐ（頭・肩幅・胴体幅・脚の太さ等はrefHeightPx側で
+    // 決まり、heightPxは縦方向の位置・長さにだけ使われる＝FrontFigure/FrontFigureKneeling内部）。
+    const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
+    const warn = isBeyondAllAreas(pos, zones) || overlapIds.has(p.id);
+    const pose = getPlacementPose(pos);
+    const isSelected = selectedIdSet.has(p.id);
+    return (
+      <g
+        key={p.id}
+        transform={`translate(${sx} ${sy})`}
+        opacity={1}
+        style={{ cursor: locked ? "default" : "pointer" }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (locked) return; // 再生中は選択操作を無効化（誤操作防止）。zoom/panは背景側の操作なので影響しない
+          if (e.shiftKey) {
+            // Shift＋クリック：選択への追加・解除（このビューでは矩形選択は未対応）
+            onToggleSelect(p.id);
+            return;
+          }
+          onSelect(p.id);
+        }}
+      >
+        <FrontFigure color={p.color} selected={isSelected} warn={warn} heightPx={heightPx} pose={pose} refHeightPx={refHeightPx} />
+      </g>
+    );
+  };
+
+  // 俯瞰客席ビュー・番号depth統合 v1：胸の番号（<text>）のJSXを生成する共通関数。
+  // 元々sorted.map(...)としてPerformer本体・Beam sliceとは別に、常に最後にまとめて
+  // 描画されていた処理を、そのままhelperとして切り出した。色・サイズ・位置・フォント・
+  // 文言・stroke・pointerEvents="none"など見た目に関わる部分は一切変更していない
+  // （G章：番号の見た目自体は変えない。変えるのは呼び出す場所＝描画順だけ）。
+  const renderOverheadPerformerLabel = (p, pos) => {
+    const { sx, sy, scale } = project(pos.x, pos.y);
+    const heightPx = p.height * scale * sizeComp;
+    const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
+    const pose = getPlacementPose(pos);
+    const { tagOffsetY, chestWidth } = frontFigureChestMetrics(heightPx, pose, refHeightPx);
+    const tagY = sy + tagOffsetY;
+    const fontSize = performerNumberFontSizeAudience(chestWidth, p.number);
+    const isSelected = selectedIdSet.has(p.id);
+    return (
+      <text
+        key={`tag-${p.id}`}
+        x={sx}
+        y={tagY}
+        textAnchor="middle"
+        dominantBaseline="middle"
+        fontSize={fontSize}
+        fontWeight="bold"
+        fill={isSelected ? THEME.accent : "#ffffff"}
+        stroke="rgba(0,0,0,0.7)"
+        strokeWidth={Math.max(1.5, fontSize * 0.1)}
+        paintOrder="stroke"
+        // この番号タグは装飾用オーバーレイであり、実際のクリック判定は下に描画されている
+        // FrontFigureの<g onPointerDown>が受け持つ。pointerEvents="none"にしてこのテキスト自身が
+        // イベントターゲットにならないようにすることで、番号の上をクリックしても常に
+        // 出演者本体をクリックしたのと同じ扱いになる（3章：TopViewの出演者番号と同じ原則）。
+        // 併せてuserSelect:noneでブラウザの文字選択対象からも外す。
+        pointerEvents="none"
+        style={{ userSelect: "none", WebkitUserSelect: "none" }}
+      >
+        {p.number}
+      </text>
+    );
+  };
 
   // ------------------------------------------------------------
   // 拡大縮小・画面移動（表示用の操作。出演者データ・遠近投影は一切変更しない）
@@ -6520,10 +10296,12 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
         {/* Lighting Area v1・W章：照明Areaレイヤー（表示専用。編集・ドラッグ・選択は平面図のみ
             ＝C章）。Areaの舞台座標上の頂点（getLightingAreaStagePoints、TopViewと共通のpure
             helper＝X章）を、既存のproject()（projectAudiencePoint）へそのまま通すことで、
-            矩形は4隅のpolygon、円・楕円は多角形近似のpolygonとして、舞台床に沿って見えるように
-            投影する（W章の要件：単なるscreen上の円ではなく、舞台床上に置かれているように見える
-            こと）。投影計算・画角・出演者位置・待機エリア・目盛り・舞台台形・ラベルには
-            一切手を加えていない。 */}
+            円・楕円（旧rectデータもellipseとして＝Lighting Area整理v1・C・G章）の多角形近似の
+            polygonとして、舞台床に沿って見えるように投影する（W章の要件：単なるscreen上の円
+            ではなく、舞台床上に置かれているように見えること）。投影計算・画角・出演者位置・
+            待機エリア・目盛り・舞台台形・ラベルには一切手を加えていない。
+            Lighting Area整理 v1・G章：俯瞰ビューは表示専用のため、色付きoutlineは出さず
+            fillのみにする（選択outlineの概念自体が不要）。 */}
         {showLightingAreas && (
           <g pointerEvents="none" style={{ userSelect: "none", WebkitUserSelect: "none" }}>
             {lightingAreas.map((area) => {
@@ -6537,14 +10315,48 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
                   points={pointsAttr}
                   fill={fillColor}
                   fillOpacity={lightingAreaFillOpacity(area.intensity)}
-                  stroke={fillColor}
-                  strokeOpacity={0.5}
-                  strokeWidth={1}
                 />
               );
             })}
           </g>
         )}
+
+        {/* 照明ビーム・簡易照射面（footprint） v1・L・N章：Lighting Areaと同じ「床レイヤー」
+            として、trajectory・Beam/Performerのdepth統合レイヤーより前（＝奥）に描く。これに
+            より、footprintは常にPerformerより後ろに表示される（N章：人物より必ず後ろ）。
+            舞台座標上のpoints（getLightingBeamFootprintStagePoints、TopViewと共通のpure
+            helper＝J章）を、既存のproject()（projectAudiencePoint）へそのまま通すだけで、
+            新しい3D投影式は作らない（L章）。Beam本体・Beam/Performerのdepth sortには一切
+            触れていない（N章）。 */}
+        {showLightingBeams3D && (
+          <g pointerEvents="none" style={{ userSelect: "none", WebkitUserSelect: "none" }}>
+            {lightingBeams3D.map((beam) => {
+              const footprintPoints = getLightingBeamFootprintStagePoints(beam);
+              if (footprintPoints.length === 0) return null;
+              const pointsAttr = footprintPoints.map((p) => project(p.x, p.y)).map((sp) => `${sp.sx},${sp.sy}`).join(" ");
+              const fillColor = lightingAreaColorHex(beam.color);
+              return (
+                <polygon
+                  key={`footprint-${beam.id}`}
+                  points={pointsAttr}
+                  fill={fillColor}
+                  fillOpacity={lightingBeamFootprintFillOpacity(beam.intensity)}
+                />
+              );
+            })}
+          </g>
+        )}
+
+        {/* 旧Lighting Beam v1 と 3D Prototype の俯瞰客席ビュー描画は、Lighting UI整理・
+            Prototype卒業により削除した。正式版「3D照明ビーム」（Scene.beams3D）は、
+            俯瞰客席ビュー・Beam-Performer depth統合 v1により、下の「軌跡」より後ろ・
+            「depth統合レイヤー」の中でPerformerとdepth順に混ざって描画されるように変更した
+            （getLightingBeam3DScreenPolygon()自体は平面図・将来のExport用にそのまま残して
+            あり、ここでは呼ばなくなっただけ）。
+            描画順は「Lighting Area→軌跡→depth統合（正式Beam v2 slice＋非選択Performer）→
+            選択中Performer」（俯瞰客席ビュー・Beam-Performer depth統合 v1・K章：軌跡は
+            depth sortへ混ぜず、既存位置＝Beamより後・Performerより前を維持するため、
+            ここに置いたまま）。 */}
 
         {/* 移動軌跡（表示専用レイヤー）：人物本体より背面・非インタラクティブに描画する。
             平面図と同じ transitionPaths（App側でcomputeTransitionPathsにより毎回計算し直された
@@ -6600,85 +10412,46 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
           </g>
         )}
 
-        {/* 人物本体（奥から手前の順に描画） */}
-        {sorted.map(({ p, pos }) => {
-          const { sx, sy, scale, opacity } = project(pos.x, pos.y);
-          // 出演者表示サイズ v1.1・PART E：俯瞰客席ビューは「身長 小・中・大」だけで人物サイズ・
-          // 身長差を表現する設計のため、performerDisplayScale（平面図専用の表示設定）は
-          // ここでは一切参照しない（v1で誤って反映していた掛け算を撤去した）。
-          const heightPx = p.height * scale * sizeComp;
-          // 身長 v2・PART E〜G：X方向（体格）の基準はDEFAULT_PERFORMER_HEIGHT固定で計算し、
-          // 実際のp.heightによる横幅の変化を防ぐ（頭・肩幅・胴体幅・脚の太さ等はrefHeightPx側で
-          // 決まり、heightPxは縦方向の位置・長さにだけ使われる＝FrontFigure/FrontFigureKneeling内部）。
-          const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
-          const warn = isBeyondAllAreas(pos, zones) || overlapIds.has(p.id);
-          const pose = getPlacementPose(pos);
+        {/* 俯瞰客席ビュー・番号depth統合 v1（前提はBeam-Performer depth統合 v1・G章と同じ）：
+            正式Beam v2のdepth sliceと非選択Performerを、depthMergedItems（舞台上のy＝奥行きで
+            「奥→手前」にソート済み）の順にそのまま描画する。以前は番号だけを最後に別途
+            まとめて描画していたため、奥のPerformerが手前のPerformerに隠れていても番号だけが
+            貫通して見えてしまっていた。今回は非選択Performerについて、本体（renderPerformerBody）
+            と番号（renderOverheadPerformerLabel）を同じdepth位置（同じReact.Fragment）で連続
+            描画することで、番号も本体と同じように奥の人物ごと隠れるようにする
+            （Beam sliceはpointerEvents="none"のまま、Performerだけが従来どおりクリック・
+            選択操作を受け付ける。番号自体の色・サイズ・位置・フォント等の見た目は
+            renderOverheadPerformerLabelへ切り出しただけで変更していない）。 */}
+        {depthMergedItems.map((item) => {
+          if (item.kind === "beamSlice") {
+            const pointsAttr = item.points.map((pt) => `${pt.x},${pt.y}`).join(" ");
+            return (
+              <polygon
+                key={item.key}
+                points={pointsAttr}
+                fill={item.fillColor}
+                fillOpacity={item.fillOpacity}
+                pointerEvents="none"
+              />
+            );
+          }
           return (
-            <g
-              key={p.id}
-              transform={`translate(${sx} ${sy})`}
-              opacity={opacity}
-              style={{ cursor: locked ? "default" : "pointer" }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (locked) return; // 再生中は選択操作を無効化（誤操作防止）。zoom/panは背景側の操作なので影響しない
-                if (e.shiftKey) {
-                  // Shift＋クリック：選択への追加・解除（このビューでは矩形選択は未対応）
-                  onToggleSelect(p.id);
-                  return;
-                }
-                onSelect(p.id);
-              }}
-            >
-              <FrontFigure color={p.color} selected={selectedIdSet.has(p.id)} warn={warn} heightPx={heightPx} pose={pose} refHeightPx={refHeightPx} />
-            </g>
+            <React.Fragment key={`depth-performer-${item.key}`}>
+              {renderPerformerBody(item.p, item.pos)}
+              {renderOverheadPerformerLabel(item.p, item.pos)}
+            </React.Fragment>
           );
         })}
 
-        {/* 胸の番号は常に最前面にまとめて描画し、重なっても読めるようにする。
-            丸バッジ（背景の円）は使わず、数字のみを表示する。選択中はアクセント色にして
-            既存の「選択中がわかる」仕様を維持しつつ、濃色の縁取り（paintOrder="stroke"）で
-            どんな背景の上でも読みやすくする。
-            フォントサイズ・タグ位置は姿勢ごとにfrontFigureChestMetrics()（FrontFigure／
-            FrontFigureKneelingの胴体比率と同期）で算出するため、身長プリセットの違いや
-            奥行き方向の遠近スケール・zoomアウト時の最小サイズ補正（sizeComp）・姿勢の違いにも
-            自動で追従し、数字がchestWidthを超えないようクランプされた範囲で1桁・2桁とも
-            胴体内に収まるサイズにする。chestWidth自体はrefHeightPx基準（身長プリセットで
-            横幅が変わらない＝PART E）なので、番号の大きさも小・中・大でほぼ同じになる。 */}
-        {sorted.map(({ p, pos }) => {
-          const { sx, sy, scale } = project(pos.x, pos.y);
-          const heightPx = p.height * scale * sizeComp;
-          const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
-          const pose = getPlacementPose(pos);
-          const { tagOffsetY, chestWidth } = frontFigureChestMetrics(heightPx, pose, refHeightPx);
-          const tagY = sy + tagOffsetY;
-          const fontSize = performerNumberFontSizeAudience(chestWidth, p.number);
-          const isSelected = selectedIdSet.has(p.id);
-          return (
-            <text
-              key={`tag-${p.id}`}
-              x={sx}
-              y={tagY}
-              textAnchor="middle"
-              dominantBaseline="middle"
-              fontSize={fontSize}
-              fontWeight="bold"
-              fill={isSelected ? THEME.accent : "#ffffff"}
-              stroke="rgba(0,0,0,0.7)"
-              strokeWidth={Math.max(1.5, fontSize * 0.1)}
-              paintOrder="stroke"
-              // この番号タグは装飾用オーバーレイであり、実際のクリック判定は下に描画されている
-              // FrontFigureの<g onPointerDown>が受け持つ。pointerEvents="none"にしてこのテキスト自身が
-              // イベントターゲットにならないようにすることで、番号の上をクリックしても常に
-              // 出演者本体をクリックしたのと同じ扱いになる（3章：TopViewの出演者番号と同じ原則）。
-              // 併せてuserSelect:noneでブラウザの文字選択対象からも外す。
-              pointerEvents="none"
-              style={{ userSelect: "none", WebkitUserSelect: "none" }}
-            >
-              {p.number}
-            </text>
-          );
-        })}
+        {/* 俯瞰客席ビュー・Beam-Performer depth統合 v1・I章：選択中Performer（複数可）は、
+            depth順とは独立に必ず最前面へ描画する既存仕様を維持する。Beam sliceより後ろに
+            埋もれることがないよう、depth統合レイヤーの外側・最後に描画する。
+            番号depth統合 v1：選択中Performerの番号も同様に最前面にしたいため、まず選択中
+            Performer本体をすべて描画し、続けて選択中Performerの番号をすべて描画する
+            （選択解除時は、その人物がdepthMergedItems側の非選択パスへ戻るだけなので、
+            番号専用の保存stateは不要＝既存のselectedIdSetのみで判定できる）。 */}
+        {selectedSorted.map(({ p, pos }) => renderPerformerBody(p, pos))}
+        {selectedSorted.map(({ p, pos }) => renderOverheadPerformerLabel(p, pos))}
       </g>
     </svg>
   );
@@ -6790,7 +10563,16 @@ export default function App() {
   // 表示専用のローカル変数 transitionPaths（軌跡表示用に毎回計算し直す配列）は
   // 名前が紛らわしいため、work側は destructure 時に transitionPathConfig という
   // 別名で受け取る（work.transitionPaths というプロパティ名自体は変更しない）。
-  const { stage, performers, slides, currentSlideIndex, transitionCounts, transitionPaths: transitionPathConfig } = work;
+  const {
+    stage,
+    performers,
+    slides,
+    currentSlideIndex,
+    transitionCounts,
+    transitionPaths: transitionPathConfig,
+    transitionLightingCues,
+    transitionPoses,
+  } = work;
 
   // このプロジェクトの実際のBPM。work.projectが無い（BPM機能実装前の古いデータ）場合や
   // project.bpmが数値でない場合はDEFAULT_BPMへfallbackする（getProjectBpm参照）。
@@ -6852,7 +10634,115 @@ export default function App() {
   // Formation切替・Scene削除・Area削除等で存在しなくなった場合は下のuseEffectで自動的に
   // クリアする（selectedIds＝出演者選択の既存クリーンアップと同じ考え方）。
   const [selectedLightingAreaId, setSelectedLightingAreaId] = useState(null);
-  // 「？ 操作方法」パネルの開閉状態。表示のON/OFFだけの一時的なUI stateであり、
+  // Lighting Beam v2・正式実装 STEP1・W章：selectedLightingAreaIdと全く同じ考え方のUI専用
+  // state（workへ保存しない）。旧Beam v1のselectedLightingBeamIdは、Beam v1のUI/rendererごと
+  // Lighting UI整理・Prototype卒業により削除した。3D Prototype用のshowLightingBeam3DPrototype
+  // stateも同様に削除した（Prototype UIごと卒業）。
+  const [selectedLightingBeam3DId, setSelectedLightingBeam3DId] = useState(null);
+  // Lighting複数選択 v1：Area/Beamをまとめて選択するための専用state（work外・Undo/Redo対象外・
+  // Backup対象外、既存のselectedLightingAreaId等と全く同じ方針）。既存のselectedIds
+  // （出演者複数選択、配列で保持しselectOnly/toggleSelectで操作する既存パターン）を参考に、
+  // Area/Beamという2種類を区別するため{type: "area"|"beam3d", id}の配列にする。
+  // 既存のselectedLightingAreaId/selectedLightingBeam3DIdは廃止せず、「複数選択集合
+  // （selectedLightingItemKeys）」と「primary selection（selectedLightingAreaId/
+  // selectedLightingBeam3DId、単一選択時の既存編集UIがそのまま使う）」という2階建ての設計にする
+  // （下のselectLightingItemOnly/toggleLightingItemSelectで常に整合させる）。
+  const [selectedLightingItemKeys, setSelectedLightingItemKeys] = useState([]);
+  // Lighting複数選択 v1：通常クリック相当（1件だけ選択し直す）。既存のselectOnly（出演者選択）
+  // と同じ考え方。primary selection（selectedLightingAreaId/selectedLightingBeam3DId）も
+  // 同時に同期し、既存の単一選択編集UIがそのまま使えるようにする。
+  const selectLightingItemOnly = useCallback((type, id) => {
+    setSelectedLightingItemKeys([{ type, id }]);
+    if (type === "area") {
+      setSelectedLightingAreaId(id);
+      setSelectedLightingBeam3DId(null);
+    } else {
+      setSelectedLightingBeam3DId(id);
+      setSelectedLightingAreaId(null);
+    }
+  }, []);
+  // Shift+click相当（追加／解除）。既存のtoggleSelect（出演者選択）と同じ考え方。結果が
+  // 1件になった場合だけprimary selectionをその1件へ同期し（単一編集UIへ自然に戻る）、
+  // 0件または2件以上になった場合はprimary selectionを両方nullにする（複数選択時は個別編集UIを
+  // 表示せず、複数選択UI＝「N個選択中」＋一括削除ボタンへ切り替える）。
+  const toggleLightingItemSelect = useCallback((type, id) => {
+    setSelectedLightingItemKeys((prev) => {
+      const exists = prev.some((k) => k.type === type && k.id === id);
+      const next = exists ? prev.filter((k) => !(k.type === type && k.id === id)) : [...prev, { type, id }];
+      if (next.length === 1) {
+        const only = next[0];
+        if (only.type === "area") {
+          setSelectedLightingAreaId(only.id);
+          setSelectedLightingBeam3DId(null);
+        } else {
+          setSelectedLightingBeam3DId(only.id);
+          setSelectedLightingAreaId(null);
+        }
+      } else {
+        setSelectedLightingAreaId(null);
+        setSelectedLightingBeam3DId(null);
+      }
+      return next;
+    });
+  }, []);
+
+  // Lighting Cue STEP 2B：選択中のkeep Cue（UI専用state、作品データではない）。
+  // selectedLightingAreaId/selectedLightingBeam3DIdと全く同じ考え方：workへ保存せず、
+  // Undo/Redo対象外・Backup対象外。Cueを選択してもArea/Beamの選択stateには一切影響しない
+  // （STEP 2Bでは意図的に独立させる）。
+  const [selectedLightingCueId, setSelectedLightingCueId] = useState(null);
+  // 「次構成1」reference view v1・STEP 4：現在Formationのlighting Cue timelineの末尾から、
+  // 次Formationの実Base Sceneを直接参照・編集しているかどうかを表すUI専用state。
+  // selectedLightingCueIdと同じくworkへは一切保存しない（Undo/Redo対象外・Backup対象外・
+  // 新しいProject schemaは追加しない＝設計原則STEP3）。trueの間は、既存のselectedLightingCueId
+  // （keep/transition Cue選択）とは意味上排他的に扱う（選択操作側でどちらか一方だけを
+  // trueにする。両方同時にセットされることは無い設計だが、displayLightingAreas等の
+  // 導出側では常にisEditingNextFormationLightingBaseを優先的に判定することで、万一の
+  // 不整合があっても安全側（次Formation Base Scene表示）に倒す）。
+  const [isEditingNextFormationLightingBase, setIsEditingNextFormationLightingBase] = useState(false);
+  // Lighting Area 後付け接続 v1・STEP 8：重複logicalAreaId接続を拒否した際に表示する、
+  // 簡潔な警告メッセージ用UI専用state（workへは保存しない）。Area選択が変わるたびに
+  // 自動でクリアする（下の既存クリーンアップuseEffectで一緒に処理する）。
+  const [lightingAreaConnectionWarning, setLightingAreaConnectionWarning] = useState(null);
+  // Cue間Beam・前の状態との接続 v1・PART H：Area版lightingAreaConnectionWarningと同じ
+  // 簡潔なwarning方式をBeamへ対称に用意する（大規模なvalidation systemは作らない）。
+  const [lightingBeamConnectionWarning, setLightingBeamConnectionWarning] = useState(null);
+  // Lighting Cue STEP 2B：新規Cue追加時のcount入力用ローカルUI state。Projectへは保存せず、
+  // Cue追加を確定した時点でのみCue.countとしてworkへ書き込まれる。
+  const [newLightingCueCount, setNewLightingCueCount] = useState(1);
+  // Lighting Cue カウント変更 v1：選択中Cueの発火位置（表示カウント）を変更するための
+  // ローカルUI state。既存のnewLightingCueCountと同じ考え方（workへは保存せず、変更確定時に
+  // のみhandlerへ渡す）。selectedLightingCueIdの変更に合わせて、下のuseEffectで現在の
+  // Cueの表示カウントへ同期する。
+  const [editLightingCueCount, setEditLightingCueCount] = useState("");
+  // Lighting Cue カウント変更UI整理：「今カウント編集モードを開いているか」だけを表す
+  // UI専用boolean state。作品データではないため、workへ保存しない・Undo/Redo対象外・
+  // Backup対象外（既存のeditLightingCueCount等と全く同じ方針）。
+  const [lightingCueCountEditing, setLightingCueCountEditing] = useState(false);
+  // Lighting Cueへ短い名前/メモを付けられる機能・9章：Cue名編集用のUI draft state。
+  // editLightingCueCount/lightingCueCountEditingと全く同じ方針（作品データではなくUI専用、
+  // workへ保存しない・Undo/Redo対象外・Backup対象外）。編集開始時に
+  // selectedLightingCue.name || ""をdraftへ入れ、確定時だけupdateLightingCueNameCommit()へ渡す。
+  const [editLightingCueName, setEditLightingCueName] = useState("");
+  const [lightingCueNameEditing, setLightingCueNameEditing] = useState(false);
+  // 照明フェード v1・STEP 13〜16：Fade設定編集用のUI draft state。editLightingCueName/
+  // lightingCueNameEditingと全く同じ方針（作品データではなくUI専用、workへ保存しない・
+  // Undo/Redo対象外・Backup対象外）。編集開始時に現在Cueのfadecounts（0を含む）をdraftへ入れ、
+  // 確定時だけupdateLightingCueFadeCountsCommit()へ渡す。
+  const [editLightingCueFadeCounts, setEditLightingCueFadeCounts] = useState(0);
+  const [lightingCueFadeCountsEditing, setLightingCueFadeCountsEditing] = useState(false);
+  // Lighting Fade v3・7章：開始フェード（Lighting Scene.entryFadeCounts）編集用のUI draft
+  // state。editLightingCueFadeCounts/lightingCueFadeCountsEditingと全く同じ方針（作品データ
+  // ではなくUI専用、workへ保存しない・Undo/Redo対象外・Backup対象外）。「開始時」選択中
+  // （selectedLightingCue===null）だけで使う、通常Cueのfade編集とは別のstate。
+  const [editLightingSceneEntryFadeCounts, setEditLightingSceneEntryFadeCounts] = useState(0);
+  const [lightingSceneEntryFadeCountsEditing, setLightingSceneEntryFadeCountsEditing] = useState(false);
+  // Lighting UI整理・Prototype卒業・L章：照明エリア／3D照明ビームセクションの折りたたみ状態。
+  // workへ保存しない、Undo/Redo対象外、Backup対象外、Formation copy対象外のUI専用state
+  // （helpOpen・globalSettingsOpen等と全く同じ方針）。初期状態は開いた状態にする。
+  const [lightingAreaSectionOpen, setLightingAreaSectionOpen] = useState(true);
+  const [lightingBeam3DSectionOpen, setLightingBeam3DSectionOpen] = useState(true);
+  // 「？ ヘルプ」パネルの開閉状態。表示のON/OFFだけの一時的なUI stateであり、
   // 作品データ（work）には含めないため履歴（Undo/Redo）の対象外。初期状態は閉じておく。
   const [helpOpen, setHelpOpen] = useState(false);
   // 右編集パネルの整理 v1（PART D・新規）：「全体の設定」「構成ごとの設定」2グループの開閉状態。
@@ -6860,6 +10750,13 @@ export default function App() {
   // work（Undo/Redo対象）には含めない（21章）。PC・タブレットでの初期状態はどちらも開いた状態（20章）。
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(true);
   const [slideSettingsOpen, setSlideSettingsOpen] = useState(true);
+  // 全体設定UI整理・2階層目accordion導入（新規）：「全体の設定」内の「ステージ設定」
+  // 「音楽設定」の開閉状態。globalSettingsOpen等と全く同じ方針で、work（Undo/Redo対象）
+  // には含めないUI専用state。親の「全体の設定」を閉じても、この2つのstateはApp側に
+  // 残り続けるため、再度開いたときに閉じる前の開閉状態へ自然に戻る（追加のuseEffect等は不要）。
+  // 初期状態は既存ユーザーの見え方を急激に変えないよう、両方openにしてある。
+  const [stageSettingsOpen, setStageSettingsOpen] = useState(true);
+  const [musicSettingsOpen, setMusicSettingsOpen] = useState(true);
   // Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層の独立グループとして
   // 「照明の設定」を新設する。開閉状態の管理方法は既存2グループと完全に同じ（work対象外・
   // 初期状態は開いた状態）。
@@ -6886,6 +10783,80 @@ export default function App() {
       if (nextOpen) setSidebarOpen(true);
       return nextOpen;
     });
+  }, []);
+  // Manual v1.1：「はじめての方へ」「機能から探す」内の各項目「ショートカット」の
+  // 開閉状態をまとめて持つ。helpOpenと全く同じ方針（表示のON/OFFだけの一時的なUI state。
+  // workへ保存せず、Undo/Redo対象外）。「はじめての方へ」はManualの主役のため、
+  // 初期状態だけgettingStarted:trueにして開いた状態にする（他キーは未設定＝閉じた状態）。
+  const [helpManualSectionsOpen, setHelpManualSectionsOpen] = useState({ gettingStarted: true });
+  const toggleHelpManualSection = useCallback((key) => {
+    setHelpManualSectionsOpen((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  // ------------------------------------------------------------------
+  // プレゼンモード v1・1・37・38章
+  // ------------------------------------------------------------------
+  // 「編集する画面」ではなく「見せる画面」に切り替えるための、完全にUI専用のboolean state。
+  // work（Project Backup・localStorage workspace・schema）へは一切保存せず、Undo/Redo
+  // 履歴にも積まない（commitWorkではなくuseStateだけで完結する）。既定はfalse（通常編集画面）。
+  const [presentationMode, setPresentationMode] = useState(false);
+  // 27章：presentationModeをONにする瞬間だけ、編集用の一時selectionをclearする
+  // （workデータそのものは一切変更しない）。selectedLightingCueIdはLighting Cue resolverが
+  // selection stateに依存しない既存設計のため、あえて変更しない（28章）。
+  const enterPresentationMode = useCallback(() => {
+    setSelectedIds([]);
+    setSelectedLightingItemKeys([]);
+    setSelectedLightingAreaId(null);
+    setSelectedLightingBeam3DId(null);
+    setPresentationMode(true);
+  }, []);
+  // 7・12・13章：「編集に戻る」はFullscreen解除→presentationMode終了の順にする（Fullscreenだけ
+  // 残って編集画面になる状態を避ける）。document.fullscreenElementを直接チェックするだけの
+  // 軽量な判定にし、isFullscreen stateへの依存は持たせない（この関数の宣言順に関わらず安全に
+  // 動くようにするため）。exitFullscreen()はPromiseだが、UIを待たせないためawaitせず、
+  // 成功/失敗どちらでもすぐpresentationModeをfalseにする（非同期でUIを固まらせない＝13章）。
+  const exitPresentationMode = useCallback(() => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch((err) => console.warn("Fullscreen exit failed:", err));
+    }
+    setPresentationMode(false);
+  }, []);
+
+  // ------------------------------------------------------------------
+  // プレゼンモード STEP 4：Fullscreen API対応
+  // ------------------------------------------------------------------
+  // Header・Stage・Bottom Presentation Controlsを含むプレゼン画面全体をFullscreenにするため、
+  // アプリの最上位container（<div className="slsim-app">）へrefを付ける（3章：documentElementへ
+  // 直接requestFullscreenするより、アプリだけをFullscreenにできるこちらを優先）。UI専用のrefで、
+  // work/Project dataへは一切保存しない。
+  const appRootRef = useRef(null);
+  // 独自booleanを手動同期するより、document.fullscreenElementを正とする（5章）。ただしReact側の
+  // 再描画のためのミラーとしてstateを持ち、fullscreenchangeイベントで同期する（6章）。初期値は
+  // false（mount時に既にFullscreenという特殊ケースは複雑に考えない＝31章）。
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
+  // 29・30章：requestFullscreen自体が存在しない環境（非対応ブラウザ）でもクラッシュしないよう、
+  // ボタン側でこの真偽値を見てdisabled/非表示にする。refはmount後でないと中身が無いため、
+  // document.documentElement.requestFullscreenの存在確認で代用する（結果はほぼ同じ判定になる）。
+  const fullscreenSupported = typeof document !== "undefined" && !!document.documentElement.requestFullscreen;
+  // 7・8章：開始/終了を1つのボタンで扱う。Promiseの失敗はconsole.warnのみに留め、
+  // 大げさなalert等は出さない。
+  const toggleFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await appRootRef.current?.requestFullscreen?.();
+      } else {
+        await document.exitFullscreen();
+      }
+    } catch (err) {
+      console.warn("Fullscreen toggle failed:", err);
+    }
   }, []);
 
   // ステージ設定から各エリアの範囲を算出（stage.width / stage.depth が変わるたびに再計算）
@@ -7605,17 +11576,357 @@ export default function App() {
   // Lighting v0・O章：現在のFormationに対応するLighting Scene（0〜1個）。
   const currentLightingScene = findLightingSceneBySlideId(lightingScenes, currentSlide.id);
   // Lighting Area v1・G章：現在のSceneが持つArea一覧（Sceneが無ければ常に空配列）。
+  // Lighting Cue STEP 2C：currentLightingAreasの意味は変更しない
+  // （＝「現在Formationの基本Lighting Scene」のarea一覧のまま）。
   const currentLightingAreas = getLightingAreas(currentLightingScene);
-  const selectedLightingArea = currentLightingAreas.find((a) => a.id === selectedLightingAreaId) || null;
+  // Lighting Beam v2・正式実装 STEP1・G章：現在のSceneが持つ正式3D Beam一覧
+  // （Sceneが無ければ常に空配列）。こちらもSTEP 2Cで意味は変更しない。
+  const currentLightingBeams3D = getLightingBeams3D(currentLightingScene);
 
-  // Lighting Area v1・L章：Formation切替・Scene削除・Area削除等で選択中Areaが存在しなくなった
-  // 場合、selectedIds（出演者選択）のクリーンアップと全く同じ考え方で自動的にクリアする。
+  // Lighting Cue STEP 2B：現在のSceneが持つkeep Cue一覧（Sceneが無ければ常に空配列）。
+  const currentLightingCues = getLightingSceneCues(currentLightingScene);
+
+  // Lighting Cue STEP 2D：現在Formationのtransition Cue一覧（次の構成が無い最後のFormation
+  // では常に空配列）。hasNextSlideForTransition/currentTransitionCountsという同名の変数が
+  // この関数の後方（構成間の移動カウント編集セクション）に別途存在するが、宣言順の関係で
+  // この時点ではまだ参照できない（TDZ回避のため、ここではgetTransitionCounts()を経由せず
+  // currentSlideIndex < slides.length - 1という同じ判定式を直接使う。二重実装ではなく、
+  // 「次の構成があるか」という同じ意味の判定を、参照可能な材料だけで行っているだけ）。
+  const hasNextSlideForCue = currentSlideIndex < slides.length - 1;
+  const currentTransitionLightingCues = hasNextSlideForCue
+    ? getTransitionLightingCues(transitionLightingCues, currentSlide.id)
+    : [];
+
+  // Lighting Cue STEP 2D：選択中CueがkeepCue配列・transition Cue配列のどちらにあるかを
+  // 探して判定する。新しいUI selection state（phase等）は追加せず、既存のselectedLightingCueId
+  // 1つだけを保持し続け、「今どちらに属するか」は毎回この2配列から検索して導出する
+  // （最小変更で安全な案＝N章）。IDはmakeId("lighting-cue")でkeep/transition共通の採番の
+  // ため、両配列に同じIDが存在することは実質的にない。
+  const selectedKeepCue = currentLightingCues.find((c) => c.id === selectedLightingCueId) || null;
+  const selectedTransitionCue = selectedKeepCue
+    ? null
+    : currentTransitionLightingCues.find((c) => c.id === selectedLightingCueId) || null;
+  const selectedLightingCue = selectedKeepCue || selectedTransitionCue;
+  const selectedLightingCuePhase = selectedKeepCue ? "keep" : selectedTransitionCue ? "transition" : null;
+  // Area/Beam CRUD handlerへ渡す「今の編集対象」を表す小さなオブジェクト。nullの場合は
+  // 基本Lighting Sceneが編集対象であることを意味する。
+  const selectedLightingCueSelection =
+    selectedLightingCueId && selectedLightingCuePhase ? { phase: selectedLightingCuePhase, cueId: selectedLightingCueId } : null;
+
+  // 「次構成1」reference view v1・STEP 4・11：次Formation（現在Formationのtransition先）自体
+  // と、そのLighting Sceneをderived valueとして用意する。hasNextSlideForCueは既にSTEP 2Dで
+  // 「次の構成があるか」の判定として存在するため、そのまま再利用する（二重実装しない）。
+  // 最終FormationではnextSlideForLighting自体がnullになるため、「次構成1」項目は自然に
+  // 利用不可になる（STEP 6・TEST B）。
+  const nextSlideForLighting = hasNextSlideForCue ? slides[currentSlideIndex + 1] : null;
+  const nextLightingSceneForReference = nextSlideForLighting
+    ? findLightingSceneBySlideId(lightingScenes, nextSlideForLighting.id)
+    : null;
+  // 「次構成1」選択中は常にcueSelection=null（次Formation Base Scene編集）として扱う
+  // （設計原則STEP4：新しいCue snapshotは作らない・保存しない）。isEditingNextFormationLightingBase
+  // がtrueの間は、selectedLightingCueSelection自体の値に関わらずこちらを優先する
+  // （TEST D：「次構成1」のcueSelection→null/Base Scene扱い）。
+  const activeLightingCueSelectionForEdit = isEditingNextFormationLightingBase ? null : selectedLightingCueSelection;
+  // 「次構成1」reference view v1：copy系handlerのUI表示判定（「今選択している対象がまさに
+  // コピー元か」）が参照すべき実際のslideId。isEditingNextFormationLightingBase時は
+  // 次Formationのslide.id、それ以外は従来通りcurrentSlide.id。
+  const activeLightingDisplaySlideId = isEditingNextFormationLightingBase
+    ? nextSlideForLighting
+      ? nextSlideForLighting.id
+      : null
+    : currentSlide.id;
+
+  // Lighting Area 後付け接続 v1・STEP 6：接続UIは「現在FormationのBase Scene Area」または
+  // 「次構成1で表示中の次Formation Base Scene Area」でだけ意味を持つ（Cue snapshot内では
+  // 表示しない＝Cue内のArea identityは既存id管理で、Formation間logical identityを直接
+  // 編集する場所ではないため）。activeLightingCueSelectionForEdit===nullであれば、
+  // 現在編集しているのが常にどちらかのBase Sceneであることが保証されているため、この
+  // 判定式だけで十分（新しいselection stateは追加しない）。
+  // STEP3：候補は必ずresolveFinalLightingStateForSlide()経由の最終状態を使う
+  // （resolvePreviousFormationFinalAreasForSlideへ集約、新しいresolveロジックは作らない）。
+  const lightingAreaConnectionCandidates =
+    activeLightingCueSelectionForEdit === null && activeLightingDisplaySlideId
+      ? resolvePreviousFormationFinalAreasForSlide(
+          { slides, lightingScenes, transitionLightingCues, transitionCounts },
+          activeLightingDisplaySlideId
+        )
+      : [];
+
+  // Lighting Beam 3D Formation間identity / 前の構成との接続 v1・PART H・I：
+  // lightingAreaConnectionCandidatesと全く同じ考え方で、Beam3D向けのFormation間接続候補を
+  // resolvePreviousFormationFinalBeamsForSlide()経由で求める。Cue選択中
+  // （activeLightingCueSelectionForEdit !== null）では常に[]になり、このUIブロック自体を
+  // 表示しない（PART H：Cue snapshot編集中は既存の「前の状態との接続」を使う）。
+  // activeLightingDisplaySlideIdは「次構成1」reference view中は次Formationのslide.idを
+  // 指すため、PART Iの要件（次構成1からの接続は実際に編集中のtargetSlideIdの直前Formationを
+  // 見る）を自然に満たす。
+  const lightingBeamConnectionCandidates =
+    activeLightingCueSelectionForEdit === null && activeLightingDisplaySlideId
+      ? resolvePreviousFormationFinalBeamsForSlide(
+          { slides, lightingScenes, transitionLightingCues, transitionCounts },
+          activeLightingDisplaySlideId
+        )
+      : [];
+
+  // Lighting Area Cue間・前の状態との接続 v1・STEP5・6・11：Cue選択中だけ意味を持つ、
+  // 「現在Cueより前に実在する最後のLighting状態」の候補一覧。Base Scene編集中
+  // （activeLightingCueSelectionForEdit===null、Formation自身の開始時・「次構成1」いずれも
+  // 含む）ではこのUI自体を使わない（STEP11：Base Sceneでは既存の「前の構成との接続」を使う）。
+  const cueLightingAreaConnectionCandidates =
+    activeLightingCueSelectionForEdit && activeLightingDisplaySlideId
+      ? (() => {
+          const scene = findLightingSceneBySlideId(lightingScenes, activeLightingDisplaySlideId);
+          if (!scene) return [];
+          const keepCuesForTarget = getLightingSceneCues(scene);
+          const transitionCuesForTarget = getTransitionLightingCues(transitionLightingCues, activeLightingDisplaySlideId);
+          return resolvePreviousLightingAreasForCueSelection(
+            scene,
+            keepCuesForTarget,
+            transitionCuesForTarget,
+            activeLightingCueSelectionForEdit
+          );
+        })()
+      : [];
+
+  // Cue間Beam・前の状態との接続 v1・PART E：cueLightingAreaConnectionCandidatesと全く同じ
+  // 考え方で、Beam3D向けの候補一覧をresolvePreviousLightingBeamsForCueSelection()経由で
+  // 求める。Base Scene編集中（activeLightingCueSelectionForEdit===null、「次構成1」含む）
+  // では常に[]になる（PART I：Base SceneではこのCue接続UI自体を表示しない）。
+  const cueLightingBeam3DConnectionCandidates =
+    activeLightingCueSelectionForEdit && activeLightingDisplaySlideId
+      ? (() => {
+          const scene = findLightingSceneBySlideId(lightingScenes, activeLightingDisplaySlideId);
+          if (!scene) return [];
+          const keepCuesForTarget = getLightingSceneCues(scene);
+          const transitionCuesForTarget = getTransitionLightingCues(transitionLightingCues, activeLightingDisplaySlideId);
+          return resolvePreviousLightingBeamsForCueSelection(
+            scene,
+            keepCuesForTarget,
+            transitionCuesForTarget,
+            activeLightingCueSelectionForEdit
+          );
+        })()
+      : [];
+
+  // 「次構成1」reference view v1・STEP 4：Formation切替時にstaleな選択が残らないよう、
+  // currentSlide.idが変わるたびに必ずfalseへ戻す（既存のselectedLightingCueIdクリーンアップ
+  // useEffectと同じ「Formation切替専用の別処理を作らず、1つのuseEffectへ集約する」思想を
+  // 踏襲しつつ、対象がCue IDではなくこのbooleanのため専用の小さなuseEffectとして分離する。
+  // TEST J：Formation切替後にstaleなnextFormation selectionが残らないことに対応）。
   useEffect(() => {
-    if (selectedLightingAreaId && !currentLightingAreas.some((a) => a.id === selectedLightingAreaId)) {
-      setSelectedLightingAreaId(null);
+    setIsEditingNextFormationLightingBase(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSlide.id]);
+
+  // Area/Beam v2と全く同じクリーンアップ考え方：Formation切替（currentLightingCuesの内容が
+  // 変わる＝別Sceneのcuesになる）・Cue削除・Scene削除・Undo/Redo等でselectedLightingCueIdが
+  // 現在のcues配列に存在しなくなった場合、自動的にnullへ戻す。Formation切替専用の別処理は
+  // 追加せず、このuseEffect1つに集約する（S章：currentSlide.idが変わればcurrentLightingScene→
+  // currentLightingCuesも変わるため、既存idは自然に見つからなくなりクリアされる）。
+  // Lighting Cue STEP 2D：判定対象にcurrentTransitionLightingCuesも追加した（keep Cue・
+  // transition Cueのどちらでも存在しなくなれば自動的にクリアする）。
+  useEffect(() => {
+    if (
+      selectedLightingCueId &&
+      !currentLightingCues.some((c) => c.id === selectedLightingCueId) &&
+      !currentTransitionLightingCues.some((c) => c.id === selectedLightingCueId)
+    ) {
+      setSelectedLightingCueId(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedLightingAreaId, currentLightingAreas]);
+  }, [selectedLightingCueId, currentLightingCues, currentTransitionLightingCues]);
+
+  // Lighting Cue カウント変更 v1：選択中Cueが変わるたび、変更用input（editLightingCueCount）を
+  // そのCueの現在の表示カウントへ同期する。「開始時」選択（selectedLightingCue===null）の
+  // 場合は空文字へ戻す（このUI自体を表示しないため、値の意味はない）。keepCountsは
+  // currentSlideから直接計算する（後方で宣言されているcurrentKeepCountsをここで参照すると
+  // TDZになるため、既存のhasNextSlideForCueと同じ「参照可能な材料だけで同じ意味の計算を行う」
+  // 方針を踏襲する。getKeepCounts自体は既存のpure helperをそのまま使うだけで、二重実装ではない）。
+  useEffect(() => {
+    // Lighting Cue カウント変更UI整理：selectedLightingCueIdが変化した時点（別Cue選択・
+    // 「開始時」選択・Formation変更・Cue削除・Undo/Redo等すべてこの1つのuseEffectで検知
+    // できる＝既存の同期useEffectと一緒に整理する＝要件7）で、カウント編集モードも
+    // 自動的に終了する。未確定の入力値を別Cueへ持ち越さない。
+    setLightingCueCountEditing(false);
+    // Lighting Cueへ短い名前/メモを付けられる機能・11章：別Cue選択・「開始時」選択・
+    // Formation変更・Cue削除・Undo/Redo等、selectedLightingCueIdが変化するすべての
+    // ケースをこの1つのuseEffectで検知し、名前編集モードも自動終了・draftを同期する
+    // （カウント編集と全く同じ思想。新しいuseEffectは追加しない）。
+    setLightingCueNameEditing(false);
+    // 照明フェード v1・STEP 16：Cue名draftと全く同じ思想で、Fade編集モードもこの1つの
+    // useEffectで自動終了・draftを同期する（新しい複雑なstate同期は作らない）。
+    setLightingCueFadeCountsEditing(false);
+    if (!selectedLightingCue) {
+      setEditLightingCueCount("");
+      setEditLightingCueName("");
+      setEditLightingCueFadeCounts(0);
+      return;
+    }
+    setEditLightingCueName(typeof selectedLightingCue.name === "string" ? selectedLightingCue.name : "");
+    setEditLightingCueFadeCounts(
+      Number.isFinite(Number(selectedLightingCue.fadeCounts)) ? Math.max(0, Number(selectedLightingCue.fadeCounts)) : 0
+    );
+    const keepNow = getKeepCounts(currentSlide);
+    const displayCount =
+      selectedLightingCuePhase === "transition" ? keepNow + selectedLightingCue.count + 1 : selectedLightingCue.count + 1;
+    setEditLightingCueCount(displayCount);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingCueId]);
+
+  // Lighting Fade v3・7章：開始フェード（Scene.entryFadeCounts）のdraft同期。既存のCue draft
+  // cleanup（selectedLightingCueId変化時）とは対象が異なる（Cueではなくその Formationの
+  // Lighting Scene自体）ため、最小限の別useEffectとして追加する。currentLightingSceneが
+  // 変わるたび（Formation切替・Scene新規作成/削除・Scene貼り付け・Undo/Redo等すべてを
+  // このuseEffectで検知できる）に、編集モードを終了しdraftを現在Sceneの値へ同期する。
+  useEffect(() => {
+    setLightingSceneEntryFadeCountsEditing(false);
+    setEditLightingSceneEntryFadeCounts(
+      currentLightingScene && Number.isFinite(Number(currentLightingScene.entryFadeCounts))
+        ? Math.max(0, Number(currentLightingScene.entryFadeCounts))
+        : 0
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentLightingScene]);
+
+  // Lighting Cue STEP 2C・C章：「現在Stageへ表示すべき／Area・Beam UIが編集対象にすべき
+  // Lighting状態」を導出する。workへ保存する新しいstateではなく、selectedLightingCueから
+  // 毎回計算するだけのderived value（useStateで二重管理しない）。Cue選択時はそのCueの
+  // areas/beams3D、未選択時は従来通りcurrentLightingAreas/currentLightingBeams3D
+  // （＝基本Lighting Scene）を返す。
+  // Lighting Cue STEP 2C・C章：「現在Stageへ表示すべき／Area・Beam UIが編集対象にすべき
+  // Lighting状態」を導出する。workへ保存する新しいstateではなく、selectedLightingCueから
+  // 毎回計算するだけのderived value（useStateで二重管理しない）。Cue選択時はそのCueの
+  // areas/beams3D、未選択時は従来通りcurrentLightingAreas/currentLightingBeams3D
+  // （＝基本Lighting Scene）を返す。
+  // 「次構成1」reference view v1・STEP 5：isEditingNextFormationLightingBaseがtrueの間は、
+  // 現在Formationのtransition最終Cueを合成・コピーするのではなく、次Formationの実Base
+  // Scene（nextLightingSceneForReference）を直接参照する。Source of Truthは常に
+  // work.lightingScenes内の次Formation自身のScene object（設計原則STEP3）。
+  const displayLightingAreas = isEditingNextFormationLightingBase
+    ? getLightingAreas(nextLightingSceneForReference)
+    : selectedLightingCue
+      ? Array.isArray(selectedLightingCue.areas)
+        ? selectedLightingCue.areas
+        : []
+      : currentLightingAreas;
+  const displayLightingBeams3D = isEditingNextFormationLightingBase
+    ? getLightingBeams3D(nextLightingSceneForReference)
+    : selectedLightingCue
+      ? Array.isArray(selectedLightingCue.beams3D)
+        ? selectedLightingCue.beams3D
+        : []
+      : currentLightingBeams3D;
+
+  // Lighting Cue STEP 2C・F・G章：選択中Area/BeamはdisplayLightingAreas/displayLightingBeams3D
+  // （＝今まさに編集対象になっている配列）から探す。Cue切替時、STEP 2AのCue snapshot生成が
+  // Area/BeamのIDを維持する設計のため、同じIDがCue内にも存在すれば選択は自然に維持される。
+  // 存在しなければ、すぐ下の既存クリーンアップuseEffect（依存先をdisplayLighting*へ変更した
+  // だけで、新しい同期処理は追加していない）が自動的にnullへ戻す。
+  const selectedLightingArea = displayLightingAreas.find((a) => a.id === selectedLightingAreaId) || null;
+
+  // Lighting Area v1・L章：Formation切替・Scene削除・Area削除・Cue切替等で選択中Areaが
+  // 存在しなくなった場合、selectedIds（出演者選択）のクリーンアップと全く同じ考え方で
+  // 自動的にクリアする。
+  // Lighting複数選択 v1：新しいuseEffectを追加せず、この既存クリーンアップへ統合する形で
+  // selectedLightingItemKeys内のarea entryも同時に整理する。Formation/Cue切替時は
+  // displayLightingAreas自体が別の配列に変わるため、古いarea entryはここで自然にすべて
+  // 除去される（＝「Formation/Cue切替時は複数選択を原則解除する」という要件を、専用の
+  // 別useEffectを作らずに満たす）。
+  useEffect(() => {
+    if (selectedLightingAreaId && !displayLightingAreas.some((a) => a.id === selectedLightingAreaId)) {
+      setSelectedLightingAreaId(null);
+    }
+    setSelectedLightingItemKeys((prev) => {
+      const next = prev.filter((k) => k.type !== "area" || displayLightingAreas.some((a) => a.id === k.id));
+      return next.length === prev.length ? prev : next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingAreaId, displayLightingAreas]);
+
+  // Lighting Area 後付け接続 v1・STEP 8：選択中Areaが切り替わったら、直前の接続拒否警告は
+  // 意味を失うためクリアする（既存クリーンアップuseEffectと同じ「selectedLightingAreaId
+  // 変化を検知する」考え方をそのまま踏襲した、専用の小さなuseEffect）。
+  useEffect(() => {
+    setLightingAreaConnectionWarning(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingAreaId]);
+
+  const selectedLightingBeam3D = displayLightingBeams3D.find((b) => b.id === selectedLightingBeam3DId) || null;
+
+  // Lighting Beam v2・正式実装 STEP1・W章：Area/Beam v1と全く同じクリーンアップ
+  // （Lighting Cue STEP 2C：依存先をdisplayLightingBeams3Dへ変更しただけ）。
+  // Lighting複数選択 v1：同じくselectedLightingItemKeys内のbeam3d entryもここで整理する。
+  useEffect(() => {
+    if (selectedLightingBeam3DId && !displayLightingBeams3D.some((b) => b.id === selectedLightingBeam3DId)) {
+      setSelectedLightingBeam3DId(null);
+    }
+    setSelectedLightingItemKeys((prev) => {
+      const next = prev.filter((k) => k.type !== "beam3d" || displayLightingBeams3D.some((b) => b.id === k.id));
+      return next.length === prev.length ? prev : next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingBeam3DId, displayLightingBeams3D]);
+
+  // ------------------------------------------------------------------
+  // Lighting Beam 3D 追尾 編集用可視化 v1
+  // ------------------------------------------------------------------
+  // 追尾Beam（followPerformerId）が「現在Formation→次Formation」の間でtargetをどう追うかを、
+  // 出演者が既に持つ既存transition path（直線／曲線／waypoint）から導出するだけの表示専用
+  // derived value。新しいLighting専用path schemaは作らず、workへは一切保存しない（4・32・33章：
+  // Undo/Redo対象外・新しいcommitWorkも追加しない）。selectedLightingItemKeys・
+  // selectedLightingBeam3D・Formation・出演者配置が変われば自動的に再計算される。
+  //   ・単一選択（selectedLightingItemKeys.length===1）かつ選択中Beamがfollowしている場合だけ
+  //     値を返す（2・28章：複数選択・固定Beam・未選択はnull）。
+  //   ・showLighting・currentLightingScene.enabledがfalseならnull（15・16章：Lighting本体が
+  //     見えていないのに軌跡だけ残らないようにする）。
+  //   ・次Formationが無ければnull（6章：最後のFormationは軌跡なし）。
+  //   ・対象出演者のcurrent/next placementのどちらかが見つからなければnull（29章：
+  //     保存済みbeam.targetへは一切fallbackしない）。
+  //   ・幾何計算（直線/曲線判定・waypoint）は既存のcomputeTransitionPaths()をそのまま呼び、
+  //     Lighting側で直線補間・Bezier・waypoint計算を再実装しない（5・8・9章）。
+  //     trajectoryModeの「前に」設定に関わらず、追尾軌跡は常に「現在→次」固定
+  //     （7章：出演者側のtrajectoryModeとは分離）。
+  //   ・computeTransitionPaths()は「直線かつ完全に静止」の場合はエントリ自体を作らない
+  //     既存仕様のため、その場合はfrom===toの結果を返す（10章：軌跡線を描くかどうかは
+  //     呼び出し側＝TopViewが判断し、ここでは常に始点/終点の位置情報だけは提供する）。
+  const selectedLightingBeamTrackingPath = useMemo(() => {
+    if (selectedLightingItemKeys.length !== 1) return null;
+    if (!selectedLightingBeam3D || !selectedLightingBeam3D.followPerformerId) return null;
+    if (!showLighting || !currentLightingScene || !currentLightingScene.enabled) return null;
+    const nextSlide = slides[currentSlideIndex + 1];
+    if (!nextSlide) return null;
+    const pathConfig = effectiveTransitionPathConfig && effectiveTransitionPathConfig[currentSlide.id];
+    const resolved = resolveLightingBeamTrackingPaths({
+      beams: [selectedLightingBeam3D],
+      fromPlacements: currentSlide.placements,
+      toPlacements: nextSlide.placements,
+      pathConfig,
+    });
+    return resolved[0] || null;
+  }, [
+    selectedLightingItemKeys,
+    selectedLightingBeam3D,
+    showLighting,
+    currentLightingScene,
+    slides,
+    currentSlideIndex,
+    currentSlide,
+    effectiveTransitionPathConfig,
+  ]);
+
+  // Lighting UI整理・Prototype卒業・M章：Area/Beam v2を選択したら、対応するセクションを
+  // 自動展開する（どちらを編集しているか視覚的に分かりやすくするため）。selectedId自体が
+  // 変化した時だけ発火するので、展開後にユーザーが手動で閉じてもこの効果が再度開き直す
+  // ことはない（再度選び直した時だけ、また自動的に開く）。
+  useEffect(() => {
+    if (selectedLightingAreaId) setLightingAreaSectionOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingAreaId]);
+  useEffect(() => {
+    if (selectedLightingBeam3DId) setLightingBeam3DSectionOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLightingBeam3DId]);
+
 
   // ステージ下部に表示する「現在の順番 / 全構成数　構成名」用のラベル。
   // 桁数はslides.lengthに合わせて自動調整し、最低2桁でゼロ埋めする（100構成以上でも自然に3桁になる）。
@@ -8122,6 +12433,91 @@ export default function App() {
   const isKeepPhase = isTransitionActive && animationState.phase === "keep";
 
   // ------------------------------------------------------------
+  // Lighting Cue STEP 2E/2G：再生中のLighting自動反映（Playback Lighting derived state）
+  // ------------------------------------------------------------
+  // 「再生中かどうか」の判定は既存のisTransitionActive（playbackState !== "idle"）を
+  // そのまま使う。playing・pausedどちらもtrueになるため、pause中もLightingが現在位置を
+  // 維持する（AM章：新しい再生stateは作らない）。playbackStateがidleに戻った瞬間だけ
+  // playbackLightingStateはnullになり、下のeffectiveLighting*が既存のdisplayLightingAreas/
+  // displayLightingBeams3D（手動選択Cue、または基本Scene）へ自然にフォールバックする（N章）。
+  // STEP 2E/2F：keep/move Lighting resolveの数式自体は、resolveLightingForPhasePosition()
+  // という共通pure helperへ集約している。
+  // Cue snapshot・Scene・areas/beams3Dのmutationは一切行わない（AE章）。
+  const playbackLightingState = useMemo(() => {
+    if (!isTransitionActive) return null;
+    if (animationState.phase === "preroll") {
+      return resolveLightingForPhasePosition({
+        phase: "preroll",
+        slideIndex: currentSlideIndex,
+        progress: 0,
+        slides,
+        lightingScenes,
+        transitionCounts,
+        transitionLightingCues,
+      });
+    }
+    if (animationState.phase === "keep") {
+      return resolveLightingForPhasePosition({
+        phase: "keep",
+        slideIndex: animationState.fromIndex,
+        progress: animationState.progress,
+        slides,
+        lightingScenes,
+        transitionCounts,
+        transitionLightingCues,
+      });
+    }
+    if (animationState.phase === "move") {
+      // Lighting Cue STEP 2F・S・T・U章：一時停止中の構成間スクラバー（14296行目付近の
+      // onChange={(e) => setScrubProgress(...)}）は、animationState.progressを更新せず
+      // scrubProgressだけを更新する（既存の「一時停止中のmoveはscrubProgressで補間表示する」
+      // 仕組み＝displayPlacementsWithScrubのscrubDisplayProgressと同じ考え方）。そのため
+      // Performer表示と同じ「実際に再生中（isAnimationRunning）ならanimationState.progress、
+      // 一時停止中ならscrubProgress」という式をここでも使う。scrubDisplayProgress自体は
+      // このuseMemoより後方で宣言されているため参照できず（TDZ回避）、Performer側と全く同じ
+      // 1行の式をここに複製しているだけで、新しいscrub state・新しいLighting resolve方式は
+      // 追加していない。音楽シーク（同期一時停止中のseek）はanimationState.progressと
+      // scrubProgressの両方を同じ値へ揃えて書き込むため、この式はどちらのseek経路でも
+      // 正しく同じ結果になる。
+      const progress = isAnimationRunning
+        ? Number.isFinite(animationState.progress)
+          ? clamp(animationState.progress, 0, 1)
+          : 0
+        : clamp(scrubProgress, 0, 1);
+      return resolveLightingForPhasePosition({
+        phase: "move",
+        slideIndex: animationState.fromIndex,
+        progress,
+        slides,
+        lightingScenes,
+        transitionCounts,
+        transitionLightingCues,
+      });
+    }
+    return null;
+  }, [
+    isTransitionActive,
+    animationState,
+    slides,
+    currentSlideIndex,
+    lightingScenes,
+    transitionCounts,
+    transitionLightingCues,
+    isAnimationRunning,
+    scrubProgress,
+  ]);
+
+  // Lighting Cue STEP 2G再改訂：manual Lighting（既存のdisplayLightingAreas/
+  // displayLightingBeams3D＝手動選択Cueまたは基本Scene）とplaybackLightingState
+  // （実際の再生/一時停止位置）の優先順位を決める最終derived value（STEP 2E相当の
+  // シンプルな優先順位へ戻した）。編集モード音楽seekはFormationナビゲーション専用に
+  // 簡略化したため、seek後は通常通りmanual Lighting表示（選択中Cueまたは基本Scene）に
+  // なる。selectedLightingCueId自体は一切書き換えない。TopView/OverheadAudienceViewは
+  // このeffectiveLighting*を参照するだけで、内部描画コードには一切触れない。
+  const effectiveLightingAreas = playbackLightingState ? playbackLightingState.areas : displayLightingAreas;
+  const effectiveLightingBeams3D = playbackLightingState ? playbackLightingState.beams3D : displayLightingBeams3D;
+
+  // ------------------------------------------------------------
   // Music Timeline / Formation Markers v1
   // ------------------------------------------------------------
   // 既存のresolveSlideMusicPosition・musicAnchorToTimeSecから毎回導出するだけの表示専用データ。
@@ -8151,7 +12547,7 @@ export default function App() {
         const titleText = [
           `構成 ${m.slideIndex + 1}${slide && slide.name ? "：" + slide.name : ""}`,
           `${sectionLabel ? sectionLabel + " / " : ""}${formatMusicAnchorEighthCountLabel(m.eighthNumber, m.countOffset)}`,
-          m.isManualAnchor ? "手動Anchor" : "自動位置",
+          m.isManualAnchor ? "手動位置" : "自動位置",
         ].join("\n");
         return { ...m, titleText };
       }),
@@ -8205,7 +12601,11 @@ export default function App() {
     // interpolatePlacements単体を使った場合と完全に同じ結果になる。連続再生のmoveフェーズも
     // このまま再利用する（別の補間ロジックは作らない＝9章）。
     const pathConfig = effectiveTransitionPathConfig && effectiveTransitionPathConfig[fromSlide.id];
-    return interpolatePlacementsWithPaths(fromSlide.placements, toSlide.placements, animationState.progress, pathConfig);
+    // 移動時の姿勢v1：work.transitionPosesはfromSlide.idをキーにした疎なmap
+    // （getTransitionPosesForSlideで安全に取得、未設定performerはfallbackでresolveTransitionPose
+    // 側が従来通り開始側poseを使う）。再生機能自体の他の部分は変更しない。
+    const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, fromSlide.id);
+    return interpolatePlacementsWithPaths(fromSlide.placements, toSlide.placements, animationState.progress, pathConfig, transitionPoseConfig);
   }, [
     isAnimationRunning,
     animationState.phase,
@@ -8215,6 +12615,7 @@ export default function App() {
     slides,
     placements,
     effectiveTransitionPathConfig,
+    transitionPoses,
   ]);
 
   // スクラバーの対象は常に「現在の構成→次の構成」のmoveフェーズで固定する。移動軌跡の
@@ -8268,7 +12669,10 @@ export default function App() {
     const nextSlide = slides[currentSlideIndex + 1];
     if (!nextSlide) return displayPlacements;
     const pathConfig = effectiveTransitionPathConfig && effectiveTransitionPathConfig[currentSlide.id];
-    return interpolatePlacementsWithPaths(currentSlide.placements, nextSlide.placements, scrubProgress, pathConfig);
+    // 移動時の姿勢v1：構成間移動スクラバーでも同じtransitionPosesを反映する
+    // （直線・曲線どちらもresolveTransitionPose経由で同じ判定になる）。
+    const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, currentSlide.id);
+    return interpolatePlacementsWithPaths(currentSlide.placements, nextSlide.placements, scrubProgress, pathConfig, transitionPoseConfig);
   }, [
     isAnimationRunning,
     isKeepPhase,
@@ -8279,7 +12683,16 @@ export default function App() {
     currentSlide,
     effectiveTransitionPathConfig,
     displayPlacements,
+    transitionPoses,
   ]);
+
+  // Lighting Beam 3D 追尾 v1・8・15・16章：Top View / Audience Viewへ渡す直前に、既存の
+  // displayPlacementsWithScrub（keep・直線移動・曲線移動・構成間スクラバー・単体/連続再生・
+  // Music同期再生のすべてを含む「今画面に表示すべき出演者位置」）を使って追尾Beamのtargetを
+  // 解決する。Formation A/B・transition progressから新しい補間計算は一切作らず、出演者表示に
+  // 既に使われているこの値をそのまま再利用するだけ（8章）。resolveLightingBeam3DTarget()の
+  // 判定を1箇所に集約するため、Top View用・Audience View用で別々に解決しない（14章）。
+  const effectiveLightingBeams3DForDisplay = resolveLightingBeams3DForDisplay(effectiveLightingBeams3D, displayPlacementsWithScrub);
 
   // CompositionBarに渡す再生状況ラベル。単体/連続・move/keepフェーズの文字列組み立てをここに
   // 集約し、CompositionBar側は「もらった内容をそのまま表示する（nullならidle時の通常表示に
@@ -8532,6 +12945,67 @@ export default function App() {
     [commitWork, activeTransitionRef, editablePerformerIds, isTransitionActive, stage, zones]
   );
 
+  // ------------------------------------------------------------
+  // 移動時の姿勢 v1
+  // ------------------------------------------------------------
+  // 選択中（編集可能分）のtransition pose設定のまとめ。既存のselectedPathTypeSummaryと
+  // 全く同じ考え方：全員 "start"（＝entry無し＝開始時の姿勢） → "start" /
+  // 全員 "standing" → "standing" / 全員 "kneeling" → "kneeling" / 混在 → "mixed" /
+  // 対象なし → null。UI側は"mixed"のときどのボタンもactiveにしない。
+  const selectedTransitionPoseSummary = useMemo(() => {
+    if (!activeTransitionRef || editablePerformerIds.length === 0) return null;
+    const fromId = activeTransitionRef.fromSlideId;
+    const forSlide = getTransitionPosesForSlide(transitionPoses, fromId);
+    const values = editablePerformerIds.map((id) => {
+      const v = forSlide[id];
+      return v === "standing" || v === "kneeling" ? v : "start";
+    });
+    if (values.every((v) => v === "start")) return "start";
+    if (values.every((v) => v === "standing")) return "standing";
+    if (values.every((v) => v === "kneeling")) return "kneeling";
+    return "mixed";
+  }, [activeTransitionRef, editablePerformerIds, transitionPoses]);
+
+  // 「開始時の姿勢」⇔「立ち」⇔「片膝」の一括切替。選択人数に関わらず1回の操作＝1件の
+  // Undo履歴（commitWork）。既存のsetSelectedPathModeと全く同じ構造。再生中は変更できない
+  // （既存のisTransitionActiveロック思想を再利用＝誤操作防止・再生途中の姿勢変化を防ぐ）。
+  //   ・"start"へ：該当performerIdのentryを削除する（「開始Formationのposeをそのまま使う」
+  //     というfallbackへ戻す。値として保存しない＝仕様通り）。
+  //   ・"standing"/"kneeling"へ：該当performerIdのentryへ明示的にその値を保存する。
+  const setSelectedTransitionPoseMode = useCallback(
+    (mode) => {
+      if (isTransitionActive) return;
+      if (!activeTransitionRef || editablePerformerIds.length === 0) return;
+      const fromId = activeTransitionRef.fromSlideId;
+      commitWork((prev) => {
+        const forSlide = getTransitionPosesForSlide(prev.transitionPoses, fromId);
+        const nextForSlide = { ...forSlide };
+        let changed = false;
+        editablePerformerIds.forEach((id) => {
+          if (mode === "standing" || mode === "kneeling") {
+            if (nextForSlide[id] === mode) return; // 既に同じ値なら変更なし
+            nextForSlide[id] = mode;
+            changed = true;
+          } else {
+            // "start"：entry自体を削除して「開始時の姿勢」（fallback）へ戻す。
+            if (!(id in nextForSlide)) return; // 元々entryが無ければ変更なし
+            delete nextForSlide[id];
+            changed = true;
+          }
+        });
+        if (!changed) return prev;
+        const nextTransitionPoses = { ...(prev.transitionPoses || {}) };
+        if (Object.keys(nextForSlide).length === 0) {
+          delete nextTransitionPoses[fromId];
+        } else {
+          nextTransitionPoses[fromId] = nextForSlide;
+        }
+        return { ...prev, transitionPoses: nextTransitionPoses };
+      });
+    },
+    [commitWork, activeTransitionRef, editablePerformerIds, isTransitionActive]
+  );
+
   // 通過点（waypoint）の編集ハンドル。「移動軌跡を表示」がONの時だけ、軌跡レイヤーの上に
   // 表示する（軌跡が非表示の状態でハンドルだけ単独で浮いて見えるのを避けるため）。
   //   ・selectedIds.length === 1 → mode:"single"（既存の個別◇編集をそのまま維持）
@@ -8607,8 +13081,7 @@ export default function App() {
   );
 
   // 「＋ 新しい構成を追加」：現在選択中の構成の配置をコピーした新しい構成を、
-  // 必ずslides配列の末尾へ追加してそこへ切り替える（元は構成の直後に挿入していたが、
-  // 「複製」ボタンを廃止しこの1つに役割を統合したため、常に末尾へ追加する仕様に変更した）。
+  // 現在選択中の構成の直後へ追加してそこへ切り替える。
   // 真っ白な構成は作らず、名前は「構成 N」の形で自動採番する（nextAutoSlideNameで重複しないNを決める）。
   // 構成の作成自体はUndo対象とする（commitWorkを使う）。
   const addNewSlide = useCallback(() => {
@@ -8625,21 +13098,42 @@ export default function App() {
         keepCounts: DEFAULT_KEEP_COUNTS, // キープは構成そのものの属性なので、新規構成には常に既定値から始める
         musicAnchor: null, // 4章：前構成のアンカーは自動コピーしない。必要な構成だけユーザーが個別に設定する
       };
-      const nextSlides = [...prev.slides, newSlide];
+      // 構成挿入位置の変更：末尾追加ではなく、現在選択中の構成（currentSlideIndex）の直後へ
+      // 挿入する。新規Formationの中身を生成するロジック（newSlideの構築）自体は既存のまま
+      // 変更せず、「どこへ挿入するか」だけを変更する。
+      const insertAt = prev.currentSlideIndex + 1;
+      const nextSlides = [...prev.slides.slice(0, insertAt), newSlide, ...prev.slides.slice(insertAt)];
       // 「直前の構成→新しい構成」の遷移はDEFAULT_TRANSITION_COUNTS（既定値）から開始する。
       // reconcileTransitionCountsは「変化していない隣接ペア」だけを引き継ぐため、
       // 新しく生まれたこのペアには何も書き込まれず、参照時に既定値へ自動フォールバックする。
+      // このreconcile系helperは挿入位置（末尾か途中か）に依存せず、常にprev.slidesと
+      // nextSlidesの隣接関係の差分だけから判定するため、末尾追加から途中挿入へ変更しても
+      // そのまま安全に機能する（新しいreconcileロジックは追加しない）。
       const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
       // 曲線設定（transitionPaths）も、transitionCountsと全く同じ考え方で
       // 「隣接ペアが変化していない遷移」だけを引き継ぐ。新しく生まれたこのペアには
       // 何も書き込まれず、参照時に既定値（直線）へ自動フォールバックする。
       const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+      // Lighting Cue STEP 2D：transitionLightingCuesも同じreconcileルールで扱う。
+      const nextTransitionLightingCues = reconcileTransitionLightingCues(prev.transitionLightingCues, prev.slides, nextSlides);
+      // 移動時の姿勢 v1：transitionPosesも同じreconcileルールで扱う。新しく生まれた
+      // 「現在の構成→新しい構成」のペアには旧いtransition pose設定を一切引き継がせない。
+      const nextTransitionPoses = reconcileTransitionPoses(prev.transitionPoses, prev.slides, nextSlides);
+      // Lighting Scene引継ぎ v1・B章：「構成を複製」と全く同じcopyLightingSceneForSlideCopy()を
+      // 再利用し、元となるFormation（src）のLighting Sceneがあれば新しいFormationへ
+      // deep copyで引き継ぐ（Area.id/Beam.id/Scene.idはすべて新規発行、Formation複製と
+      // 同じ後方互換ルール）。Sceneが存在しない場合はcopyLightingSceneForSlideCopy()が
+      // 何もせず既存のlightingScenesをそのまま返す。
+      const nextLightingScenes = copyLightingSceneForSlideCopy(getLightingScenes(prev), src.id, newSlide.id);
       return {
         ...prev,
         slides: nextSlides,
-        currentSlideIndex: nextSlides.length - 1,
+        currentSlideIndex: insertAt,
         transitionCounts: nextTransitionCounts,
         transitionPaths: nextTransitionPaths,
+        transitionLightingCues: nextTransitionLightingCues,
+        transitionPoses: nextTransitionPoses,
+        lightingScenes: nextLightingScenes,
       };
     });
   }, [commitWork, isTransitionActive]);
@@ -8681,6 +13175,10 @@ export default function App() {
         // reconcileTransitionCountsによって自動的に既定値（DEFAULT_TRANSITION_COUNTS）へフォールバックする。
         const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
         const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+        // Lighting Cue STEP 2D：削除されたslideIdに紐づくtransition Cueも同じreconcileで除去する。
+        const nextTransitionLightingCues = reconcileTransitionLightingCues(prev.transitionLightingCues, prev.slides, nextSlides);
+        // 移動時の姿勢 v1：削除されたslideIdに紐づくtransition poseも同じreconcileで除去する。
+        const nextTransitionPoses = reconcileTransitionPoses(prev.transitionPoses, prev.slides, nextSlides);
         // Lighting v0・R章：削除されたslideIdを参照するLighting Sceneも同じcommitWorkで削除し、
         // 孤児Sceneを残さない。
         const nextLightingScenes = reconcileLightingScenes(getLightingScenes(prev), nextSlides);
@@ -8690,6 +13188,8 @@ export default function App() {
           currentSlideIndex: nextIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
           lightingScenes: nextLightingScenes,
         };
       });
@@ -8739,6 +13239,10 @@ export default function App() {
         const nextCurrentSlideIndex = resolveCurrentSlideIndexAfterBulkDelete(prev.slides, prev.currentSlideIndex, nextSlides, idSet);
         const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
         const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+        // Lighting Cue STEP 2D：一括削除でも同様に孤児transition Cueを残さない。
+        const nextTransitionLightingCues = reconcileTransitionLightingCues(prev.transitionLightingCues, prev.slides, nextSlides);
+        // 移動時の姿勢 v1：一括削除でも同様に孤児transition poseを残さない。
+        const nextTransitionPoses = reconcileTransitionPoses(prev.transitionPoses, prev.slides, nextSlides);
         // Lighting v0・R章：一括削除でも同様に孤児Sceneを残さない。
         const nextLightingScenes = reconcileLightingScenes(getLightingScenes(prev), nextSlides);
         return {
@@ -8747,6 +13251,8 @@ export default function App() {
           currentSlideIndex: nextCurrentSlideIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
           lightingScenes: nextLightingScenes,
         };
       });
@@ -8768,10 +13274,12 @@ export default function App() {
       commitWork((prev) => {
         if (index < 0 || index >= prev.slides.length) return prev;
         const src = prev.slides[index];
-        const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId } = insertSlideCopyAfter(
+        const { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideId } = insertSlideCopyAfter(
           prev.slides,
           prev.transitionCounts,
           prev.transitionPaths,
+          prev.transitionLightingCues,
+          prev.transitionPoses,
           src,
           index
         );
@@ -8785,6 +13293,8 @@ export default function App() {
           currentSlideIndex: nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
           lightingScenes: nextLightingScenes,
         };
       });
@@ -8950,10 +13460,12 @@ export default function App() {
       const translatedSlide = translateSlideForCrossProjectPaste(sourceSlide, performerIdMap);
       commitWork((prev) => {
         const insertAt = prev.currentSlideIndex;
-        const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId } = insertSlideCopyAfter(
+        const { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideId } = insertSlideCopyAfter(
           prev.slides,
           prev.transitionCounts,
           prev.transitionPaths,
+          prev.transitionLightingCues,
+          prev.transitionPoses,
           translatedSlide,
           insertAt
         );
@@ -8964,6 +13476,8 @@ export default function App() {
           currentSlideIndex: nextCurrentIndex === -1 ? prev.currentSlideIndex : nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
         };
       });
     },
@@ -8983,10 +13497,12 @@ export default function App() {
       commitWork((prev) => {
         const afterIndex = typeof afterIndexResolver === "function" ? afterIndexResolver(prev) : prev.currentSlideIndex;
         if (afterIndex < -1 || afterIndex >= prev.slides.length) return prev; // 保険（対象indexが既に無い等）
-        const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideIds } = insertSlidesCopyAfter(
+        const { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideIds } = insertSlidesCopyAfter(
           prev.slides,
           prev.transitionCounts,
           prev.transitionPaths,
+          prev.transitionLightingCues,
+          prev.transitionPoses,
           sourceSlides,
           sourceInternalTransitionCounts || {},
           sourceInternalTransitionPaths || {},
@@ -9007,6 +13523,8 @@ export default function App() {
           currentSlideIndex: nextCurrentIndex === -1 ? prev.currentSlideIndex : nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
           lightingScenes: nextLightingScenes,
         };
       });
@@ -9149,10 +13667,12 @@ export default function App() {
       const latestClip = copiedSlideRef.current;
       if (!latestClip || !latestClip.slide) return prev; // 保険（コミット関数実行時点の再チェック）
       const insertAt = prev.currentSlideIndex;
-      const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId } = insertSlideCopyAfter(
+      const { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideId } = insertSlideCopyAfter(
         prev.slides,
         prev.transitionCounts,
         prev.transitionPaths,
+        prev.transitionLightingCues,
+        prev.transitionPoses,
         latestClip.slide,
         insertAt
       );
@@ -9165,6 +13685,8 @@ export default function App() {
         currentSlideIndex: nextCurrentIndex === -1 ? prev.currentSlideIndex : nextCurrentIndex,
         transitionCounts: nextTransitionCounts,
         transitionPaths: nextTransitionPaths,
+        transitionLightingCues: nextTransitionLightingCues,
+        transitionPoses: nextTransitionPoses,
         lightingScenes: nextLightingScenes,
       };
     });
@@ -9262,10 +13784,12 @@ export default function App() {
         const srcIndex = prev.slides.findIndex((s) => s.id === copiedSlideId);
         if (srcIndex === -1) return prev; // 保険：コピー元が既に無い場合は何もしない（11章）
         const src = prev.slides[srcIndex];
-        const { nextSlides, nextTransitionCounts, nextTransitionPaths, newSlideId } = insertSlideCopyAfter(
+        const { nextSlides, nextTransitionCounts, nextTransitionPaths, nextTransitionLightingCues, nextTransitionPoses, newSlideId } = insertSlideCopyAfter(
           prev.slides,
           prev.transitionCounts,
           prev.transitionPaths,
+          prev.transitionLightingCues,
+          prev.transitionPoses,
           src,
           targetIndex
         );
@@ -9279,6 +13803,8 @@ export default function App() {
           currentSlideIndex: nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
           lightingScenes: nextLightingScenes,
         };
       });
@@ -9343,12 +13869,18 @@ export default function App() {
         // 自動的に既定値（DEFAULT_TRANSITION_COUNTS）へフォールバックする（複雑な自動引き継ぎは行わない）。
         const nextTransitionCounts = reconcileTransitionCounts(prev.transitionCounts, prev.slides, nextSlides);
         const nextTransitionPaths = reconcileTransitionPaths(prev.transitionPaths, prev.slides, nextSlides);
+        // Lighting Cue STEP 2D：transitionLightingCuesも同じreconcileルールで扱う。
+        const nextTransitionLightingCues = reconcileTransitionLightingCues(prev.transitionLightingCues, prev.slides, nextSlides);
+        // 移動時の姿勢 v1：transitionPosesも同じreconcileルールで扱う。
+        const nextTransitionPoses = reconcileTransitionPoses(prev.transitionPoses, prev.slides, nextSlides);
         return {
           ...prev,
           slides: nextSlides,
           currentSlideIndex: nextCurrentIndex,
           transitionCounts: nextTransitionCounts,
           transitionPaths: nextTransitionPaths,
+          transitionLightingCues: nextTransitionLightingCues,
+          transitionPoses: nextTransitionPoses,
         };
       });
     },
@@ -9393,7 +13925,9 @@ export default function App() {
   const setTransitionCountsCommit = useCallback(
     (rawValue) => {
       if (isTransitionActive) return; // 再生中は移動カウントを変更できない
-      const parsed = Math.round(Number(rawValue));
+      // 0.5カウント精度対応 v1：整数Math.round()をsnapCountToHalf()へ変更（キープと同じ思想）。
+      // 0カウントは引き続き正式な有効値としてMIN_TRANSITION_COUNTS（0）のまま維持する。
+      const parsed = snapCountToHalf(Number(rawValue));
       const next = Number.isFinite(parsed) ? Math.max(MIN_TRANSITION_COUNTS, parsed) : MIN_TRANSITION_COUNTS;
       commitWork((prev) => {
         const slide = prev.slides[prev.currentSlideIndex];
@@ -9445,6 +13979,13 @@ export default function App() {
   // ことで、2章の「初期値は現在使っているPNG設定を基本にする」を満たす。
   const [exportShowTrajectory, setExportShowTrajectory] = useState(false);
   const [exportTrajectoryMode, setExportTrajectoryMode] = useState("next");
+  // 追尾スポット軌跡Export v1・18〜20章：Export Center専用の「追尾スポット軌跡」表示state。
+  // exportShowTrajectory（出演者の移動軌跡）とは完全に独立したbooleanで、一方をONにしても
+  // 他方が連動してONにはならない（23章）。work/Project schemaには一切保存せず、Undo/Redo対象外。
+  // 対応する編集画面側のstate（selectedLightingBeamTrackingPathはselection依存の別物）は
+  // 存在しないため、exportShowMusicTime等と同じ「Export専用の新規UI state」として扱う。
+  // defaultはfalse（20章：追尾軌跡は情報量が増えるため、必要な時だけONにするオプション）。
+  const [exportShowLightingTrackingPaths, setExportShowLightingTrackingPaths] = useState(false);
   // 出演者名 v1：Export Center専用の「出演者名を表示」設定。exportShowTrajectoryと全く同じ
   // 考え方（work/Undo/Redoの対象外・Export Centerを開いた瞬間に編集画面の現在値をコピー）で
   // 独立させる。実際に描画へ反映するのはrenderTopFormationExportのみで、俯瞰客席ビュー側の
@@ -9466,6 +14007,33 @@ export default function App() {
   // PNG側の挙動（1構成=直接ダウンロード／2構成以上=ZIP）は一切変更せず、format==="pdf"の
   // 場合だけ別ブランチへ進む（handleExportCenterConfirm参照）。
   const [exportFormat, setExportFormat] = useState("png");
+  // Lighting Cue Export v1・3・4章：Export Centerに追加する「照明キューごとに出力」チェック
+  // ボックス専用state。新しい別モーダルは作らず、既存Export Centerの内部に1つのcheckboxとして
+  // 追加するだけ（3章の第一候補のうちcheckbox案を採用）。ONの間、出力対象は常に「現在の構成」
+  // 1件に固定される（4章：第一段階は選択中Formationのみ）。work/Undo/Redoには一切影響しない
+  // UI専用stateで、他のexport*state（exportShowWaitingAreas等）と全く同じ方針。
+  const [exportLightingCueMode, setExportLightingCueMode] = useState(false);
+  // 出演者一覧単体Export v1・23・24章：「出演者一覧のみ出力」専用のboolean state。
+  // exportContentModeのような大規模renameはせず、既存exportLightingCueModeと組み合わせて
+  // 3状態（通常／照明キュー／出演者一覧）を表現する最小差分アプローチを採用した。
+  // work/Undo/Redoには一切影響しないUI専用state。
+  const [exportPerformerListOnly, setExportPerformerListOnly] = useState(false);
+  // 24章：出演者一覧モードと照明キューモードは同時ONにならないよう、UIのonChangeハンドラ側で
+  // 相互排他にする（内部stateを1つに統合するのではなく、切り替え時に相手を必ずOFFにする、
+  // という最小限の排他制御）。
+  const handleExportLightingCueModeChange = useCallback((next) => {
+    setExportLightingCueMode(next);
+    if (next) setExportPerformerListOnly(false);
+  }, []);
+  const handleExportPerformerListOnlyChange = useCallback((next) => {
+    setExportPerformerListOnly(next);
+    if (next) setExportLightingCueMode(false);
+  }, []);
+  // 出演者一覧 Export v1・14・15・32章：PDF形式選択時だけ意味を持つ「出演者一覧を先頭に
+  // 付ける」checkbox専用state。work/Undo/Redoには一切影響しないUI専用stateで、他の
+  // export*stateと全く同じ方針。PDF資料としては番号・名前対応表がある方が基本的に
+  // 分かりやすいため、default true（15章）。
+  const [exportIncludePerformerList, setExportIncludePerformerList] = useState(true);
   // Export Center v1・7章：構成選択状態はwork/project/slideには一切保存しない、
   // Export Center専用のUI一時state（Undo/Redo対象外）。slide.idの配列で保持する
   // （並べ替え・削除等でindexがズレても、idベースなら安全に追従できるため）。
@@ -9526,11 +14094,24 @@ export default function App() {
     setExportViewChoice("current");
     setExportShowTrajectory(showTrajectory);
     setExportTrajectoryMode(trajectoryMode);
+    // 追尾スポット軌跡Export v1・21章：対応する編集画面stateが存在しないため、Export表示倍率と
+    // 同じ考え方で開くたびに必ずdefault（false）へ戻す。
+    setExportShowLightingTrackingPaths(false);
     setExportShowPerformerNames(showPerformerNames);
     // Export表示倍率 v1：対応する編集画面stateが存在しないため、開くたびに必ず100%へ戻す
     // （PART C：編集画面のzoomとは無関係。TEST A「Export Centerを開く→100%表示」）。
     setExportDisplayScale(EXPORT_DISPLAY_SCALE_DEFAULT);
     setExportFormat("png");
+    // Lighting Cue Export v1：Export Centerを開くたびに必ずOFFへ戻す（前回開いた時にONに
+    // していても、次に開いた時は必ず通常Exportから始まる＝既存のexportFormatリセットと
+    // 同じ安全策）。
+    setExportLightingCueMode(false);
+    // 出演者一覧単体Export v1・22章：出演者一覧モードもdefaultにせず、必ず通常Formation
+    // Exportから始まる（既存exportLightingCueModeリセットと同じ思想）。
+    setExportPerformerListOnly(false);
+    // 出演者一覧 Export v1・32章：既存のexportFormatリセットと同じ思想で、開くたびに
+    // 必ずdefault（true）へ戻す（前回OFFにしていても、次に開いた時は必ずONから始まる）。
+    setExportIncludePerformerList(true);
     setExportCenterOpen(true);
   }, [isTransitionActive, showTrajectory, trajectoryMode, showPerformerNames]);
 
@@ -9581,11 +14162,39 @@ export default function App() {
   }, [exportViewChoice, viewMode]);
 
   const exportTargetSlideCount = getExportSlideIndices().length;
-  const exportConfirmDisabled =
-    exportBatchBusy || slides.length === 0 || (exportTargetMode === "selection" && selectedExportSlideIds.length === 0);
+  // Lighting Cue Export 複数Formation対応 v1・27〜29章：currentLightingSceneだけを根拠に
+  // Mode全体をdisabledにしない（29章）。Lighting Cue Export ONで対象となるscope
+  // （現在/選択/すべての構成、既存getExportSlideIndices()をそのまま再利用）の中に、
+  // 有効なLighting Scene（enabled）を持つFormationが1つでもあればexport可能とする
+  // （25・26章：一部だけLightingなしでも、残りが正常出力できればConfirmは利用可能）。
+  const exportLightingCueModeAvailable = getExportSlideIndices().some((idx) => {
+    const s = slides[idx];
+    if (!s) return false;
+    const scene = findLightingSceneBySlideId(lightingScenes || [], s.id);
+    return !!(scene && scene.enabled);
+  });
+  // 出演者一覧単体Export v1・21・29章：Project performersだけで完結するため、Formation・
+  // Lighting Sceneの状態には一切依存しない。busy中以外は常に出力可能（0人でもrendererが
+  // 案内文付きの空Canvasを返すためクラッシュしない＝21章）。
+  const exportConfirmDisabled = exportPerformerListOnly
+    ? exportBatchBusy
+    : exportLightingCueMode
+    ? exportBatchBusy || !exportLightingCueModeAvailable
+    : exportBatchBusy || slides.length === 0 || (exportTargetMode === "selection" && selectedExportSlideIds.length === 0);
   // v1.2：形式（PNG/PDF）に応じてボタン文言を出し分ける。PNG側の文言は従来通り変更しない。
+  // Lighting Cue Export v1：exportLightingCueModeの間は常に「現在の構成」1件が対象のため、
+  // 通常Exportの「◯構成を出力」という複数件文言は使わない（4章：第一段階は選択中Formationのみ）。
+  // 出演者一覧単体Export v1：exportPerformerListOnlyの間は構成数に関する文言を一切使わない。
   const exportConfirmLabel = exportBatchBusy
     ? "出力中…"
+    : exportPerformerListOnly
+    ? exportFormat === "pdf"
+      ? "出演者一覧をPDFで出力"
+      : "出演者一覧を出力"
+    : exportLightingCueMode
+    ? exportFormat === "pdf"
+      ? "照明キューをPDFで出力"
+      : "照明キューを出力"
     : exportFormat === "pdf"
     ? exportTargetMode === "current"
       ? "PDFを出力"
@@ -9605,6 +14214,228 @@ export default function App() {
   // 作らず全体を失敗扱いにする（途中経過のダウンロードは一切発生しない）。
   const handleExportCenterConfirm = useCallback(async () => {
     setPngExportError(null);
+
+    // 出演者一覧単体Export v1・25〜29章：exportPerformerListOnlyがONの間は、Formation・
+    // Lighting Cueを一切参照しない最上位の専用branchへ完全に分岐する（buildFormationExportModels・
+    // buildLightingCueExportModelsはどちらも呼ばない＝28章）。既存のrenderPerformerListExportToCanvas()・
+    // appendCanvasToPdf()・downloadCanvasAsPng()をそのまま再利用し（18章：見た目を4箇所で
+    // 別実装しない）、新しいrendererは作らない。ZIPは使わない（14・26章：1枚だけのため）。
+    if (exportPerformerListOnly) {
+      setExportBatchBusy(true);
+      try {
+        const canvas = renderPerformerListExportToCanvas(performers, activeProject.name);
+        if (!canvas) throw new Error("出演者一覧用のCanvasを準備できませんでした。");
+        if (exportFormat === "pdf") {
+          // 27章：PDFDocument.create() → Canvas（生成済み） → appendCanvasToPdf() → save →
+          // download、という最小限の流れだけ。Formation/Cueページは一切追加しない（15章）。
+          const pdfDoc = await PDFDocument.create();
+          await appendCanvasToPdf(pdfDoc, canvas);
+          const pdfBytes = await pdfDoc.save();
+          const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+          const pdfFilename = buildPerformerListExportPdfFilename(activeProject.name);
+          downloadBlob(pdfBlob, pdfFilename, (err) => {
+            throw err instanceof Error ? err : new Error("PDFファイルのダウンロードに失敗しました。");
+          });
+        } else {
+          // 26章：Canvas生成→downloadCanvasAsPng()→returnだけ。JSZipは呼ばない。
+          const filename = buildPerformerListExportFilename(activeProject.name);
+          await new Promise((resolve, reject) => {
+            downloadCanvasAsPng(
+              canvas,
+              filename,
+              (err) => reject(err instanceof Error ? err : new Error("PNGファイルの生成に失敗しました。")),
+              () => resolve()
+            );
+          });
+        }
+        setExportCenterOpen(false);
+        setExportSlidePickerOpen(false);
+      } catch (err) {
+        const label = exportFormat === "pdf" ? "PDFの出力に失敗しました。" : "PNGファイルの生成に失敗しました。";
+        setPngExportError(`${label}${err && err.message ? err.message : ""}`);
+      } finally {
+        setExportBatchBusy(false);
+      }
+      return;
+    }
+
+    // Lighting Cue Export 複数Formation対応 v1・1〜3・67章：exportLightingCueModeがONの間、
+    // 対象Formationを通常Formation Exportと全く同じgetExportSlideIndices()（現在/選択/
+    // すべての構成）から取得し、複数Formation分のLighting Cue modelをflatに束ねる
+    // buildLightingCueExportModelsForSlides()へ委譲する。Canvas描画（renderFormationExportToCanvas）・
+    // PNG直接ダウンロード（downloadCanvasAsPng）・ZIP（JSZip）・PDF（PDFDocument）はすべて
+    // 通常Exportと同じ既存基盤をそのまま再利用する（25・29・30・54章：新しいZIP/PDF実装を作らない）。
+    if (exportLightingCueMode) {
+      const lightingCueTargetIndices = getExportSlideIndices();
+      // 25・26章：対象scope内に有効なLighting Sceneを持つFormationが1つも無ければExportを
+      // 開始しない（Confirm button側のexportConfirmDisabledと同じ判定をここでも安全側に
+      // 再確認するだけで、新しい判定ロジックは作らない）。
+      const hasLightingInScope = lightingCueTargetIndices.some((idx) => {
+        const s = slides[idx];
+        if (!s) return false;
+        const scene = findLightingSceneBySlideId(lightingScenes || [], s.id);
+        return !!(scene && scene.enabled);
+      });
+      if (!hasLightingInScope) {
+        setPngExportError("選択した構成に有効な照明設定がありません。");
+        return;
+      }
+      setExportBatchBusy(true);
+      try {
+        const models = buildLightingCueExportModelsForSlides({
+          slideIndices: lightingCueTargetIndices,
+          slides,
+          performers,
+          stage,
+          zones,
+          musicSections,
+          transitionCounts,
+          effectiveTransitionPathConfig,
+          transitionPoses,
+          performerDisplayScale,
+          showMusicTime: exportShowMusicTime,
+          stageAppearance,
+          lightingScenes,
+          transitionLightingCues,
+          showTrajectory: exportShowTrajectory,
+          trajectoryMode: exportTrajectoryMode,
+          showLightingTrackingPaths: exportShowLightingTrackingPaths,
+        });
+        if (models.length === 0) {
+          setPngExportError("出力対象の照明キューが見つかりませんでした。");
+          return;
+        }
+        // 20章：対象Formationが1つだけ（scope==="current"時、または選択/全構成でも
+        // 結果的にLightingありが1件だけだった場合）はFormation番号入りの従来通りの
+        // ZIP/PDF名にし、複数Formationにまたがる場合だけ汎用名にする。
+        const distinctSlideNumbers = new Set(models.map((m) => m.slideNumber));
+        const singleFormationNumber = distinctSlideNumbers.size === 1 ? models[0].slideNumber : null;
+        const renderOptions = {
+          viewMode: resolveExportRenderViewMode(),
+          showWaitingAreas: exportShowWaitingAreas,
+          showPerformerNames: exportShowPerformerNames,
+          displayScale: exportDisplayScale,
+        };
+        if (exportFormat === "pdf") {
+          // 17・30章：既存PDF出力（pdf-lib）を1Cue=1ページとしてそのまま再利用する。
+          // models配列はFormation順・Cue順（buildLightingCueExportModelsForSlidesが保証）の
+          // ため、for..ofでそのまま追加していくだけでページ順も自然に正しくなる。
+          const pdfDoc = await PDFDocument.create();
+          // Lighting Cue PDF 表示改善 v1・STEP C：PDF生成時だけ使う一時的なdisplay metadata。
+          // 新しいReact state・Project dataは一切作らず、既存models配列（Formation順・Cue順）
+          // の並びからその場で導出するだけ。buildLightingCueExportModels(s)・Cue解決ロジックは
+          // 一切変更しない（model.lightingCueLabelを唯一の表示元として使い、新しいcount計算・
+          // 別文字列の再構築はしない）。
+          const formationCueCounts = new Map();
+          models.forEach((m) => {
+            formationCueCounts.set(m.slideNumber, (formationCueCounts.get(m.slideNumber) || 0) + 1);
+          });
+          const formationRunningIndex = new Map();
+          const totalPages = models.length + (exportIncludePerformerList ? 1 : 0);
+          let pageCursor = exportIncludePerformerList ? 1 : 0;
+          const pdfMetaList = models.map((m, i) => {
+            const isFormationStart = i === 0 || models[i - 1].slideNumber !== m.slideNumber;
+            const itemIndexInFormation = (formationRunningIndex.get(m.slideNumber) || 0) + 1;
+            formationRunningIndex.set(m.slideNumber, itemIndexInFormation);
+            pageCursor += 1;
+            return {
+              isFormationStart,
+              itemIndexInFormation,
+              itemCountInFormation: formationCueCounts.get(m.slideNumber),
+              pageNumber: pageCursor,
+              totalPages,
+            };
+          });
+          // 出演者一覧 Export v1・18・19・20・35章：Lighting Cue PDFでも通常PDFと全く同じ
+          // renderPerformerListExportToCanvas()を使い、専用のLighting Cue performer listは
+          // 作らない（20章）。Formationページより先に、PDF全体で1ページだけ追加する
+          // （Formationごとに繰り返さない＝18章）。②：出演者一覧ページもPDF全体のページ番号へ
+          // 含めるため、appendCanvasToPdf()で埋め込む前にdrawExportPageNumberOverlay()で
+          // 「1 / totalPages」を上乗せする。
+          if (exportIncludePerformerList) {
+            const listCanvas = renderPerformerListExportToCanvas(performers, activeProject.name);
+            if (!listCanvas) throw new Error("出演者一覧ページ用のCanvasを準備できませんでした。");
+            const listCtx = listCanvas.getContext && listCanvas.getContext("2d");
+            if (listCtx) drawExportPageNumberOverlay(listCtx, 1, totalPages);
+            await appendCanvasToPdf(pdfDoc, listCanvas);
+          }
+          for (let i = 0; i < models.length; i++) {
+            const model = models[i];
+            const canvas = document.createElement("canvas");
+            const ok = renderFormationExportToCanvas(model, canvas, { ...renderOptions, lightingCuePdfMeta: pdfMetaList[i] });
+            if (!ok) throw new Error(`「${model.lightingCueLabel}」のPDF用Canvasを準備できませんでした。`);
+            const blob = await canvasToPngBlob(canvas);
+            const pngBytes = new Uint8Array(await blob.arrayBuffer());
+            const pngImage = await pdfDoc.embedPng(pngBytes);
+            const page = pdfDoc.addPage([EXPORT_PNG_WIDTH, EXPORT_PNG_HEIGHT]);
+            page.drawImage(pngImage, { x: 0, y: 0, width: EXPORT_PNG_WIDTH, height: EXPORT_PNG_HEIGHT });
+          }
+          const pdfBytes = await pdfDoc.save();
+          const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+          const pdfFilename = buildLightingCueExportPdfFilename(activeProject.name, singleFormationNumber);
+          downloadBlob(pdfBlob, pdfFilename, (err) => {
+            throw err instanceof Error ? err : new Error("PDFファイルのダウンロードに失敗しました。");
+          });
+        } else if (models.length === 1) {
+          // 12・28章：カットが1枚（Formation1件・Cueが1つも無く開始時のみ）の場合は既存の
+          // 直接ダウンロード方式。唯一のカット＝開始時のため、出力順連番は常に0（00_start）。
+          const model = models[0];
+          const canvas = document.createElement("canvas");
+          const ok = renderFormationExportToCanvas(model, canvas, renderOptions);
+          if (!ok) throw new Error(`「${model.lightingCueLabel}」のPNG描画用Canvasを準備できませんでした。`);
+          const filename = buildLightingCueExportFilename(model.slideNumber, 0, model.lightingCueDisplayCount);
+          await new Promise((resolve, reject) => {
+            downloadCanvasAsPng(
+              canvas,
+              filename,
+              (err) => reject(err instanceof Error ? err : new Error("PNGファイルの生成に失敗しました。")),
+              () => resolve()
+            );
+          });
+        } else {
+          // 13・16章：複数カットは既存JSZipでまとめる（新しいZIP実装は作らない）。
+          // 16章：cutIndexはFormationが切り替わるたび（model.slideNumberが変化するたび）に
+          // 必ず0へリセットする（全Export通算の連番にはしない）。models配列はFormation順・
+          // Cue順（buildLightingCueExportModelsForSlidesが保証）のため、直前のmodelとの
+          // slideNumber比較だけで正しく検知できる（新しいグルーピングstateは持たない）。
+          const zip = new JSZip();
+          let cutIndex = 0;
+          let prevSlideNumber = null;
+          for (const model of models) {
+            if (model.slideNumber !== prevSlideNumber) {
+              cutIndex = 0;
+              prevSlideNumber = model.slideNumber;
+            }
+            const canvas = document.createElement("canvas");
+            const ok = renderFormationExportToCanvas(model, canvas, renderOptions);
+            if (!ok) throw new Error(`「${model.lightingCueLabel}」のPNG描画用Canvasを準備できませんでした。`);
+            const blob = await canvasToPngBlob(canvas);
+            const filename = buildLightingCueExportFilename(model.slideNumber, cutIndex, model.lightingCueDisplayCount);
+            zip.file(filename, blob);
+            cutIndex++;
+          }
+          const zipBlob = await zip.generateAsync({ type: "blob" });
+          const zipFilename = buildLightingCueExportZipFilename(activeProject.name, singleFormationNumber);
+          await new Promise((resolve, reject) => {
+            try {
+              downloadBlob(zipBlob, zipFilename, (err) => reject(err instanceof Error ? err : new Error("ZIPファイルのダウンロードに失敗しました。")));
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          });
+        }
+        setExportCenterOpen(false);
+        setExportSlidePickerOpen(false);
+      } catch (err) {
+        const label = exportFormat === "pdf" ? "PDFの出力に失敗しました。" : "PNGの一括出力に失敗しました。";
+        setPngExportError(`${label}${err && err.message ? err.message : ""}`);
+      } finally {
+        setExportBatchBusy(false);
+      }
+      return;
+    }
+
     const indices = getExportSlideIndices();
     if (indices.length === 0) {
       setPngExportError("出力する構成がありません。");
@@ -9629,8 +14460,20 @@ export default function App() {
         performerDisplayScale,
         showMusicTime: exportShowMusicTime,
         stageAppearance,
-        lightingEnabled,
+        // Lighting UI整理・Prototype卒業・Q章：Project-level lightingEnabledはもう表示条件
+        // として使わない方針のため、Export側の判定（buildFormationExportModel内部の
+        // `if (!lightingEnabled) return [];`）にも影響を波及させないよう、ここでは常にtrueを
+        // 渡す。buildFormationExportModel／renderTopFormationExport／
+        // renderAudienceFormationExport自体は一切変更していない（Export内部の実装を触らず、
+        // 呼び出し側が渡す値だけを変えることで、既存Export関数への変更を避けつつ
+        // 新しいUI仕様と整合させている）。これにより、UIから「照明機能を使う」を
+        // 削除した後も、Scene.enabledのみでLighting Area Exportが正しく機能する
+        // （this fixes a regression discovered during this refactor: without this change, all
+        // new Projects default to work.project.lightingEnabled=false and would silently stop
+        // exporting Lighting Areas since there is no longer any UI to set it true）。
+        lightingEnabled: true,
         lightingScenes,
+        showLightingTrackingPaths: exportShowLightingTrackingPaths,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");
@@ -9654,6 +14497,12 @@ export default function App() {
         // という単一の出力方式にする（PNG側の「1枚=直接DL／2枚以上=ZIP」という分岐は関係ない）。
         // 1件でも失敗したら例外を投げ、部分的なPDFは作らない（17章のZIPと同じ方針を踏襲）。
         const pdfDoc = await PDFDocument.create();
+        // 出演者一覧 Export v1・19・35章：Formationページより先に、必ず1ページ目として追加する。
+        if (exportIncludePerformerList) {
+          const listCanvas = renderPerformerListExportToCanvas(performers, activeProject.name);
+          if (!listCanvas) throw new Error("出演者一覧ページ用のCanvasを準備できませんでした。");
+          await appendCanvasToPdf(pdfDoc, listCanvas);
+        }
         for (const model of models) {
           const canvas = document.createElement("canvas");
           const ok = renderFormationExportToCanvas(model, canvas, renderOptions);
@@ -9730,6 +14579,14 @@ export default function App() {
       setExportBatchBusy(false);
     }
   }, [
+    exportPerformerListOnly,
+    exportLightingCueMode,
+    exportIncludePerformerList,
+    currentLightingScene,
+    currentSlide,
+    currentSlideIndex,
+    transitionPoses,
+    transitionLightingCues,
     getExportSlideIndices,
     slides,
     performers,
@@ -9748,8 +14605,8 @@ export default function App() {
     performerDisplayScale,
     exportFormat,
     activeProject.name,
-    lightingEnabled,
     lightingScenes,
+    exportShowLightingTrackingPaths,
   ]);
 
 
@@ -9875,13 +14732,456 @@ export default function App() {
     [commitWork]
   );
 
-  // ---- Lighting v0・L章：Lighting機能全体のON/OFF ----
-  const setLightingEnabledCommit = useCallback(
-    (next) => {
-      commitWork((prev) => ({ ...prev, project: { ...(prev.project || {}), lightingEnabled: !!next } }));
+  // 旧「Lighting機能全体のON/OFF」（work.project.lightingEnabledをUIから変更するhandler）は、
+  // Lighting UI整理・Prototype卒業・F-1章により「照明機能を使う」checkboxごと正式UIから
+  // 削除した。lightingEnabled field自体は保存データ互換性のため残っている
+  // （getLightingEnabled()参照）が、今後このhandlerでUIから変更することはない。
+
+  // Lighting Area Formation間logical identity v1・PART C：「前の構成から引き継ぐ」。
+  // 直前Formationのresolveされた最終Lighting状態（resolveFinalLightingStateForSlide()、
+  // 既存の「最終照明をコピー」v2が使っているのと同じ既存helper）を、現在Formationの
+  // Base Sceneへ新規生成する。clipboardを経由しない1回のcommitWork（＝Undo 1件）。
+  //   ・STEP 12：安全側ガード。現在FormationにLighting Sceneが既に存在する場合は何もしない
+  //     （既存設定を黙って破壊しない。UI側もSceneが無い時だけボタンを表示する二重ガード）。
+  //   ・STEP 8：引き継ぎ元Areaのidは新規発行、logicalAreaIdは継承。引き継ぎ元に
+  //     logicalAreaIdがまだ無い（旧Project）場合は、この場でlazyに新規発行し、
+  //     backfillLogicalAreaIdsInScene()/backfillLogicalAreaIdsInTransitionCues()で
+  //     直前Formation側の該当Area（Base Scene・全Cue、同じidを持つもの全て）へも
+  //     同じ値を書き戻す（Projectを開いただけの一括migrationは行わない＝lazy方式）。
+  //   ・STEP 9：Move関連field（positionMoveCounts/positionMoveMode/positionMoveFromAreaId）は
+  //     引き継がず、Base Scene Areaとして安全な既定値（0・"none"・未設定）へリセットする。
+  //   ・STEP 10：Beamはid新規発行、logicalBeamIdは継承。引き継ぎ元にlogicalBeamIdがまだ
+  //     無い（旧Project）場合は、この場でlazyに新規発行し、backfillLogicalBeamIdsInScene()/
+  //     backfillLogicalBeamIdsInTransitionCues()で直前Formation側の該当Beam（Base Scene・
+  //     全Cue、同じidを持つもの全て）へも同じ値を書き戻す（Areaと全く同じlazy方式）。
+  //     source/target/sourceWidth/targetWidth/color/intensity/followPerformerId等はspreadで
+  //     そのまま維持（PART C：Formation間Move用fieldはまだ追加しない）。
+  //   ・STEP 11：現在Formation自身のentryFadeCounts・Cue配列には一切触れない（新規Sceneの
+  //     Cue配列は空のまま、entryFadeCountsは既存のaddLightingSceneForCurrentSlideと同じ0）。
+  const inheritLightingFromPreviousFormationCommit = useCallback(() => {
+    commitWork((prev) => {
+      const idx = prev.currentSlideIndex;
+      if (idx <= 0) return prev; // STEP 6：最初のFormationには直前Formationが無い
+      const currentSlideNow = prev.slides[idx];
+      const prevSlideNow = prev.slides[idx - 1];
+      if (!currentSlideNow || !prevSlideNow) return prev;
+      const scenes = getLightingScenes(prev);
+      if (findLightingSceneBySlideId(scenes, currentSlideNow.id)) return prev; // STEP 12：既存Sceneがあれば何もしない
+      const finalState = resolveFinalLightingStateForSlide(
+        prevSlideNow,
+        currentSlideNow,
+        scenes,
+        prev.transitionLightingCues,
+        prev.transitionCounts
+      );
+      // STEP 8：logicalAreaId未設定のAreaだけ、この場でlazyに新規発行する（id基準でMap化）。
+      const logicalIdByAreaId = new Map();
+      finalState.areas.forEach((area) => {
+        if (!getLightingAreaLogicalId(area)) logicalIdByAreaId.set(area.id, makeId("logical-area"));
+      });
+      // Lighting Beam 3D Formation間identity v1・PART B：logicalBeamId未設定のBeamも同様に
+      // lazy発行する（Area版と全く同じid基準Map化パターン）。
+      const logicalIdByBeamId = new Map();
+      finalState.beams3D.forEach((beam) => {
+        if (!getLightingBeamLogicalId(beam)) logicalIdByBeamId.set(beam.id, makeId("logical-beam"));
+      });
+      // 直前Formation側（Base Scene・transition Cue）へ同じlogicalAreaId/logicalBeamIdを
+      // backfillする。
+      const prevScene = findLightingSceneBySlideId(scenes, prevSlideNow.id);
+      const backfilledPrevSceneAreas = prevScene ? backfillLogicalAreaIdsInScene(prevScene, logicalIdByAreaId) : null;
+      // PART B：Area用backfillの結果へ、続けてBeam用backfillを適用する（同じScene
+      // objectへ両方のfieldを反映させるため、一度で合成する）。
+      const backfilledPrevScene = backfilledPrevSceneAreas
+        ? backfillLogicalBeamIdsInScene(backfilledPrevSceneAreas, logicalIdByBeamId)
+        : null;
+      const transitionMap = prev.transitionLightingCues || {};
+      const backfilledTransitionCuesAreas = backfillLogicalAreaIdsInTransitionCues(
+        getTransitionLightingCues(transitionMap, prevSlideNow.id),
+        logicalIdByAreaId
+      );
+      const backfilledTransitionCues = backfillLogicalBeamIdsInTransitionCues(backfilledTransitionCuesAreas, logicalIdByBeamId);
+      // STEP 8・9：現在Formation Base Scene用の新規Area。idは新規発行、logicalAreaIdは
+      // 引き継ぎ元（既存値、または上でlazy発行した新値）を継承。Move関連fieldはリセット。
+      const newAreas = finalState.areas.map((area) => ({
+        ...area,
+        id: makeId("lighting-area"),
+        logicalAreaId: getLightingAreaLogicalId(area) || logicalIdByAreaId.get(area.id),
+        positionMoveCounts: 0,
+        positionMoveMode: "none",
+        positionMoveFromAreaId: undefined,
+      }));
+      // Lighting Beam 3D Formation間identity v1・PART B：新規Beamは、idは新規発行、
+      // logicalBeamIdは引き継ぎ元（既存値、または上でlazy発行した新値）を継承する。
+      // source/target/sourceWidth/targetWidth/color/intensity/followPerformerId等はspreadで
+      // そのまま維持（PART C：Formation間Move用fieldはまだ追加しない）。
+      const newBeams3D = finalState.beams3D.map((beam) => ({
+        ...beam,
+        id: makeId("lighting-beam3d"),
+        logicalBeamId: getLightingBeamLogicalId(beam) || logicalIdByBeamId.get(beam.id),
+        source: { ...beam.source },
+        target: { ...beam.target },
+      }));
+      const newScene = {
+        id: makeId("lighting"),
+        slideId: currentSlideNow.id,
+        enabled: true,
+        note: "",
+        entryFadeCounts: 0, // STEP 11：直前Formationからentryfadeountsは引き継がない
+        areas: newAreas,
+        beams: [],
+        beams3D: newBeams3D,
+        cues: [], // STEP 11：現在Formation自身のCue配列は空のまま（勝手に生成しない）
+      };
+      const nextScenes = scenes.map((sc) => (backfilledPrevScene && sc.id === backfilledPrevScene.id ? backfilledPrevScene : sc));
+      return {
+        ...prev,
+        lightingScenes: [...nextScenes, newScene],
+        transitionLightingCues: { ...transitionMap, [prevSlideNow.id]: backfilledTransitionCues },
+      };
+    });
+  }, [commitWork]);
+
+  // Lighting Area 後付け接続 v1・STEP 7：普通にcopy/pasteして作ったArea（logicalAreaIdが
+  // 別）を、後から直前Formationの最終Lighting状態に存在するAreaと「同じ照明の続き」として
+  // 明示的に接続する。変更するのはlogicalAreaIdだけ（STEP2：位置・色・サイズ等は一切
+  // 変更しない）。処理内容はSTEP7の手順そのまま：
+  //   1. targetSlideの直前Formationを取得
+  //   2. resolveFinalLightingStateForSlide()で前Formation最終Lightingを取得
+  //      （resolvePreviousFormationFinalAreasForSlide()へ集約、新しいresolveロジックは
+  //      作らない）
+  //   3. 選択したsourceAreaを特定
+  //   4. sourceArea.logicalAreaIdを取得
+  //   5. 無ければ（旧データ）新しいlogicalAreaIdをlazy発行
+  //   6. 前Formation内の同じArea idを持つBase/Cue snapshotへbackfill
+  //      （backfillLogicalAreaIdsInScene/backfillLogicalAreaIdsInTransitionCuesを
+  //      「前の構成から引き継ぐ」と全く同じ形で再利用）
+  //   7. target Area.logicalAreaIdだけを同じ値へ変更
+  // STEP 8：target Formation内に既に同じlogicalAreaIdを持つ別Areaが存在する場合は、
+  // 重複logicalAreaIdを作らないよう安全側で接続を拒否する（lightingAreaConnectionWarningへ
+  // 簡潔なメッセージを設定するだけで、大規模なvalidation systemは作らない）。
+  const connectLightingAreaToPreviousFormationCommit = useCallback(
+    (targetAreaId, sourceAreaId) => {
+      let rejected = false;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const slides = prev.slides;
+        const idx = slides.findIndex((s) => s.id === targetSlideId);
+        if (idx <= 0) return prev; // STEP6と同じ：直前Formationが無ければ何もしない
+        const prevSlideNow = slides[idx - 1];
+        const scenes = getLightingScenes(prev);
+        const finalPrevAreas = resolvePreviousFormationFinalAreasForSlide(prev, targetSlideId);
+        const sourceArea = finalPrevAreas.find((a) => a.id === sourceAreaId);
+        if (!sourceArea) return prev;
+
+        // STEP 5・8：logicalAreaId未設定（旧データ）ならこの場でlazy発行し、前Formation側
+        // （Base Scene・transition Cue、同じArea idを持つもの全て）へbackfillする
+        // （「前の構成から引き継ぐ」と全く同じ既存パターンを再利用）。
+        let sourceLogicalId = getLightingAreaLogicalId(sourceArea);
+        let nextScenes = scenes;
+        let nextTransitionMap = prev.transitionLightingCues || {};
+        if (!sourceLogicalId) {
+          sourceLogicalId = makeId("logical-area");
+          const logicalIdByAreaId = new Map([[sourceArea.id, sourceLogicalId]]);
+          const prevScene = findLightingSceneBySlideId(scenes, prevSlideNow.id);
+          if (prevScene) {
+            const backfilledPrevScene = backfillLogicalAreaIdsInScene(prevScene, logicalIdByAreaId);
+            nextScenes = scenes.map((sc) => (sc.id === backfilledPrevScene.id ? backfilledPrevScene : sc));
+          }
+          const backfilledTransitionCues = backfillLogicalAreaIdsInTransitionCues(
+            getTransitionLightingCues(nextTransitionMap, prevSlideNow.id),
+            logicalIdByAreaId
+          );
+          nextTransitionMap = { ...nextTransitionMap, [prevSlideNow.id]: backfilledTransitionCues };
+        }
+
+        // STEP 8：target Formation Base Scene内に、既に同じlogicalAreaIdを持つ別Areaが
+        // 存在する場合は接続を拒否する（重複logicalAreaId禁止）。
+        const targetScene = findLightingSceneBySlideId(nextScenes, targetSlideId);
+        if (!targetScene) return prev;
+        const hasDuplicate = targetScene.areas.some(
+          (a) => a.id !== targetAreaId && getLightingAreaLogicalId(a) === sourceLogicalId
+        );
+        if (hasDuplicate) {
+          rejected = true;
+          return prev;
+        }
+
+        // STEP 7の7：target Area.logicalAreaIdだけを変更する（他fieldは一切変更しない）。
+        const finalScenes = nextScenes.map((sc) =>
+          sc.id === targetScene.id
+            ? { ...sc, areas: sc.areas.map((a) => (a.id === targetAreaId ? { ...a, logicalAreaId: sourceLogicalId } : a)) }
+            : sc
+        );
+        return { ...prev, lightingScenes: finalScenes, transitionLightingCues: nextTransitionMap };
+      });
+      setLightingAreaConnectionWarning(
+        rejected ? "この照明エリアはすでに別のエリアと接続されています" : null
+      );
     },
-    [commitWork]
+    [commitWork, isEditingNextFormationLightingBase]
   );
+
+  // Cue間・前の状態との接続 v1・STEP7・8・9：選択中Cue内のAreaを、現在Cueより前に実在する
+  // 最後のLighting状態のAreaへ接続する。処理内容はFormation間接続
+  // （connectLightingAreaToPreviousFormationCommit）と同じ7手順（前の状態取得→source
+  // 特定→logicalAreaId取得/lazy発行→backfill→重複チェック→target側だけ変更）だが、
+  // 「前の状態」の取得元がresolvePreviousFormationFinalAreasForSlide()（Formation境界）
+  // ではなくresolvePreviousLightingAreasForCueSelection()（同一Formation内のCue timeline）
+  // である点だけが異なる。Base Scene編集中（activeLightingCueSelectionForEdit===null）は
+  // 対象外（STEP11：Base Sceneでは既存の「前の構成との接続」を使う）。
+  const connectLightingAreaToPreviousCueStateCommit = useCallback(
+    (targetAreaId, sourceAreaId) => {
+      let rejected = false;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const cueSelection = activeLightingCueSelectionForEdit;
+        if (!cueSelection) return prev; // STEP11：Base Sceneでは対象外（UI側でも表示しない二重ガード）
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, targetSlideId);
+        if (!scene) return prev;
+        const keepCues = getLightingSceneCues(scene);
+        const transitionCues = getTransitionLightingCues(prev.transitionLightingCues, targetSlideId);
+        const prevAreas = resolvePreviousLightingAreasForCueSelection(scene, keepCues, transitionCues, cueSelection);
+        const sourceArea = prevAreas.find((a) => a.id === sourceAreaId);
+        if (!sourceArea) return prev;
+
+        // STEP8：logicalAreaId未設定（旧データ）ならこの場でlazy発行し、同一Formation内の
+        // 同じArea idを持つBase Scene・全Cueへbackfillする（既存の
+        // backfillLogicalAreaIdsInScene/backfillLogicalAreaIdsInTransitionCuesをそのまま
+        // 再利用）。
+        let sourceLogicalId = getLightingAreaLogicalId(sourceArea);
+        let workAfterBackfill = prev;
+        if (!sourceLogicalId) {
+          sourceLogicalId = makeId("logical-area");
+          const logicalIdByAreaId = new Map([[sourceArea.id, sourceLogicalId]]);
+          const backfilledScene = backfillLogicalAreaIdsInScene(scene, logicalIdByAreaId);
+          const backfilledTransitionCues = backfillLogicalAreaIdsInTransitionCues(transitionCues, logicalIdByAreaId);
+          workAfterBackfill = {
+            ...prev,
+            lightingScenes: scenes.map((sc) => (sc.id === backfilledScene.id ? backfilledScene : sc)),
+            transitionLightingCues: { ...(prev.transitionLightingCues || {}), [targetSlideId]: backfilledTransitionCues },
+          };
+        }
+
+        // STEP9：現在選択中Cue snapshot内に、既に同じlogicalAreaIdを持つ別Areaが存在する
+        // 場合は接続を拒否する（1つの前状態Areaが同じCue内で複数Areaへ曖昧に枝分かれする
+        // のを防ぐ）。
+        const currentLists = readActiveLightingLists(workAfterBackfill, targetSlideId, cueSelection);
+        if (!currentLists) return prev;
+        const hasDuplicate = currentLists.areas.some(
+          (a) => a.id !== targetAreaId && getLightingAreaLogicalId(a) === sourceLogicalId
+        );
+        if (hasDuplicate) {
+          rejected = true;
+          return prev;
+        }
+
+        // STEP7の7：target Area.logicalAreaIdだけを変更する（x/y/width/height/rotation/
+        // shape/color/intensity/positionMoveCounts・その他fieldには一切触れない）。
+        return applyActiveLightingUpdate(workAfterBackfill, targetSlideId, cueSelection, "area", targetAreaId, {
+          logicalAreaId: sourceLogicalId,
+        });
+      });
+      setLightingAreaConnectionWarning(rejected ? "この照明エリアはすでに別のエリアと接続されています" : null);
+    },
+    [commitWork, isEditingNextFormationLightingBase, activeLightingCueSelectionForEdit]
+  );
+
+  // Lighting Area 後付け接続 v1・STEP 9：接続解除。target Areaへ新しいlogicalAreaIdを発行
+  // するだけ（＝新しい独立Areaとして扱う）。source側（前Formation）は一切変更しない。
+  const disconnectLightingAreaFromPreviousFormationCommit = useCallback(
+    (targetAreaId) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", targetAreaId, () => ({
+          logicalAreaId: makeId("logical-area"),
+        }));
+      });
+      setLightingAreaConnectionWarning(null);
+    },
+    [commitWork, isEditingNextFormationLightingBase, activeLightingCueSelectionForEdit]
+  );
+
+  // Lighting Beam 3D Formation間identity / 前の構成との接続 v1・PART E：
+  // connectLightingAreaToPreviousFormationCommit()と全く同じ9手順（target Formation取得→
+  // 直前Formation取得→resolvePreviousFormationFinalBeamsForSlide()で前Formation最終Beam
+  // 一覧取得→source Beam特定→logicalBeamId取得/lazy発行→前Formation側backfill→target
+  // Formation内重複チェック→target側だけ変更）を、Area→Beam・logicalAreaId→logicalBeamId
+  // へ対称に置き換えただけ。Base Scene編集中（activeLightingCueSelectionForEdit===null、
+  // 「次構成1」含む）でだけ意味を持つ（PART H・I：UI側もBase Scene編集中だけ表示する
+  // 二重ガード）。変更するのはlogicalBeamIdだけ（source/target/sourceWidth/targetWidth/
+  // color/intensity/followPerformerId/positionMoveCounts・その他fieldには一切触れない）。
+  // PART J：followPerformerIdを持つBeam（追尾中）でも接続自体は許可する（接続＝identity、
+  // Move可否＝別概念のため、ここでは追尾解除を行わない）。
+  const connectLightingBeamToPreviousFormationCommit = useCallback(
+    (targetBeamId, sourceBeamId) => {
+      let rejected = false;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const slides = prev.slides;
+        const idx = slides.findIndex((s) => s.id === targetSlideId);
+        if (idx <= 0) return prev; // 直前Formationが無ければ何もしない（Area版と同じガード）
+        const prevSlideNow = slides[idx - 1];
+        const scenes = getLightingScenes(prev);
+        const finalPrevBeams3D = resolvePreviousFormationFinalBeamsForSlide(prev, targetSlideId);
+        const sourceBeam = finalPrevBeams3D.find((b) => b.id === sourceBeamId);
+        if (!sourceBeam) return prev;
+
+        // logicalBeamId未設定（旧データ）ならこの場でlazy発行し、前Formation側
+        // （Base Scene・transition Cue、同じBeam idを持つもの全て）へbackfillする
+        // （Area版connectLightingAreaToPreviousFormationCommit()と全く同じ既存パターンを
+        // 再利用）。
+        let sourceLogicalId = getLightingBeamLogicalId(sourceBeam);
+        let nextScenes = scenes;
+        let nextTransitionMap = prev.transitionLightingCues || {};
+        if (!sourceLogicalId) {
+          sourceLogicalId = makeId("logical-beam");
+          const logicalIdByBeamId = new Map([[sourceBeam.id, sourceLogicalId]]);
+          const prevScene = findLightingSceneBySlideId(scenes, prevSlideNow.id);
+          if (prevScene) {
+            const backfilledPrevScene = backfillLogicalBeamIdsInScene(prevScene, logicalIdByBeamId);
+            nextScenes = scenes.map((sc) => (sc.id === backfilledPrevScene.id ? backfilledPrevScene : sc));
+          }
+          const backfilledTransitionCues = backfillLogicalBeamIdsInTransitionCues(
+            getTransitionLightingCues(nextTransitionMap, prevSlideNow.id),
+            logicalIdByBeamId
+          );
+          nextTransitionMap = { ...nextTransitionMap, [prevSlideNow.id]: backfilledTransitionCues };
+        }
+
+        // target Formation Base Scene内に、既に同じlogicalBeamIdを持つ別Beamが存在する
+        // 場合は接続を拒否する（重複logicalBeamId禁止。PART F）。
+        const targetScene = findLightingSceneBySlideId(nextScenes, targetSlideId);
+        if (!targetScene) return prev;
+        const targetSceneBeams3D = getLightingBeams3D(targetScene);
+        const hasDuplicate = targetSceneBeams3D.some(
+          (b) => b.id !== targetBeamId && getLightingBeamLogicalId(b) === sourceLogicalId
+        );
+        if (hasDuplicate) {
+          rejected = true;
+          return prev;
+        }
+
+        // target Beam.logicalBeamIdだけを変更する（他fieldは一切触れない）。
+        const finalScenes = nextScenes.map((sc) =>
+          sc.id === targetScene.id
+            ? { ...sc, beams3D: getLightingBeams3D(sc).map((b) => (b.id === targetBeamId ? { ...b, logicalBeamId: sourceLogicalId } : b)) }
+            : sc
+        );
+        return { ...prev, lightingScenes: finalScenes, transitionLightingCues: nextTransitionMap };
+      });
+      setLightingBeamConnectionWarning(rejected ? "この照明ビームはすでに別のビームと接続されています" : null);
+    },
+    [commitWork, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Beam 3D Formation間identity / 前の構成との接続 v1・PART G：接続解除。
+  // target Beamへ新しいlogicalBeamIdを発行するだけ（＝新しい独立Beamとして扱う）。
+  // source側（前Formation）は一切変更しない。位置・幅・色・追尾等も一切変更しない。
+  const disconnectLightingBeamFromPreviousFormationCommit = useCallback(
+    (targetBeamId) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", targetBeamId, () => ({
+          logicalBeamId: makeId("logical-beam"),
+        }));
+      });
+      setLightingBeamConnectionWarning(null);
+    },
+    [commitWork, isEditingNextFormationLightingBase, activeLightingCueSelectionForEdit]
+  );
+
+  // Cue間Beam・前の状態との接続 v1・PART F：選択中Cue内のBeamを、現在Cueより前に実在する
+  // 最後のLighting状態のBeamへ接続する。処理内容はconnectLightingAreaToPreviousCueStateCommit()
+  // と全く同じ7手順（前の状態取得→source特定→logicalBeamId取得/lazy発行→backfill→重複
+  // チェック→target側だけ変更）を、Area→Beam・logicalAreaId→logicalBeamIdへ対称に
+  // 置き換えただけ。変更するのはlogicalBeamIdだけ（source/target/sourceWidth/targetWidth/
+  // color/intensity/followPerformerId/positionMoveCounts・その他fieldには一切触れない）。
+  // Base Scene編集中（activeLightingCueSelectionForEdit===null）は対象外（PART I：Base
+  // SceneではFormation間Beam接続は今回未実装のため、このUI自体を表示しない二重ガード）。
+  const connectLightingBeamToPreviousCueStateCommit = useCallback(
+    (targetBeamId, sourceBeamId) => {
+      let rejected = false;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const cueSelection = activeLightingCueSelectionForEdit;
+        if (!cueSelection) return prev; // PART I：Base Sceneでは対象外（UI側でも表示しない二重ガード）
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, targetSlideId);
+        if (!scene) return prev;
+        const keepCues = getLightingSceneCues(scene);
+        const transitionCues = getTransitionLightingCues(prev.transitionLightingCues, targetSlideId);
+        const prevBeams3D = resolvePreviousLightingBeamsForCueSelection(scene, keepCues, transitionCues, cueSelection);
+        const sourceBeam = prevBeams3D.find((b) => b.id === sourceBeamId);
+        if (!sourceBeam) return prev;
+
+        // PART F・5：logicalBeamId未設定（旧データ）ならこの場でlazy発行し、同一Formation内の
+        // 同じBeam idを持つBase Scene・全Cueへbackfillする（既存の
+        // backfillLogicalBeamIdsInScene/backfillLogicalBeamIdsInTransitionCuesをそのまま
+        // 再利用）。
+        let sourceLogicalId = getLightingBeamLogicalId(sourceBeam);
+        let workAfterBackfill = prev;
+        if (!sourceLogicalId) {
+          sourceLogicalId = makeId("logical-beam");
+          const logicalIdByBeamId = new Map([[sourceBeam.id, sourceLogicalId]]);
+          const backfilledScene = backfillLogicalBeamIdsInScene(scene, logicalIdByBeamId);
+          const backfilledTransitionCues = backfillLogicalBeamIdsInTransitionCues(transitionCues, logicalIdByBeamId);
+          workAfterBackfill = {
+            ...prev,
+            lightingScenes: scenes.map((sc) => (sc.id === backfilledScene.id ? backfilledScene : sc)),
+            transitionLightingCues: { ...(prev.transitionLightingCues || {}), [targetSlideId]: backfilledTransitionCues },
+          };
+        }
+
+        // PART H：現在選択中Cue snapshot内に、既に同じlogicalBeamIdを持つ別Beamが存在する
+        // 場合は接続を拒否する（1つの前状態Beamが同じCue内で複数Beamへ曖昧に枝分かれする
+        // のを防ぐ）。
+        const currentLists = readActiveLightingLists(workAfterBackfill, targetSlideId, cueSelection);
+        if (!currentLists) return prev;
+        const hasDuplicate = currentLists.beams3D.some(
+          (b) => b.id !== targetBeamId && getLightingBeamLogicalId(b) === sourceLogicalId
+        );
+        if (hasDuplicate) {
+          rejected = true;
+          return prev;
+        }
+
+        // PART F・7：target Beam.logicalBeamIdだけを変更する（source/target/sourceWidth/
+        // targetWidth/color/intensity/followPerformerId/positionMoveCounts・その他fieldには
+        // 一切触れない）。PART J：followPerformerIdを持つBeam（追尾中）でも接続自体は許可する
+        // （接続＝identity、Move可否＝別概念のため、ここでは追尾解除を行わない）。
+        return applyActiveLightingUpdate(workAfterBackfill, targetSlideId, cueSelection, "beam3d", targetBeamId, {
+          logicalBeamId: sourceLogicalId,
+        });
+      });
+      setLightingBeamConnectionWarning(rejected ? "この照明ビームはすでに別のビームと接続されています" : null);
+    },
+    [commitWork, isEditingNextFormationLightingBase, activeLightingCueSelectionForEdit]
+  );
+
+  // Cue間Beam・前の状態との接続 v1・PART G：接続解除。target Beamへ新しいlogicalBeamIdを
+  // 発行するだけ（＝新しい独立Beamとして扱う）。source側（前の状態のBeam）は一切変更しない。
+  // 位置・幅・色・followPerformerId等も一切変更しない。
+  const disconnectLightingBeamFromPreviousCueStateCommit = useCallback(
+    (targetBeamId) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", targetBeamId, () => ({
+          logicalBeamId: makeId("logical-beam"),
+        }));
+      });
+      setLightingBeamConnectionWarning(null);
+    },
+    [commitWork, isEditingNextFormationLightingBase, activeLightingCueSelectionForEdit]
+  );
+
 
   // ---- Lighting v0・O章：現在のFormation（slides[currentSlideIndex]）にLighting Sceneを
   // 1件作成する。既にSceneが存在する場合は何もしない（Formation 1つにつき0〜1個＝v0の制約）。
@@ -9891,7 +15191,25 @@ export default function App() {
       if (!slide) return prev;
       const scenes = getLightingScenes(prev);
       if (findLightingSceneBySlideId(scenes, slide.id)) return prev; // 既に存在＝何もしない
-      const newScene = { id: makeId("lighting"), slideId: slide.id, enabled: true, note: "" };
+      const newScene = { id: makeId("lighting"), slideId: slide.id, enabled: true, note: "", entryFadeCounts: 0, cues: [] };
+      return { ...prev, lightingScenes: [...scenes, newScene] };
+    });
+  }, [commitWork]);
+
+  // 「次構成1」reference view v1・STEP 10：「次構成1」を選択したが次Formationにまだ
+  // Lighting Sceneが存在しない場合、ユーザーの明示操作（[＋ 照明設定を作成]ボタン）で
+  // 空のSceneだけを作成する。addLightingSceneForCurrentSlide()と全く同じ内容の新規Scene
+  // だが、対象が「現在Formation」ではなく「次Formation」である点だけが異なる（新しい
+  // defaultルールは作らない）。Sceneがないだけで自動的に「引き継ぐ」を実行することは
+  // しない（STEP 10：ユーザーの明示操作を必ず経由する）。
+  const addLightingSceneForNextFormation = useCallback(() => {
+    commitWork((prev) => {
+      const idx = prev.currentSlideIndex;
+      const nextSlide = prev.slides[idx + 1];
+      if (!nextSlide) return prev;
+      const scenes = getLightingScenes(prev);
+      if (findLightingSceneBySlideId(scenes, nextSlide.id)) return prev; // 既に存在＝何もしない
+      const newScene = { id: makeId("lighting"), slideId: nextSlide.id, enabled: true, note: "", entryFadeCounts: 0, cues: [] };
       return { ...prev, lightingScenes: [...scenes, newScene] };
     });
   }, [commitWork]);
@@ -9921,19 +15239,398 @@ export default function App() {
     [commitWork]
   );
 
-  // Sceneメモ（textarea）。F章の方針通り、1文字入力ごとにUndo履歴を作らないよう、
-  // beginEdit（onFocus）〜endEdit（onBlur/Enter）で1回の編集セッション＝1件の履歴にまとめる
-  // 既存のdraft state方式を踏襲する（updateLiveで見た目だけ更新し、commitはしない）。
-  const updateLightingSceneNoteLive = useCallback(
-    (sceneId, note) => {
-      updateWorkLive((prev) => {
-        const scenes = getLightingScenes(prev);
-        const next = scenes.map((sc) => (sc.id === sceneId ? { ...sc, note } : sc));
-        return { ...prev, lightingScenes: next };
-      });
+  // ------------------------------------------------------------------
+  // Lighting Scene単体コピー＆ペースト v1（C〜J章）／コピー元Formation判定 v2（B〜E章）
+  // ------------------------------------------------------------------
+  // アプリ内の一時clipboardとしてuseRefで保持する（H章：OS clipboard・保存不要、
+  // v2・F〜V章：個別Lighting clipboard（Area / Beam v2）。
+  // Scene丸ごとclipboardとは完全に別物として扱う（U章：互いに独立、片方の解除がもう片方へ
+  // 影響しない）。
+  // Lighting要素clipboard統合 v1：単体1個も複数個も同じ形式で保持できるよう一般化した
+  // （単体用／複数用の2つのclipboard形状を持たない）。
+  //   copiedLightingItemRef.current = {
+  //     sourceSlideId,
+  //     sourceSelection,           // コピー時点のselectedLightingCueSelection（null=開始時 / {phase, cueId}）。
+  //                                 // コピー元表示や将来のデバッグ用の付随情報で、作品データには保存しない。
+  //     items: [ { type: "area"|"beam3D", sourceItemId, data } ],  // 1件以上。単体copyもitems.length===1として扱う。
+  //   } | null
+  const copiedLightingItemRef = useRef(null);
+  const [hasCopiedLightingItem, setHasCopiedLightingItem] = useState(false);
+
+  // Area個別コピー（G章）。コピー元Area（同一Formation・同一Area）で再押下したら解除、
+  // それ以外なら上書き（Scene copyと同じtoggleの考え方）。Beamをコピーしていた場合や、
+  // 複数選択をコピーしていた場合も上書きされる（clipboardは常に1個のitems配列だけ＝F章）。
+  // Lighting要素clipboard統合 v1：保存形式をitems配列（1件）へ合わせた以外、判定・挙動は
+  // 変更していない（既存のcurrentLightingAreasからの読み出しもそのまま維持）。
+  const toggleLightingAreaCopy = useCallback(
+    (areaId) => {
+      const sourceSlideId = resolveActiveLightingTargetSlideId({ slides, currentSlideIndex }, isEditingNextFormationLightingBase);
+      if (!sourceSlideId) return;
+      const current = copiedLightingItemRef.current;
+      const isSameSingleSource =
+        !!current &&
+        current.sourceSlideId === sourceSlideId &&
+        current.items.length === 1 &&
+        current.items[0].type === "area" &&
+        current.items[0].sourceItemId === areaId &&
+        isSameLightingCueSelection(current.sourceSelection, activeLightingCueSelectionForEdit);
+      if (isSameSingleSource) {
+        copiedLightingItemRef.current = null;
+        setHasCopiedLightingItem(false);
+        return;
+      }
+      // 個別照明コピー不具合修正 v1：コピー元の取得をcurrentLightingAreas（Base Scene固定）の
+      // 直接参照から、copySelectedLightingItems()と全く同じreadActiveLightingLists()経由へ
+      // 統一する。これにより開始時だけでなく、選択中のkeep Cue / transition Cue snapshot内の
+      // Areaも正しく見つかるようになる（新しいcopy engineは作らない）。
+      const lists = readActiveLightingLists({ lightingScenes, transitionLightingCues }, sourceSlideId, activeLightingCueSelectionForEdit);
+      if (!lists) return;
+      const area = lists.areas.find((a) => a.id === areaId);
+      if (!area) return;
+      copiedLightingItemRef.current = {
+        sourceSlideId,
+        sourceSelection: activeLightingCueSelectionForEdit,
+        items: [{ type: "area", sourceItemId: areaId, data: cloneLightingItemDataByType("area", area) }],
+      };
+      setHasCopiedLightingItem(true);
     },
-    [updateWorkLive]
+    [slides, currentSlideIndex, lightingScenes, transitionLightingCues, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
+
+  // Beam v2個別コピー（H章）。Area側と全く同じtoggleの考え方。source/targetはdeep copyする
+  // （cloneLightingItemDataByType()へ集約、重複実装しない）。
+  const toggleLightingBeam3DCopy = useCallback(
+    (beamId) => {
+      const sourceSlideId = resolveActiveLightingTargetSlideId({ slides, currentSlideIndex }, isEditingNextFormationLightingBase);
+      if (!sourceSlideId) return;
+      const current = copiedLightingItemRef.current;
+      const isSameSingleSource =
+        !!current &&
+        current.sourceSlideId === sourceSlideId &&
+        current.items.length === 1 &&
+        current.items[0].type === "beam3D" &&
+        current.items[0].sourceItemId === beamId &&
+        isSameLightingCueSelection(current.sourceSelection, activeLightingCueSelectionForEdit);
+      if (isSameSingleSource) {
+        copiedLightingItemRef.current = null;
+        setHasCopiedLightingItem(false);
+        return;
+      }
+      // 個別照明コピー不具合修正 v1：Area側と同じく、readActiveLightingLists()経由へ統一する。
+      const lists = readActiveLightingLists({ lightingScenes, transitionLightingCues }, sourceSlideId, activeLightingCueSelectionForEdit);
+      if (!lists) return;
+      const beam = lists.beams3D.find((b) => b.id === beamId);
+      if (!beam) return;
+      copiedLightingItemRef.current = {
+        sourceSlideId,
+        sourceSelection: activeLightingCueSelectionForEdit,
+        items: [{ type: "beam3D", sourceItemId: beamId, data: cloneLightingItemDataByType("beam3D", beam) }],
+      };
+      setHasCopiedLightingItem(true);
+    },
+    [slides, currentSlideIndex, lightingScenes, transitionLightingCues, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting複数選択 v1のselectedLightingItemKeysから、現在編集中のLighting snapshot
+  // （selectedLightingCueSelectionが指す開始時／keep Cue／transition Cue）に含まれる
+  // Area/Beamだけを抽出してclipboardへ保存する（copy時点ではreadActiveLightingLists()を
+  // deleteSelectedLightingItems()と全く同じ考え方で再利用し、開始時/keep/transition別の
+  // 読み出しロジックは作らない）。作品データは一切変更しないため、commitWorkは呼ばない
+  // （＝Undo/Redo対象外。29章の仕様通り）。
+  const copySelectedLightingItems = useCallback(() => {
+    const sourceSlideId = resolveActiveLightingTargetSlideId({ slides, currentSlideIndex }, isEditingNextFormationLightingBase);
+    if (!sourceSlideId || selectedLightingItemKeys.length === 0) return;
+    const lists = readActiveLightingLists({ lightingScenes, transitionLightingCues }, sourceSlideId, activeLightingCueSelectionForEdit);
+    if (!lists) return;
+    const areaIdsToCopy = new Set(selectedLightingItemKeys.filter((k) => k.type === "area").map((k) => k.id));
+    const beamIdsToCopy = new Set(selectedLightingItemKeys.filter((k) => k.type === "beam3d").map((k) => k.id));
+    const items = [
+      ...lists.areas
+        .filter((a) => areaIdsToCopy.has(a.id))
+        .map((a) => ({ type: "area", sourceItemId: a.id, data: cloneLightingItemDataByType("area", a) })),
+      ...lists.beams3D
+        .filter((b) => beamIdsToCopy.has(b.id))
+        .map((b) => ({ type: "beam3D", sourceItemId: b.id, data: cloneLightingItemDataByType("beam3D", b) })),
+    ];
+    if (items.length === 0) return;
+    // 単体copyと完全に同じclipboard形式（items配列）へ統一する。同じ選択集合を再度押した
+    // 場合の「解除」トグルは、集合比較が複雑になるため今回は行わず、常に上書きする
+    // （既存のScene copy等のtoggle方式とは異なる、複数copy専用の簡略仕様）。
+    copiedLightingItemRef.current = { sourceSlideId, sourceSelection: activeLightingCueSelectionForEdit, items };
+    setHasCopiedLightingItem(true);
+  }, [slides, currentSlideIndex, lightingScenes, transitionLightingCues, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase, selectedLightingItemKeys]);
+
+  // 個別clipboardの内容（1件以上）を、現在の「編集対象Lighting snapshot」
+  // （selectedLightingCueSelectionが指す開始時／keep Cue／transition Cue）へ「追加」する
+  // （L・M章：既存要素の置換ではなく追加）。
+  // Lighting要素clipboard統合 v1・重要改善：以前はfindLightingSceneBySlideId()を直接使い
+  // base Sceneへ固定で追加していたが、keep/transition Cue編集中でもそのCueへ正しく貼り
+  // 付けられるよう、readActiveLightingLists()/writeActiveLightingLists()を使う経路へ統一した
+  // （deleteSelectedLightingItems()・duplicateLightingArea()・duplicateLightingBeam3D()と
+  // 同じpattern）。Sceneが存在しない場合は既存のScene新規作成default
+  // （enabled:true, note:"", beams:[], cues:[]）をそのまま維持し、コピーした要素だけを
+  // 持たせる（この場合cueSelectionは当然nullになる＝Cue UIはScene未作成時は表示されない
+  // ため）。全要素へpaste実行前に新しいIDを発行し、貼り付け後の選択に使う（T章）。
+  // O章：貼り付け後もclipboardは解除しない（繰り返し複数Formation/Cueへ貼り付け可能）。
+  // commitWorkはclipboardの件数に関係なく1回だけ（Undo 1回ですべて消え、Redo 1回で復元）。
+  const pasteLightingItemToCurrentSlide = useCallback(() => {
+    const clip = copiedLightingItemRef.current;
+    if (!clip || !Array.isArray(clip.items) || clip.items.length === 0) return;
+    // IDはcommitWorkの外側で先に発行する（既存のduplicateLighting*/単体pasteと同じ方針）。
+    // Lighting Area Formation間logical identity v1・STEP 3：Area個別pasteは「設定・見た目の
+    // 再利用」であり時間的な継続ではないため、Area typeにだけ新しいlogicalAreaIdも
+    // 併せて発行する（Beamにはlogicalの概念自体が今回無いため対象外）。
+    // Cue間Beam・前の状態との接続 v1・PART K：Beam個別copy/pasteも「見た目・設定の再利用」で
+    // あり時間的な継続ではないため、Areaと同様に新しいlogicalBeamIdを併せて発行する
+    // （copy元のlogicalBeamIdは継承しない）。
+    const preparedItems = clip.items.map((item) => ({
+      type: item.type,
+      newId: item.type === "area" ? makeId("lighting-area") : makeId("lighting-beam3d"),
+      newLogicalAreaId: item.type === "area" ? makeId("logical-area") : null,
+      newLogicalBeamId: item.type === "beam3D" ? makeId("logical-beam") : null,
+      data: cloneLightingItemDataByType(item.type, item.data),
+    }));
+    const targetSelection = activeLightingCueSelectionForEdit;
+    commitWork((prev) => {
+      const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+      if (!targetSlideId) return prev;
+      const newAreas = preparedItems
+        .filter((it) => it.type === "area")
+        .map((it) => ({ ...it.data, id: it.newId, logicalAreaId: it.newLogicalAreaId }));
+      const newBeams3D = preparedItems
+        .filter((it) => it.type === "beam3D")
+        .map((it) => ({
+          ...it.data,
+          id: it.newId,
+          logicalBeamId: it.newLogicalBeamId,
+          source: { ...it.data.source },
+          target: { ...it.data.target },
+        }));
+      const scenes = getLightingScenes(prev);
+      const scene = findLightingSceneBySlideId(scenes, targetSlideId);
+      if (!scene) {
+        // 既存の単体paste同様、Scene未作成Formationへは既存のScene新規作成defaultで
+        // Sceneごと作る（新しいdefaultルールは作らない）。
+        const newScene = {
+          id: makeId("lighting"),
+          slideId: targetSlideId,
+          enabled: true,
+          note: "",
+          areas: newAreas,
+          beams: [],
+          beams3D: newBeams3D,
+          cues: [],
+        };
+        return { ...prev, lightingScenes: [...scenes, newScene] };
+      }
+      const lists = readActiveLightingLists(prev, targetSlideId, targetSelection);
+      if (!lists) return prev;
+      const nextAreas = [...lists.areas, ...newAreas];
+      const nextBeams3D = [...lists.beams3D, ...newBeams3D];
+      return writeActiveLightingLists(prev, targetSlideId, targetSelection, nextAreas, nextBeams3D);
+    });
+    // Lighting複数選択 v1：貼り付けた全要素をselectedLightingItemKeysへ設定する。1個だけの
+    // 場合はprimary selection（selectedLightingAreaId/selectedLightingBeam3DId）もその1件へ
+    // 同期し、既存の単一編集UIへ自然に戻す（S章）。2個以上ならprimaryは両方null（T章）。
+    const newKeys = preparedItems.map((it) => ({ type: lightingSelectionTypeFromClipboardType(it.type), id: it.newId }));
+    setSelectedLightingItemKeys(newKeys);
+    if (preparedItems.length === 1) {
+      const only = preparedItems[0];
+      if (only.type === "area") {
+        setSelectedLightingAreaId(only.newId);
+        setSelectedLightingBeam3DId(null);
+      } else {
+        setSelectedLightingBeam3DId(only.newId);
+        setSelectedLightingAreaId(null);
+      }
+    } else {
+      setSelectedLightingAreaId(null);
+      setSelectedLightingBeam3DId(null);
+    }
+  }, [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]);
+
+  // ------------------------------------------------------------------
+  // Lighting状態 clipboard v2：「開始時」の基本Lighting Scene・keep Cue・transition Cueの
+  // 3種類すべての間で、areas/beams3Dだけをコピー／貼り付けできるよう一般化した
+  // （旧v1はCue同士専用だった）。既存のcopiedLightingCueRef（useRef方式）・
+  // hasCopiedLightingCue（再描画用フラグ）はそのまま再利用し、新しいclipboardは追加しない。
+  // ------------------------------------------------------------------
+  // copiedLightingItemRef（Area/Beam単体）とは完全に独立させる
+  // （別のuseRef・別のuseState、互いに解除しない）。
+  // コピー元・貼り付け先の判定は、既存のselectedLightingCueSelectionと全く同じ形
+  // （null＝開始時、{phase, cueId}＝Cue）をsourceSelectionとして保持することで、
+  // 「開始時だけ別の読み書きロジック」を作らずに済ませる。
+  //   copiedLightingCueRef.current = { sourceSlideId, sourceSelection, data: {areas, beams3D} } | null
+  const copiedLightingCueRef = useRef(null);
+  const [hasCopiedLightingCue, setHasCopiedLightingCue] = useState(false);
+
+  // 「照明状態をコピー」：コピー対象は常に「現在選択中のLighting状態」
+  // （selectedLightingCueSelection＝開始時ならnull、Cueなら{phase, cueId}）。既存の
+  // readActiveLightingLists()をそのまま再利用して読み出す（開始時・keep・transitionの
+  // 3種類とも同じ関数・同じ引数形で扱える設計のため、新規の読み出しロジックは作らない）。
+  // 既存のScene/Area/Beam copyと同じtoggleの考え方（コピー元と全く同じ選択で再押下したら
+  // 解除、それ以外なら上書き）。コピー元の同一判定は、開始時同士はsourceSlideId一致、
+  // Cue同士はsourceSlideId＋phase＋cueIdの一致で行う（別Formationの同じCue IDを誤って
+  // 同一視しない）。cloneLightingStateSnapshot()でobject referenceを断ち切る
+  // （Area/BeamのIDは維持＝既存のCue snapshot方針と同じ）。Lighting Sceneが存在しない
+  // 場合はreadActiveLightingLists()がnullを返すため、既存仕様通りコピーしない。
+  // 「次構成1」reference view v1・STEP 13：コピー元は「現在表示しているFormation」ではなく
+  // 「実際に選択中のLighting snapshotが属するslideId」（isEditingNextFormationLightingBase時は
+  // 次Formation）である。表示上のcurrentSlideと実際のコピー元slideIdを混同しないよう、
+  // ここでもresolveActiveLightingTargetSlideId()で明示的に解決する。
+  const toggleLightingCueCopy = useCallback(() => {
+    const sourceSlideId = resolveActiveLightingTargetSlideId({ slides, currentSlideIndex }, isEditingNextFormationLightingBase);
+    if (!sourceSlideId) return;
+    const current = copiedLightingCueRef.current;
+    const isSameSource =
+      !!current &&
+      current.sourceSlideId === sourceSlideId &&
+      (current.sourceSelection === null
+        ? activeLightingCueSelectionForEdit === null
+        : !!activeLightingCueSelectionForEdit &&
+          current.sourceSelection.phase === activeLightingCueSelectionForEdit.phase &&
+          current.sourceSelection.cueId === activeLightingCueSelectionForEdit.cueId);
+    if (isSameSource) {
+      copiedLightingCueRef.current = null;
+      setHasCopiedLightingCue(false);
+      return;
+    }
+    const lists = readActiveLightingLists({ lightingScenes, transitionLightingCues }, sourceSlideId, activeLightingCueSelectionForEdit);
+    if (!lists) return; // Sceneが存在しない、または選択中Cueが見つからない
+    const snapshot = cloneLightingStateSnapshot(lists.areas, lists.beams3D);
+    copiedLightingCueRef.current = { sourceSlideId, sourceSelection: activeLightingCueSelectionForEdit, data: snapshot };
+    setHasCopiedLightingCue(true);
+  }, [slides, currentSlideIndex, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase, lightingScenes, transitionLightingCues]);
+
+  // 「照明状態を貼り付け」：貼り付け先も常に「現在選択中のLighting状態」
+  // （selectedLightingCueSelection）。既存のwriteActiveLightingLists()をそのまま再利用し、
+  // 貼り付け先の（開始時なら基本Sceneのid/slideId/enabled/note/legacy beams/cues、Cueなら
+  // cue.id・cue.count・所属phase）には一切触れず、areas/beams3Dだけを書き換える
+  // （開始時へ貼り付けてもそのFormationのCue配列は変更されない＝writeActiveLightingLists自体が
+  // areas/beams3D以外のfieldを touchしない設計のため）。貼り付けのたびにclipboard内容を
+  // cloneLightingStateSnapshot()で再度deep copyしてから書き込み、複数の貼り付け先へ
+  // 繰り返し貼り付けてもobject referenceを共有しない。貼り付け後もclipboardは解除せず、
+  // selectedLightingCueIdも変更しない。Formation・開始時/keep/transitionを跨いでも
+  // 同じ経路で動作する（readActiveLightingLists/writeActiveLightingLists自体がslideId・
+  // cueSelectionを引数で受け取る設計のため）。
+  //
+  // Lighting Area Formation間logical identity v1・STEP 5：同一Formation内へのpaste
+  // （＝同じLighting要素の別時点の状態）はid・logicalAreaIdともに維持するが、別Formationへの
+  // pasteは「引き継ぐ」ではなく「照明状態の再利用」であるため、Areaのid・logicalAreaIdを
+  // 新規発行する（Beamもidだけ新規発行、logicalBeamIdは今回未導入のため対象外）。
+  // 同一Formationか別Formationかは、コピー元のsourceSlideIdと貼り付け先のslide.idを
+  // commit時点で比較して判定する（配列index等では一切判定しない）。
+  // 「次構成1」reference view v1・STEP 13：貼り付け先も同様にresolveActiveLightingTargetSlideId()
+  // で解決し、「次構成1」選択中は実際にnextSlide.idへ書き込む。
+  const pasteLightingCueToSelected = useCallback(() => {
+    const clip = copiedLightingCueRef.current;
+    if (!clip) return;
+    const targetSelection = activeLightingCueSelectionForEdit;
+    commitWork((prev) => {
+      const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+      if (!targetSlideId) return prev;
+      const isCrossFormation = clip.sourceSlideId !== targetSlideId;
+      const snapshot = isCrossFormation
+        ? remapLightingStateForCrossFormationPaste(clip.data.areas, clip.data.beams3D)
+        : cloneLightingStateSnapshot(clip.data.areas, clip.data.beams3D);
+      return writeActiveLightingLists(prev, targetSlideId, targetSelection, snapshot.areas, snapshot.beams3D);
+    });
+  }, [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]);
+
+  // UI表示用：「今選択している対象（開始時／Cue）が、まさにコピー元そのものか」を判定し、
+  // 「照明状態をコピー」ボタンをコピー済み状態（accent表示）にする（既存のArea/Beam
+  // copyのisSelectedAreaCopySource等と全く同じ考え方）。
+  const isSelectedLightingCueCopySource =
+    hasCopiedLightingCue &&
+    !!copiedLightingCueRef.current &&
+    copiedLightingCueRef.current.sourceSlideId === activeLightingDisplaySlideId &&
+    (copiedLightingCueRef.current.sourceSelection === null
+      ? activeLightingCueSelectionForEdit === null
+      : !!activeLightingCueSelectionForEdit &&
+        copiedLightingCueRef.current.sourceSelection.phase === activeLightingCueSelectionForEdit.phase &&
+        copiedLightingCueRef.current.sourceSelection.cueId === activeLightingCueSelectionForEdit.cueId);
+
+  // Lighting要素clipboard統合 v1：clipboardがitems配列形式になったため、「今choseeているArea/
+  // Beamがコピー元そのものか」の判定は、items.length===1（＝単体copy相当の状態）のときだけ
+  // 意味を持つ（複数コピー時は特定の1件をコピー元として強調表示しない＝22章）。
+  const isSelectedAreaCopySource =
+    hasCopiedLightingItem &&
+    !!copiedLightingItemRef.current &&
+    copiedLightingItemRef.current.sourceSlideId === activeLightingDisplaySlideId &&
+    copiedLightingItemRef.current.items.length === 1 &&
+    copiedLightingItemRef.current.items[0].type === "area" &&
+    !!selectedLightingArea &&
+    copiedLightingItemRef.current.items[0].sourceItemId === selectedLightingArea.id &&
+    // 個別照明コピー不具合修正 v1・STEP 10：同一Formation内でCue snapshot生成時にID維持される
+    // 設計のため、sourceSelectionも一致する場合だけコピー元として表示する。
+    isSameLightingCueSelection(copiedLightingItemRef.current.sourceSelection, activeLightingCueSelectionForEdit);
+  const isSelectedBeam3DCopySource =
+    hasCopiedLightingItem &&
+    !!copiedLightingItemRef.current &&
+    copiedLightingItemRef.current.sourceSlideId === activeLightingDisplaySlideId &&
+    copiedLightingItemRef.current.items.length === 1 &&
+    copiedLightingItemRef.current.items[0].type === "beam3D" &&
+    !!selectedLightingBeam3D &&
+    copiedLightingItemRef.current.items[0].sourceItemId === selectedLightingBeam3D.id &&
+    isSameLightingCueSelection(copiedLightingItemRef.current.sourceSelection, activeLightingCueSelectionForEdit);
+
+  // Lighting要素clipboard複数copyフィードバック v1：「今選択しているLighting集合が、まさに
+  // clipboardのコピー元集合そのものか」を判定する。単体用のisSelectedAreaCopySource/
+  // isSelectedBeam3DCopySourceとは別に、複数選択（selectedLightingItemKeys）向けの判定として
+  // 用意する（isSelectedAreaCopySource等は既存通りitems.length===1の場合しか真にならないため、
+  // 複数選択時のフィードバックにはそのまま使えない）。
+  // 比較条件：同じslide・同じLighting snapshot（開始時/keep Cue/transition Cueの選択が一致）・
+  // 同じ選択個数・同じArea/Beam集合（順不同）。汎用deepEqualは追加せず、"type:id"文字列の
+  // Setで集合一致だけを見る最小限の比較にする。type変換は直前に追加した既存adapter
+  // （lightingSelectionTypeFromClipboardType）をそのまま再利用し、別の変換ロジックは増やさない。
+  const isSelectedLightingItemsCopySource =
+    hasCopiedLightingItem &&
+    !!copiedLightingItemRef.current &&
+    copiedLightingItemRef.current.sourceSlideId === activeLightingDisplaySlideId &&
+    isSameLightingCueSelection(copiedLightingItemRef.current.sourceSelection, activeLightingCueSelectionForEdit) &&
+    copiedLightingItemRef.current.items.length === selectedLightingItemKeys.length &&
+    copiedLightingItemRef.current.items.length > 0 &&
+    (() => {
+      const clipKeySet = new Set(
+        copiedLightingItemRef.current.items.map(
+          (it) => `${lightingSelectionTypeFromClipboardType(it.type)}:${it.sourceItemId}`
+        )
+      );
+      return selectedLightingItemKeys.every((k) => clipKeySet.has(`${k.type}:${k.id}`));
+    })();
+
+  // 照明ビーム操作性整理 v2・複数対応：出演者複数選択（selectedIds）のうち、現在の構成で
+  // stage上にいる（area==="stage"またはarea==null）出演者だけを対象にする。単体選択時に
+  // 使っていた「stage上か」の判定条件をそのまま複数選択へ一般化しただけで、新しいstage内外
+  // ルールは作らない（18章）。stage外の出演者は個別に対象から除外する（＝その人だけBeamを
+  // 作らない。1人選択でその1人がstage外だった場合の既存挙動＝ボタン全体disabledと、結果的に
+  // 同じ「0本生成」になる）。placementsは「現在構成の正式なplacements」（currentSlide.
+  // placements）を使い、アニメーション中の一時座標は参照しない（既存方針を踏襲）。
+  // このフィルタ結果（selectedPerformerIdsForSpotlight）を、ボタンのdisabled判定・
+  // 表示件数・実際にcommitWorkへ渡すidsのすべてで共通して使うことで、表示件数と実際に
+  // 生成されるBeam本数が食い違わないようにする。
+  const selectedPerformerIdsForSpotlight = selectedIds.filter((id) => {
+    const pos = placements[id];
+    return !!pos && (pos.area === "stage" || pos.area == null);
+  });
+  const canLightSelectedPerformersWithBeam3D = selectedPerformerIdsForSpotlight.length > 0 && !isTransitionActive;
+
+  // K章：個別貼り付けボタンのlabel／disabled判定。type別labelの方が分かりやすいというご要望のため、
+  // clipboardの中身（Area/Beam v2/空）に応じて文言を切り替える。
+  // Lighting要素clipboard統合 v1：clipboardがitems配列（1件以上）になったため、件数に応じて
+  // 文言を切り替える（Area1個／Beam1本＝従来通りtype別、2個以上＝「照明N個を貼り付け」。
+  // 複数時はtype内訳を文言へ入れない＝18章）。
+  const copiedLightingItemCount = hasCopiedLightingItem && copiedLightingItemRef.current ? copiedLightingItemRef.current.items.length : 0;
+  const copiedLightingSingleItemType =
+    copiedLightingItemCount === 1 ? copiedLightingItemRef.current.items[0].type : null;
+  const pasteLightingItemLabel =
+    copiedLightingItemCount === 0
+      ? "個別照明を貼り付け"
+      : copiedLightingItemCount === 1
+      ? copiedLightingSingleItemType === "area"
+        ? "照明エリアを貼り付け"
+        : "照明ビームを貼り付け"
+      : `照明${copiedLightingItemCount}個を貼り付け`;
 
   // ------------------------------------------------------------------
   // Lighting Area v1・G〜S章：現在のFormationのSceneに対するArea追加・削除・編集
@@ -9941,78 +15638,155 @@ export default function App() {
   // G章：現在のFormationにSceneが無い場合は何もしない（Scene→Areaという親子関係を維持し、
   // Areaだけが宙に浮いた状態を作らない）。新規Areaはcreate DefaultLightingArea()で
   // 「舞台中央付近・stage sizeに応じてclamp済み」のdefault値を持つ（H章）。
+  // Lighting Cue STEP 2C・H・N章：Cue選択中は選択中Cueのareasだけへ追加し、基本Sceneには
+  // 一切影響させない。Sceneが無ければ従来通り追加しない（G章）。
+  // Lighting Cue STEP 2D：readActiveLightingLists/writeActiveLightingListsを使い、
+  // transition Cue / keep Cue / 基本Sceneの3種類を同じ形で扱う（STEP 2Cのkeep Cue専用の
+  // 素朴な分岐から、この共通helper経由へ置き換えた＝T章）。
   const addLightingAreaForCurrentScene = useCallback(() => {
     commitWork((prev) => {
-      const slide = prev.slides[prev.currentSlideIndex];
-      if (!slide) return prev;
-      const scenes = getLightingScenes(prev);
-      const scene = findLightingSceneBySlideId(scenes, slide.id);
-      if (!scene) return prev; // Sceneが無ければ追加しない（G章）
+      const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+      if (!targetSlideId) return prev;
+      const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+      if (!lists) return prev; // Sceneが無い、または選択中Cueが既に存在しない（G章）
       const newArea = createDefaultLightingArea(prev.stage);
-      const nextAreas = [...getLightingAreas(scene), newArea];
-      const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, areas: nextAreas } : sc));
-      return { ...prev, lightingScenes: nextScenes };
+      return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, [...lists.areas, newArea], lists.beams3D);
     });
-  }, [commitWork]);
+  }, [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]);
 
   // Area削除（U章：Scene削除・Formation削除時の孤児処理は既存のScene/Slide削除フローに
-  // 委ねるため、ここでは「単体Area削除」だけを扱う）。
+  // 委ねるため、ここでは「単体Area削除」だけを扱う）。Lighting Cue STEP 2D・P章：Cue選択中は
+  // そのCue snapshot（keep/transitionどちらでも）だけから削除し、基本Sceneには影響させない。
   const deleteLightingArea = useCallback(
     (areaId) => {
       commitWork((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
-        const scenes = getLightingScenes(prev);
-        const scene = findLightingSceneBySlideId(scenes, slide.id);
-        if (!scene) return prev;
-        const nextAreas = getLightingAreas(scene).filter((a) => a.id !== areaId);
-        if (nextAreas.length === getLightingAreas(scene).length) return prev;
-        const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, areas: nextAreas } : sc));
-        return { ...prev, lightingScenes: nextScenes };
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+        if (!lists) return prev;
+        const nextAreas = lists.areas.filter((a) => a.id !== areaId);
+        if (nextAreas.length === lists.areas.length) return prev;
+        return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, nextAreas, lists.beams3D);
       });
     },
-    [commitWork]
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting複数選択 v1：選択中のArea/Beamをまとめて1回のcommitWorkで削除する。既存の
+  // deleteLightingArea/deleteLightingBeam3Dと同じ「readActiveLightingLists()で今の編集対象
+  // （開始時/keep Cue/transition Cueのいずれか＝selectedLightingCueSelection）を読み出し、
+  // filterしてwriteActiveLightingLists()で書き戻す」という既存思想をそのまま使い、
+  // 開始時/keep/transitionで別々の削除ロジックは作らない。他Cueや基本Sceneに同じIDの
+  // 要素があっても、readActiveLightingLists/writeActiveLightingLists自体が現在の編集対象
+  // だけを見る設計のため、そちらを誤って削除することはない。
+  const deleteSelectedLightingItems = useCallback(() => {
+    if (selectedLightingItemKeys.length === 0) return;
+    const areaIdsToDelete = new Set(selectedLightingItemKeys.filter((k) => k.type === "area").map((k) => k.id));
+    const beamIdsToDelete = new Set(selectedLightingItemKeys.filter((k) => k.type === "beam3d").map((k) => k.id));
+    commitWork((prev) => {
+      const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+      if (!targetSlideId) return prev;
+      const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+      if (!lists) return prev;
+      const nextAreas = lists.areas.filter((a) => !areaIdsToDelete.has(a.id));
+      const nextBeams3D = lists.beams3D.filter((b) => !beamIdsToDelete.has(b.id));
+      if (nextAreas.length === lists.areas.length && nextBeams3D.length === lists.beams3D.length) return prev;
+      return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, nextAreas, nextBeams3D);
+    });
+    // 削除後は選択状態を解除する（既存のselectedLightingAreaId/selectedLightingBeam3DIdの
+    // クリーンアップuseEffectにも依存せず、ここで明示的に即座にクリアする）。
+    setSelectedLightingItemKeys([]);
+    setSelectedLightingAreaId(null);
+    setSelectedLightingBeam3DId(null);
+  }, [commitWork, selectedLightingItemKeys, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]);
+
+  // Lighting Area複製 v1・C章：選択中Areaを同一Formation内で複製する（clipboardは使わない、
+  // Area単体のcopy/pasteとは別物。E章：新しいAreaIdはmakeId()で発行、元と同じIdは使わない）。
+  // shape/x/y/width/height/color/intensity等は{...source}のスプレッドでそのまま保持されるため、
+  // legacy rect fallback等の互換処理には一切触れない（そもそもshapeの値を解釈・正規化せず
+  // 生データのままコピーするため）。複製後は新Areaを自動選択する（F章）。
+  // Lighting Cue STEP 2D・Q章：Cue選択中はそのCue snapshot内だけで複製する。
+  const duplicateLightingArea = useCallback(
+    (areaId) => {
+      const newAreaId = makeId("lighting-area");
+      // Lighting Area Formation間logical identity v1・STEP 3：Area複製は複製元と
+      // logicalAreaIdを共有しない（新規発行）。同じlogicalAreaIdを2つのAreaが持つと、
+      // 将来のBoundary Move matchingで意図しない重複対応付けが起きる危険があるため。
+      const newLogicalAreaId = makeId("logical-area");
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+        if (!lists) return prev;
+        const sourceArea = lists.areas.find((a) => a.id === areaId);
+        if (!sourceArea) return prev;
+        const newArea = { ...sourceArea, id: newAreaId, logicalAreaId: newLogicalAreaId };
+        return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, [...lists.areas, newArea], lists.beams3D);
+      });
+      setSelectedLightingAreaId(newAreaId);
+      setSelectedLightingItemKeys([{ type: "area", id: newAreaId }]);
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
   // shape / color / intensity：ボタン選択のみのUIのため即1件のcommit。
+  // Lighting Cue STEP 2D・H・J・T章：applyActiveLightingUpdate()経由で、選択中Cueの種類
+  // （keep/transition）または基本Sceneのいずれかを更新する。
   const setLightingAreaShapeCommit = useCallback(
     (areaId, shape) => {
       if (!LIGHTING_AREA_SHAPES.includes(shape)) return;
       commitWork((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
         // I章：circleの場合はwidth/heightを同じ値に揃える（既存widthを両軸へコピー）。
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, (a) =>
           shape === "circle" ? { shape, height: a.width } : { shape }
         );
-        return { ...prev, lightingScenes: nextScenes };
       });
     },
-    [commitWork]
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
   const setLightingAreaColorCommit = useCallback(
     (areaId, colorKey) => {
       if (!LIGHTING_AREA_COLOR_KEYS.includes(colorKey)) return;
       commitWork((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { color: colorKey });
-        return { ...prev, lightingScenes: nextScenes };
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, { color: colorKey });
       });
     },
-    [commitWork]
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
   const setLightingAreaIntensityCommit = useCallback(
     (areaId, intensity) => {
       const clamped = clamp(Number(intensity), 0, 1);
       commitWork((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { intensity: clamped });
-        return { ...prev, lightingScenes: nextScenes };
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, { intensity: clamped });
       });
     },
-    [commitWork]
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Area 回転 v1・11〜14章：ellipse専用の回転編集（slider・数値入力どちらからも
+  // 呼ばれる共通commit）。既存のsetLightingAreaColorCommit/IntensityCommitと全く同じ
+  // 「commitWork→applyActiveLightingUpdate」の経路をそのまま再利用し、専用のUndo/Redoは
+  // 作らない。UIからの入力値は0〜359へ正規化する（360→0, 450→90, -45→315のようなmodulo
+  // 正規化。過剰なvalidationは追加しない＝13章）。circleへ変更してもrotation値自体は
+  // 消去しない（データ破壊よりデータ保持を優先＝6章）。
+  const setLightingAreaRotationCommit = useCallback(
+    (areaId, rotation) => {
+      const n = Number(rotation);
+      if (!Number.isFinite(n)) return;
+      const normalized = ((Math.round(n) % 360) + 360) % 360;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, { rotation: normalized });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
   // width / height（サイドバーの数値/＋−操作。P章：v1ではドラッグリサイズは実装しない）。
@@ -10021,15 +15795,64 @@ export default function App() {
     (areaId, dimension, value) => {
       const clamped = clamp(Number(value), LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE);
       commitWork((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
-          a.shape === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, (a) =>
+          normalizeLightingAreaShape(a.shape) === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
         );
-        return { ...prev, lightingScenes: nextScenes };
       });
     },
-    [commitWork]
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Area Move v1・STEP 4・5・6・20：選択中Areaのpositionmovecountsだけを変更する
+  // commit handler。既存のsetLightingAreaColorCommit/IntensityCommitと全く同じ
+  // 「commitWork→applyActiveLightingUpdate」経路（Undo1回・Redo1回＝STEP 20）をそのまま
+  // 再利用する。0.5カウント精度対応 v1のsnapCountToHalf()を再利用し、新しい0.5丸めhelperは
+  // 作らない（STEP 6）。
+  // Lighting Area Boundary Move v1・STEP 6B：以前は「開始時」（selectedLightingCueSelection
+  // ===null）を対象外にしていたが、境界Move（PART B・positionMoveMode==="custom"）は
+  // Base Scene Area自身のpositionMoveCountsを使うため、その制限を撤廃した。cueSelectionが
+  // nullの場合はapplyActiveLightingUpdate()が自然にBase Sceneへ書き込む（既存の他のArea
+  // 設定commit handler、例：setLightingAreaColorCommit等と同じ経路）。Cue選択中の通常Move
+  // （PART A・既存Lighting Area Move v1）とBase Scene編集中の境界Move（PART B）は、UI側の
+  // 表示条件（selectedLightingCueSelectionの有無・positionMoveMode==="custom"）で使い分ける
+  // だけで、このhandler自体は経路を1本のまま共有する（新しい別のcommit経路を作らない）。
+  // 「次構成1」reference view v1・STEP 7：isEditingNextFormationLightingBase時は
+  // targetSlideIdが次Formationになり、activeLightingCueSelectionForEditは常にnull
+  // （＝次Formation Base Scene）になるため、この既存経路をそのまま流用するだけでよい
+  // （新しい別のcommit経路は作らない）。
+  const setLightingAreaPositionMoveCountsCommit = useCallback(
+    (areaId, moveCounts) => {
+      const n = Number(moveCounts);
+      const safeMoveCounts = Number.isFinite(n) ? Math.max(0, snapCountToHalf(n)) : 0;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, {
+          positionMoveCounts: safeMoveCounts,
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Area Boundary Move v1・STEP 4B・18：選択中Area（Base Scene編集中のみ想定）の
+  // positionMoveModeだけを変更するcommit handler。既存のsetLightingAreaPositionMoveCountsCommit
+  // と全く同じ「commitWork→applyActiveLightingUpdate」経路（Undo1回・Redo1回）を再利用する。
+  // 不正な値（LIGHTING_AREA_POSITION_MOVE_MODESに無い値）は無視して何もしない。
+  const setLightingAreaPositionMoveModeCommit = useCallback(
+    (areaId, mode) => {
+      if (!LIGHTING_AREA_POSITION_MOVE_MODES.includes(mode)) return;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, {
+          positionMoveMode: mode,
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
   // Area本体のドラッグ移動（O章）。出演者drag（dragGroup/updateSlidePlacementsLive）と同じ
@@ -10041,13 +15864,12 @@ export default function App() {
   const updateLightingAreaPositionLive = useCallback(
     (areaId, x, y) => {
       updateWorkLive((prev) => {
-        const slide = prev.slides[prev.currentSlideIndex];
-        if (!slide) return prev;
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, { x, y });
-        return { ...prev, lightingScenes: nextScenes };
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, { x, y });
       });
     },
-    [updateWorkLive]
+    [updateWorkLive, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
   // Area resize v1・K・N章：リサイズハンドルのドラッグ中に呼ばれるlive版。position dragの
@@ -10061,15 +15883,729 @@ export default function App() {
     (areaId, dimension, value) => {
       const clamped = clamp(Number(value), LIGHTING_AREA_MIN_SIZE, LIGHTING_AREA_MAX_SIZE);
       updateWorkLive((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, (a) =>
+          normalizeLightingAreaShape(a.shape) === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
+        );
+      });
+    },
+    [updateWorkLive, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // ------------------------------------------------------------------
+  // Lighting Beam v2・正式実装 STEP1・X〜Y章：現在のFormationのSceneに対する
+  // 正式3D Beam追加・削除・編集
+  // ------------------------------------------------------------------
+  // X章：Sceneが存在する場合のみ動作（Area・Beam v1と同じScene→Beamという親子関係）。
+  // Lighting Cue STEP 2C・H・O章：Cue選択中は選択中Cueのbeams3Dだけへ追加する。
+  // Lighting Cue STEP 2D：readActiveLightingLists/writeActiveLightingListsを使い、
+  // transition Cue / keep Cue / 基本Sceneの3種類を同じ形で扱う（Area側と同じ考え方＝T章）。
+  const addLightingBeam3DForCurrentScene = useCallback(() => {
+    commitWork((prev) => {
+      const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+      if (!targetSlideId) return prev;
+      const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+      if (!lists) return prev; // Sceneが無ければ追加しない
+      const newBeam3D = createDefaultLightingBeam3D(prev.stage);
+      return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, lists.areas, [...lists.beams3D, newBeam3D]);
+    });
+  }, [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]);
+
+  // X章：選択中のBeam v2のみ削除。他のBeam v2・Area・Beam v1には一切影響しない
+  // （updateLightingBeam3DInScenesと同じくbeams3D配列だけを対象にしているため）。
+  // Lighting Cue STEP 2D・P章：Cue選択中はそのCue snapshot（keep/transitionどちらでも）
+  // だけから削除する。
+  const deleteLightingBeam3D = useCallback(
+    (beamId) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+        if (!lists) return prev;
+        const nextBeams3D = lists.beams3D.filter((b) => b.id !== beamId);
+        if (nextBeams3D.length === lists.beams3D.length) return prev;
+        return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, lists.areas, nextBeams3D);
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Beam v2複製 v1・D章：選択中Beamを同一Formation内で複製する（clipboardは
+  // 使わない、Beam単体のcopy/pasteとは別物）。source/targetは必ず新しいオブジェクトとして
+  // deep copyし、複製先の参照共有を防ぐ（Formation複製のcloneLightingSceneContentForSlideと
+  // 同じ考え方）。sourceWidth/targetWidthは{...sourceBeam}のスプレッドでそのまま保持されるため、
+  // sourceWidth=0も含め既存の`??`ベースのfallbackロジックには一切触れない。複製後は
+  // 新Beamを自動選択する（F章）。Lighting Cue STEP 2D・Q章：Cue選択中はそのCue snapshot内
+  // だけで複製する。
+  const duplicateLightingBeam3D = useCallback(
+    (beamId) => {
+      const newBeamId = makeId("lighting-beam3d");
+      // Cue間Beam・前の状態との接続 v1・PART A：Beam複製はArea複製と同じく、複製元と
+      // logicalBeamIdを共有しない（新規発行）。同じlogicalBeamIdを2つのBeamが持つと、
+      // 「前の状態との接続」matchingで意図しない重複対応付けが起きる危険があるため。
+      const newLogicalBeamId = makeId("logical-beam");
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const lists = readActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit);
+        if (!lists) return prev;
+        const sourceBeam = lists.beams3D.find((b) => b.id === beamId);
+        if (!sourceBeam) return prev;
+        const newBeam = {
+          ...sourceBeam,
+          id: newBeamId,
+          logicalBeamId: newLogicalBeamId,
+          source: { ...sourceBeam.source },
+          target: { ...sourceBeam.target },
+        };
+        return writeActiveLightingLists(prev, targetSlideId, activeLightingCueSelectionForEdit, lists.areas, [...lists.beams3D, newBeam]);
+      });
+      setSelectedLightingBeam3DId(newBeamId);
+      setSelectedLightingItemKeys([{ type: "beam3d", id: newBeamId }]);
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // color / intensity：ボタン選択のみのUIのため即1件のcommit（Area・Beam v1と同じ方式）。
+  // Lighting Cue STEP 2D・H・K・T章：applyActiveLightingUpdate()経由で編集対象を切替。
+  const setLightingBeam3DColorCommit = useCallback(
+    (beamId, colorKey) => {
+      if (!LIGHTING_AREA_COLOR_KEYS.includes(colorKey)) return;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, { color: colorKey });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+  const setLightingBeam3DIntensityCommit = useCallback(
+    (beamId, intensity) => {
+      const clamped = clamp(Number(intensity), 0, 1);
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, { intensity: clamped });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Beam 3D 追尾 v1・5〜7・12章：追尾対象のON/OFF・切替。既存のcolor/intensity
+  // commitと全く同じcommitWork→applyActiveLightingUpdate経路を再利用し、専用のUndo/Redoは
+  // 作らない。performerId===""（＝UIの「追尾しない」選択）の場合はfollowPerformerIdをnullへ
+  // 戻し、保存済みtarget座標を使う固定Beamへ戻る（12章）。保存する値は必ずperformer.idの
+  // 文字列のみで、名前・番号文字列は保存しない（6章）。
+  const setLightingBeam3DFollowPerformerCommit = useCallback(
+    (beamId, performerId) => {
+      const normalized = performerId ? performerId : null;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, {
+          followPerformerId: normalized,
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // sourceWidth / targetWidth（S章）：sourceWidthは0を許可（0以上）、targetWidthは
+  // 0以下にならないようclamp（E章：sourceWidthだけ最小値を0にする）。
+  const setLightingBeam3DSourceWidthCommit = useCallback(
+    (beamId, value) => {
+      const clamped = clamp(Number(value), LIGHTING_BEAM_3D_MIN_SOURCE_WIDTH, LIGHTING_BEAM_3D_MAX_WIDTH);
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, { sourceWidth: clamped });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+  const setLightingBeam3DTargetWidthCommit = useCallback(
+    (beamId, value) => {
+      const clamped = clamp(Number(value), LIGHTING_BEAM_3D_MIN_WIDTH, LIGHTING_BEAM_3D_MAX_WIDTH);
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, { targetWidth: clamped });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // source.z（高さ、P章）：数値入力のみ（平面図dragでは変更しない）。0〜LIGHTING_BEAM_3D_MAX_Zへ
+  // clamp。source全体を丸ごと置き換えず、既存のx/yは維持したままzだけ更新する。
+  const setLightingBeam3DSourceZCommit = useCallback(
+    (beamId, z) => {
+      const clamped = clamp(Number(z), LIGHTING_BEAM_3D_MIN_Z, LIGHTING_BEAM_3D_MAX_Z);
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => ({
+          source: { ...b.source, z: clamped },
+        }));
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // source.x/y・target.x/yのサイドバー数値入力用commit（N・O章）。stage範囲へclampする。
+  const setLightingBeam3DSourcePositionCommit = useCallback(
+    (beamId, axis, value) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const halfW = prev.stage.width / 2;
+        const clamped = axis === "x" ? clamp(Number(value), -halfW, halfW) : clamp(Number(value), 0, prev.stage.depth);
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => ({
+          source: { ...b.source, [axis]: clamped },
+        }));
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+  const setLightingBeam3DTargetPositionCommit = useCallback(
+    (beamId, axis, value) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        const halfW = prev.stage.width / 2;
+        const clamped = axis === "x" ? clamp(Number(value), -halfW, halfW) : clamp(Number(value), 0, prev.stage.depth);
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => ({
+          target: { ...b.target, [axis]: clamped },
+        }));
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Beam 反転 v1.1・STEP1〜4：選択中Beamのsource⇄targetだけを入れ替える。
+  // sourceWidth／targetWidthは交換しない（v1の不具合修正：STEP2）。
+  //   sourceWidth ＝ 発光元側（根元）の幅
+  //   targetWidth ＝ 照射先側（先端）の幅
+  // という「役割としての意味」を常に維持することで、getLightingBeam3DScreenSlicePolygon()の
+  // 既存補間ロジック（sourceWidthをt=0側、targetWidthをt=1側として使う、無変更）が
+  // 「反転後は根元(source)が細いまま新しい発光元位置（元targetの座標）へ、先端(target)が
+  // 太いまま新しい照射先位置（元sourceの座標）へ」という正しい幾何形状を自然に生成する。
+  // 既存のsetLightingBeam3DXxxCommit群と全く同じ「commitWork→applyActiveLightingUpdate」
+  // 経路をそのまま再利用し、新しいcommit経路は作らない（STEP7）。id・color・intensity・
+  // その他metadataには一切触れない（STEP4）。
+  // STEP4：追尾中（followPerformerId設定済み）のBeamは反転すると意味が曖昧になるため、
+  // 安全側でno-op（空patchを返す＝stateは一切変化しない）とする。UI側でもボタンをdisabled
+  // にする（二重ガード）。
+  // STEP3：source/targetの座標そのものはelseなくswapするため、旧Projectでwidthが
+  // undefinedであっても、この関数はwidthに一切触れないためfallback処理自体が不要になった
+  // （widthのfallbackは既存のrenderer側・commit側の`??`ベース処理にすべて任せる。ここで
+  // 新しいfallback/migrationは行わない）。
+  const flipLightingBeam3DDirectionCommit = useCallback(
+    (beamId) => {
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => {
+          if (b.followPerformerId) return {}; // STEP4：追尾中は反転禁止（安全側no-op）
+          return {
+            source: { ...b.target },
+            target: { ...b.source },
+          };
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Cue間Beam Move v1・STEP 14：選択中Beamのpositionmovecountsだけを変更するcommit
+  // handler。既存のsetLightingAreaPositionMoveCountsCommit・setLightingBeam3DXxxCommit群と
+  // 全く同じ「commitWork→resolveActiveLightingTargetSlideId→applyActiveLightingUpdate」
+  // 経路をそのまま再利用し、専用のUndo/Redoは作らない。0.5カウント精度対応 v1の
+  // snapCountToHalf()を再利用し、新しい0.5丸めhelperは作らない。STEP11：追尾中Beamは
+  // handler側でも安全側にno-opにする（二重ガード。UI側でも欄自体をdisabledにする）。
+  const setLightingBeam3DPositionMoveCountsCommit = useCallback(
+    (beamId, moveCounts) => {
+      const n = Number(moveCounts);
+      const safeMoveCounts = Number.isFinite(n) ? Math.max(0, snapCountToHalf(n)) : 0;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => {
+          if (b.followPerformerId) return {}; // STEP11：追尾中は安全側no-op
+          return { positionMoveCounts: safeMoveCounts };
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // Lighting Beam 3D Formation間Move v1・PART B・P：Area版setLightingAreaPositionMoveModeCommit()
+  // と全く同じ「commitWork→applyActiveLightingUpdate」経路をBeamへ対称に追加した。不正な値
+  // （LIGHTING_AREA_POSITION_MOVE_MODESに無い値）は無視して何もしない。PART H：追尾中Beam
+  // （followPerformerId有り）は安全側no-opにする（Move自体が対象外のため、modeを設定しても
+  // 意味を持たない。二重ガードとしてUI側でもdisabled相当の表示にする）。
+  const setLightingBeam3DPositionMoveModeCommit = useCallback(
+    (beamId, mode) => {
+      if (!LIGHTING_AREA_POSITION_MOVE_MODES.includes(mode)) return;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => {
+          if (b.followPerformerId) return {}; // PART H：追尾中は安全側no-op
+          return { positionMoveMode: mode };
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // 照明ビーム操作性整理 v1・B・C・D章：「選択中の出演者を照らす」＝既存Beamのtargetだけを
+  // 動かす操作ではなく、選択中出演者の真上から真下へ落ちる新しい照明ビームを1本自動追加する
+  // 操作へ変更した。
+  //   ・source/target のx/yは、選択中出演者の「現在の構成における正式なplacement」
+  //     （commitWork内のprevから読み直す。アニメーション中の一時座標は使わない＝旧実装と
+  //     同じ方針）をそのまま使う。
+  //   ・source.z は20固定（D章）、target.zは0固定（既存のtarget更新関数と同じ）。
+  //   ・color・intensity・sourceWidth・targetWidthは、既存のcreateDefaultLightingBeam3D()
+  //     が返すdefault値をそのまま流用する（新しいSpotlight専用schemaは作らない＝D・O章）。
+  //   ・Scene自体の存在は、このボタンが表示されている時点でcurrentLightingSceneが必ず
+  //     存在することが呼び出し元のJSX構造で保証されているため、addLightingBeam3DForCurrentScene
+  //     と同様に「Sceneが無ければ何もしない」ガードだけ残す。
+  // 新Beamのidは、duplicateLightingBeam3Dと同じパターンでcommitWorkの外側で先に発行し、
+  // commit後にsetSelectedLightingBeam3DIdで自動選択する（G章）。
+  // Lighting Cue STEP 2D・O章：Cue選択中はそのCue snapshotへBeamを追加する。
+  //
+  // 複数出演者スポット v1・8〜13章：単体専用だった実装を「performerIdの配列を受け取り、
+  // 1人につきBeam1本をループで生成し、1回のcommitWorkでまとめて書き込む」形へ一般化した。
+  // 1人選択（配列長1）の場合も全く同じ経路を通るため、単体用と複数用で別ロジックを持たない
+  // （8章：既存単体handlerの内部helper化）。source/target座標の計算式・default値の使い方は
+  // 元の単体実装から一切変更していない（performerごとに独立してこの計算を適用するだけ）。
+  // stage内外の判定（18章）はこの関数の呼び出し側（ボタンのonClick）が
+  // selectedPerformerIdsForSpotlightとして既に絞り込んでいるため、ここでは行わない
+  // （＝表示件数と実際の生成本数を一致させるため、フィルタ処理を1箇所に集約する）。
+  const addLightingBeam3DAtSelectedPerformersCommit = useCallback(
+    (performerIds) => {
+      const ids = Array.isArray(performerIds) ? performerIds.filter(Boolean) : [];
+      if (ids.length === 0) return;
+      // IDはcommitWorkの外側で先にまとめて発行する（既存単体版・duplicateLightingBeam3Dと
+      // 同じ方針）。
+      const newBeamIds = ids.map(() => makeId("lighting-beam3d"));
+      // Cue間Beam・前の状態との接続 v1・PART A：baseはcreateDefaultLightingBeam3D()の
+      // 単一template objectのため、そのlogicalBeamIdをそのまま複数Beamへspreadすると
+      // 全Beamが同じlogicalBeamIdを共有してしまう（重複logicalBeamId）。出演者ごとに
+      // 個別のlogicalBeamIdを別途発行し、spread後に明示的に上書きする。
+      const newBeamLogicalIds = ids.map(() => makeId("logical-beam"));
+      commitWork((prev) => {
         const slide = prev.slides[prev.currentSlideIndex];
         if (!slide) return prev;
-        const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, areaId, (a) =>
-          a.shape === "circle" ? { width: clamped, height: clamped } : { [dimension]: clamped }
-        );
+        const lists = readActiveLightingLists(prev, slide.id, selectedLightingCueSelection);
+        if (!lists) return prev; // Sceneが無ければ追加しない（addLightingBeam3DForCurrentSceneと同じ方針）
+        const halfW = prev.stage.width / 2;
+        const base = createDefaultLightingBeam3D(prev.stage);
+        // 12章：出演者ごとに新しいIDを持つ独立したBeamを1本ずつ生成する（巨大な1本の
+        // Beamにはしない）。11章：既存beams3Dは削除・置換せず、末尾へ追加するだけ。
+        const newBeams = ids
+          .map((performerId, idx) => {
+            const pos = slide.placements[performerId];
+            if (!pos) return null; // 見つからない出演者はスキップ（既存単体版と同じ保険）
+            const x = clamp(pos.x, -halfW, halfW);
+            const y = clamp(pos.y, 0, prev.stage.depth);
+            return {
+              ...base,
+              id: newBeamIds[idx],
+              logicalBeamId: newBeamLogicalIds[idx],
+              source: { x, y, z: clamp(20, LIGHTING_BEAM_3D_MIN_Z, LIGHTING_BEAM_3D_MAX_Z) },
+              target: { x, y, z: 0 },
+            };
+          })
+          .filter(Boolean);
+        if (newBeams.length === 0) return prev;
+        return writeActiveLightingLists(prev, slide.id, selectedLightingCueSelection, lists.areas, [...lists.beams3D, ...newBeams]);
+      });
+      // 13章：生成後のLighting selection。1人（配列長1）なら従来通りprimary selectionも
+      // そのBeamへ同期し、単一編集UIへ自然に戻す。2人以上ならprimaryはnullにし、複数選択
+      // UXへつなげる（Lighting複数選択 v1のselectLightingItemOnly/toggleLightingItemSelectと
+      // 同じ「1件ならprimary同期、複数ならprimary null」という既存の考え方を踏襲）。
+      // 15章：出演者側のselectedIdsはここでは一切変更しない（勝手に解除しない）。
+      setSelectedLightingItemKeys(newBeamIds.map((id) => ({ type: "beam3d", id })));
+      if (newBeamIds.length === 1) {
+        setSelectedLightingBeam3DId(newBeamIds[0]);
+        setSelectedLightingAreaId(null);
+      } else {
+        setSelectedLightingBeam3DId(null);
+        setSelectedLightingAreaId(null);
+      }
+    },
+    [commitWork, selectedLightingCueSelection]
+  );
+
+  // source / target のドラッグ移動（K・L章）。Beam v1のupdateLightingBeamPositionLiveと全く
+  // 同じパターン（updateWorkLiveで見た目だけ更新し、pointer up時にTopView側の
+  // onLightingBeam3DDragEnd＝既存のendWorkBatchで1件の履歴に確定する）。Beam v2専用の
+  // Undoシステムは作らない（Y章）。z（高さ）はドラッグでは変更しない（P章：数値入力のみ）ため、
+  // ここではx/yだけを更新する。
+  const updateLightingBeam3DSourcePositionLive = useCallback(
+    (beamId, x, y) => {
+      updateWorkLive((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => ({
+          source: { ...b.source, x, y },
+        }));
+      });
+    },
+    [updateWorkLive, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+  const updateLightingBeam3DTargetPositionLive = useCallback(
+    (beamId, x, y) => {
+      updateWorkLive((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => ({
+          target: { ...b.target, x, y }, // target.zは常に0のまま変更しない（I章）
+        }));
+      });
+    },
+    [updateWorkLive, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // ------------------------------------------------------------------
+  // Lighting Cue STEP 2D：keep Cue / transition Cueの追加・削除（内部データは分離、
+  // ユーザーには「0〜keepCounts+transitionCounts」の一本のcount軸として見せる＝K章）。
+  // ------------------------------------------------------------------
+  // 呼び出し側からは常にUI上のdisplayCount（0〜totalCounts）を受け取る。
+  //   displayCount <= keepCounts → keep Cue（count=displayCountのまま）
+  //   displayCount >  keepCounts → transition Cue（count=displayCount-keepCounts、
+  //                                 いわゆるtransition内ローカルcount）
+  // という境界（P章：<=keepCountsはkeep、それ以外はtransition）で振り分ける。
+  // 「直前状態」のsnapshotは、STEP 2Aのresolve LightingCueState()・cloneLightingStateSnapshot()
+  // をそのまま使い、新しいLighting resolve engineは作らない（I・J章）。
+  // transition Cueの場合、まずkeep終了時点（elapsedCounts=keepCounts）のLighting状態を
+  // resolveLightingCueState()で求め、それをbaseとして「そのtransition Cue countより前の
+  // transition Cueがあればその状態、無ければkeep終了状態」を同じresolveLightingCueState()で
+  // 求める（H章の「keepの基本/keep Cue→transition開始→transition Cueが連続した一本の
+  // Lighting状態として見える」という要件を、既存pure helperの2段呼び出しだけで満たす）。
+  const addLightingCueForCurrentSceneCommit = useCallback(
+    (displayCount) => {
+      const slide = slides[currentSlideIndex];
+      if (!slide) return;
+      const scene = findLightingSceneBySlideId(lightingScenes, slide.id);
+      if (!scene) return; // Sceneが無ければCueも追加しない（Area/Beamと同じ親子関係、AK章）
+      const keep = getKeepCounts(slide);
+      const hasNext = currentSlideIndex < slides.length - 1;
+      const move = hasNext ? getTransitionCounts(transitionCounts, slide.id) : 0;
+      const totalCounts = keep + move;
+      // Cue countの安全化：0.5カウント精度対応 v1でsnapCountToHalf()へ変更（旧:整数化）＋
+      // 0〜totalCountsへclamp。既存clamp()をそのまま使う。
+      // 次の構成が無い最後のFormationではmove=0のため、totalCounts=keepCountsとなり、
+      // transition Cueは自然に作成できなくなる（Q章）。
+      const safeDisplayCount = clamp(snapCountToHalf(displayCount), 0, Math.max(0, totalCounts));
+      // Lighting Cue STEP 2G再々改訂：keep/transitionの境界判定を「>」から「>=」へ変更した。
+      // これはCue schema・resolveLightingCueStateの発火式（elapsedCounts >= cue.count）・
+      // localCountの計算式（safeDisplayCount - keepCountsNow）のいずれも変更しない、
+      // 「呼び出し側が渡すsafeDisplayCount＝keepの場合の分類先」だけを変更する最小修正。
+      // 理由：UI表示が1始まりになったことで、UIアダプター側は常にinternalDisplayCount =
+      // uiCount - 1という統一式でこの関数を呼び出す（keep/transitionで分岐しない）。
+      // その結果、transition開始地点（transition local count=0）を表すsafeDisplayCountの値は
+      // 必然的にkeepと同じ値（=keep）になる。この値を「keepの最後」ではなく「transitionの
+      // 最初（local count=0）」として保存できるようにするため、境界を「> keep」から
+      // 「>= keep」へ変更する。この変更は新規Cue作成時の保存先（keep配列かtransitionMapか）
+      // の判定にのみ影響し、既に保存済みの既存Cueの分類・count値・実際の発火タイミングには
+      // 一切影響しない（保存先は作成時に一度だけ決まり、以後この判定式を再評価することはない）。
+      const isTransitionCue = safeDisplayCount >= keep;
+      // Lighting Cue 新規追加時の重複防止 v1・5〜7章：「同じFormation・同じphase・同じ
+      // internal countにはCueを最大1つ」というルールを、既存のCueカウント変更
+      // （updateLightingCueCountCommit）と同じ考え方で新規追加側にも適用する。1カウント目Cue
+      // （count=0）も専用判定を作らず、この通常の重複チェックへ自然に含める（3章）。
+      // ここでの事前チェックはUI表示時点のlightingScenes/transitionLightingCues（＝
+      // このuseCallbackが再生成される元になった直近のrender値）に基づく早期return用の
+      // 判定で、実際の書き込み拒否は下のcommitWork内部（prevベースの最新データ）で
+      // 必ず再確認する（UI側判定をすり抜けてもcommit側で拒否する二重安全構造＝5章）。
+      // 重複と判定した場合は、commitWork自体を呼ばない（Undo履歴を増やさない＝14章）・
+      // selectedLightingCueIdも変更しない（既存選択を維持する＝15章）。
+      const localCountForConflictCheck = safeDisplayCount - keep;
+      const hasConflictOuter = isTransitionCue
+        ? getTransitionLightingCues(transitionLightingCues, slide.id).some((cue) => cue.count === localCountForConflictCheck)
+        : getLightingSceneCues(scene).some((cue) => cue.count === safeDisplayCount);
+      if (hasConflictOuter) return;
+      const newCueId = makeId("lighting-cue");
+
+      commitWork((prev) => {
+        const prevSlide = prev.slides[prev.currentSlideIndex];
+        if (!prevSlide) return prev;
+        const scenes = getLightingScenes(prev);
+        const targetScene = findLightingSceneBySlideId(scenes, prevSlide.id);
+        if (!targetScene) return prev;
+        const baseAreas = getLightingAreas(targetScene);
+        const baseBeams3D = getLightingBeams3D(targetScene);
+        const keepCues = getLightingSceneCues(targetScene);
+
+        if (!isTransitionCue) {
+          // 重複防止（二重安全・6章）：UI側の事前チェックをすり抜けても、commit直前の
+          // 最新keepCuesで同じcountのCueが既に存在するか再確認する。存在すれば追加・削除・
+          // 上書き・mergeのいずれも行わず、workをそのまま返す（＝Undo履歴を作らない）。
+          if (keepCues.some((cue) => cue.count === safeDisplayCount)) return prev;
+          // keep Cue追加：「displayCountより前のkeep Cueのうち最も後ろの状態」をsnapshot。
+          const priorCues = keepCues.filter((cue) => cue.count < safeDisplayCount);
+          const priorState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: priorCues, elapsedCounts: safeDisplayCount });
+          const snapshot = cloneLightingStateSnapshot(priorState.areas, priorState.beams3D);
+          const newCue = { id: newCueId, count: safeDisplayCount, name: "", fadeCounts: 0, areas: snapshot.areas, beams3D: snapshot.beams3D };
+          const nextCues = [...keepCues, newCue];
+          const nextScenes = scenes.map((sc) => (sc.id === targetScene.id ? { ...sc, cues: nextCues } : sc));
+          return { ...prev, lightingScenes: nextScenes };
+        }
+
+        // transition Cue追加。まずkeep終了時点（elapsedCounts=keepCounts）のLighting状態を求める。
+        const keepCountsNow = getKeepCounts(prevSlide);
+        const keepEndState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: keepCountsNow });
+        const transitionMap = prev.transitionLightingCues || {};
+        const existingTransitionCues = getTransitionLightingCues(transitionMap, prevSlide.id);
+        const localCount = safeDisplayCount - keepCountsNow;
+        // 重複防止（二重安全・7章）：keep側と同じ考え方で、最新existingTransitionCuesを
+        // localCountで再確認する（keep Cue側の同じ数字とは別timelineのため混同しない）。
+        if (existingTransitionCues.some((cue) => cue.count === localCount)) return prev;
+        // 「直前のtransition Cue」＝ローカルcountがこれより小さいCueのうち最も後ろの状態。
+        // 存在しなければkeepEndStateがそのままbaseになる（resolveLightingCueStateの
+        // 「cuesが空ならbaseをそのまま返す」という既存仕様をそのまま利用）。
+        const priorTransitionCues = existingTransitionCues.filter((cue) => cue.count < localCount);
+        const priorState = resolveLightingCueState({
+          baseAreas: keepEndState.areas,
+          baseBeams3D: keepEndState.beams3D,
+          cues: priorTransitionCues,
+          elapsedCounts: localCount,
+        });
+        const snapshot = cloneLightingStateSnapshot(priorState.areas, priorState.beams3D);
+        const newCue = { id: newCueId, count: localCount, name: "", fadeCounts: 0, areas: snapshot.areas, beams3D: snapshot.beams3D };
+        const nextTransitionCues = [...existingTransitionCues, newCue];
+        return { ...prev, transitionLightingCues: { ...transitionMap, [prevSlide.id]: nextTransitionCues } };
+      });
+      setSelectedLightingCueId(newCueId);
+    },
+    [commitWork, slides, currentSlideIndex, lightingScenes, transitionCounts, transitionLightingCues]
+  );
+
+  // Cue削除：選択中のCue、または指定Cue IDを削除する。他Cue・基本Lightingには一切影響しない。
+  // Lighting Cue STEP 2D：まずkeep Cue配列から探し、見つかればそちらから削除、見つからなければ
+  // transitionLightingCuesから探して削除する（呼び出し側にkeep/transitionの区別を要求しない）。
+  const deleteLightingCue = useCallback(
+    (cueId) => {
+      commitWork((prev) => {
+        const slide = prev.slides[prev.currentSlideIndex];
+        if (!slide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, slide.id);
+        if (scene) {
+          const keepCues = getLightingSceneCues(scene);
+          const nextKeepCues = keepCues.filter((cue) => cue.id !== cueId);
+          if (nextKeepCues.length !== keepCues.length) {
+            const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, cues: nextKeepCues } : sc));
+            return { ...prev, lightingScenes: nextScenes };
+          }
+        }
+        const transitionMap = prev.transitionLightingCues || {};
+        const existingTransitionCues = getTransitionLightingCues(transitionMap, slide.id);
+        const nextTransitionCues = existingTransitionCues.filter((cue) => cue.id !== cueId);
+        if (nextTransitionCues.length === existingTransitionCues.length) return prev; // 見つからなければ何もしない
+        return { ...prev, transitionLightingCues: { ...transitionMap, [slide.id]: nextTransitionCues } };
+      });
+      setSelectedLightingCueId((prevId) => (prevId === cueId ? null : prevId));
+    },
+    [commitWork]
+  );
+
+  // Lighting Cue カウント変更 v1：選択中Cueの発火位置（表示カウント）だけを変更する。
+  // areas/beams3DのsnapshotはaddLightingCueForCurrentSceneCommitとは異なり一切再生成しない
+  // （「その時点の照明を新しく作る」操作ではなく「既存Cueを別の時間位置へ移動する」操作の
+  // ため）。cue.id・snapshot内容（areas/beams3D）は不変のまま、countフィールドだけを
+  // 書き換える。keep/transitionの境界判定は既存のaddLightingCueForCurrentSceneCommit()と
+  // 完全に同じ「safeDisplayCount >= keep」をそのまま再利用し、別ルールを新規実装しない。
+  // 移動先に既に別Cueが存在する場合（重複）は何も変更しない（UI側で警告表示する）。
+  const updateLightingCueCountCommit = useCallback(
+    (uiCount) => {
+      if (!selectedLightingCueId || !selectedLightingCuePhase) return; // 「開始時」選択中は対象外
+      const slide = slides[currentSlideIndex];
+      if (!slide) return;
+      const keep = getKeepCounts(slide);
+      const hasNext = currentSlideIndex < slides.length - 1;
+      const move = hasNext ? getTransitionCounts(transitionCounts, slide.id) : 0;
+      const totalCounts = keep + move;
+      // Lighting Cue 1カウント目分離 v1・9章：変更可能範囲を1〜totalCountsへ変更した
+      // （旧: 2〜totalCounts。「開始時」＝Base Sceneは今回もCueではなく別概念のため対象外の
+      // ままだが、「1カウント目」は正式なCueとして移動先に選べるようにする）。既存clamp()を
+      // 再利用し、新しいclampロジックは作らない。
+      // 0.5カウント精度対応 v1：snapCountToHalf()へ変更（旧:整数化）。既存clamp()を再利用し、
+      // 新しいclampロジックは作らない。
+      const safeUiCount = clamp(snapCountToHalf(uiCount), 1, Math.max(1, totalCounts));
+      const safeDisplayCount = safeUiCount - 1; // 既存の「internalDisplayCount = uiCount - 1」を維持
+      const isTransitionCue = safeDisplayCount >= keep; // addLightingCueForCurrentSceneCommitと同じ境界判定
+      const newCount = isTransitionCue ? safeDisplayCount - keep : safeDisplayCount;
+      const cueId = selectedLightingCueId;
+
+      commitWork((prev) => {
+        const prevSlide = prev.slides[prev.currentSlideIndex];
+        if (!prevSlide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, prevSlide.id);
+        if (!scene) return prev;
+        const keepCues = getLightingSceneCues(scene);
+        const transitionMap = prev.transitionLightingCues || {};
+        const transitionCues = getTransitionLightingCues(transitionMap, prevSlide.id);
+
+        // 変更対象のCueを探す（既存のselectedKeepCue/selectedTransitionCueと同じ探索パターン）。
+        const sourceKeepCue = keepCues.find((c) => c.id === cueId);
+        const sourceTransitionCue = sourceKeepCue ? null : transitionCues.find((c) => c.id === cueId);
+        const sourceCue = sourceKeepCue || sourceTransitionCue;
+        if (!sourceCue) return prev; // 見つからなければ何もしない（保険）
+
+        // 変化なし（同じ所属・同じcount）なら無駄なUndo履歴を作らない。
+        const samePhase = isTransitionCue ? !!sourceTransitionCue : !!sourceKeepCue;
+        if (samePhase && sourceCue.count === newCount) return prev;
+
+        // 重複判定：移動先配列に「自分以外」で同じcount値を持つCueが既に存在する場合は変更しない。
+        const targetArray = isTransitionCue ? transitionCues : keepCues;
+        const hasConflict = targetArray.some((c) => c.id !== cueId && c.count === newCount);
+        if (hasConflict) return prev; // 何もしない（UI側で警告表示する）
+
+        // Cue自身（id・areas・beams3Dは不変、countだけ更新。deep copyし直さない＝仕様通り）。
+        const movedCue = { ...sourceCue, count: newCount };
+
+        let finalKeepCues = keepCues;
+        let finalTransitionCues = transitionCues;
+        if (sourceKeepCue) {
+          if (isTransitionCue) {
+            // keep → transitionへ移動
+            finalKeepCues = keepCues.filter((c) => c.id !== cueId);
+            finalTransitionCues = [...transitionCues, movedCue].sort((a, b) => a.count - b.count);
+          } else {
+            // keep内で移動
+            finalKeepCues = keepCues.map((c) => (c.id === cueId ? movedCue : c)).sort((a, b) => a.count - b.count);
+          }
+        } else {
+          if (isTransitionCue) {
+            // transition内で移動
+            finalTransitionCues = transitionCues.map((c) => (c.id === cueId ? movedCue : c)).sort((a, b) => a.count - b.count);
+          } else {
+            // transition → keepへ移動
+            finalTransitionCues = transitionCues.filter((c) => c.id !== cueId);
+            finalKeepCues = [...keepCues, movedCue].sort((a, b) => a.count - b.count);
+          }
+        }
+
+        const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, cues: finalKeepCues } : sc));
+        const nextTransitionMap = { ...transitionMap, [prevSlide.id]: finalTransitionCues };
+        return { ...prev, lightingScenes: nextScenes, transitionLightingCues: nextTransitionMap };
+      });
+      // selectedLightingCueIdは変更しない（同じcue.idのまま選択状態を維持する＝要件5）。
+    },
+    [commitWork, slides, currentSlideIndex, transitionCounts, selectedLightingCueId, selectedLightingCuePhase]
+  );
+
+  // Lighting Cueへ短い名前/メモを付けられる機能・5章：選択中Cueのnameだけを変更する小さな
+  // commit handler。updateLightingCueCountCommit()と全く同じCue探索パターン（keepCues→
+  // transitionCuesの順に探す）を再利用し、cue.id・cue.count・cue.areas・cue.beams3Dは
+  // 一切変更しない（{...sourceCue, name: trimmed}というspreadだけ）。新しいCue探索ロジックは
+  // 追加していない。
+  const updateLightingCueNameCommit = useCallback(
+    (name) => {
+      if (!selectedLightingCueId || !selectedLightingCuePhase) return; // 「開始時」選択中は対象外（8章）
+      const trimmed = typeof name === "string" ? name.trim() : "";
+      const cueId = selectedLightingCueId;
+      commitWork((prev) => {
+        const prevSlide = prev.slides[prev.currentSlideIndex];
+        if (!prevSlide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, prevSlide.id);
+        if (!scene) return prev;
+        const keepCues = getLightingSceneCues(scene);
+        const transitionMap = prev.transitionLightingCues || {};
+        const transitionCues = getTransitionLightingCues(transitionMap, prevSlide.id);
+
+        const sourceKeepCue = keepCues.find((c) => c.id === cueId);
+        const sourceTransitionCue = sourceKeepCue ? null : transitionCues.find((c) => c.id === cueId);
+        const sourceCue = sourceKeepCue || sourceTransitionCue;
+        if (!sourceCue) return prev;
+
+        const currentName = typeof sourceCue.name === "string" ? sourceCue.name : "";
+        if (currentName === trimmed) return prev; // 変化なしなら無駄なUndo履歴を作らない
+
+        const updatedCue = { ...sourceCue, name: trimmed };
+        if (sourceKeepCue) {
+          const nextKeepCues = keepCues.map((c) => (c.id === cueId ? updatedCue : c));
+          const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, cues: nextKeepCues } : sc));
+          return { ...prev, lightingScenes: nextScenes };
+        }
+        const nextTransitionCues = transitionCues.map((c) => (c.id === cueId ? updatedCue : c));
+        return { ...prev, transitionLightingCues: { ...transitionMap, [prevSlide.id]: nextTransitionCues } };
+      });
+      // selectedLightingCueIdは変更しない（updateLightingCueCountCommitと同じ方針）。
+    },
+    [commitWork, selectedLightingCueId, selectedLightingCuePhase]
+  );
+
+  // 照明フェード v1・STEP 15：選択中Cueのfadecountsだけを変更する小さなcommit handler。
+  // updateLightingCueNameCommit()と全く同じCue探索パターン（keepCues→transitionCuesの順に
+  // 探す）・commitWork patternを再利用し、cue.id・cue.count・cue.name・cue.areas・
+  // cue.beams3Dは一切変更しない（{...sourceCue, fadeCounts: safe値}というspreadだけ）。
+  const updateLightingCueFadeCountsCommit = useCallback(
+    (fadeCounts) => {
+      if (!selectedLightingCueId || !selectedLightingCuePhase) return; // 「開始時」選択中は対象外
+      // 0.5カウント精度対応 v1：整数Math.round()をsnapCountToHalf()へ変更。
+      const safeFadeCounts = Number.isFinite(Number(fadeCounts)) ? Math.max(0, snapCountToHalf(Number(fadeCounts))) : 0;
+      const cueId = selectedLightingCueId;
+      commitWork((prev) => {
+        const prevSlide = prev.slides[prev.currentSlideIndex];
+        if (!prevSlide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, prevSlide.id);
+        if (!scene) return prev;
+        const keepCues = getLightingSceneCues(scene);
+        const transitionMap = prev.transitionLightingCues || {};
+        const transitionCues = getTransitionLightingCues(transitionMap, prevSlide.id);
+
+        const sourceKeepCue = keepCues.find((c) => c.id === cueId);
+        const sourceTransitionCue = sourceKeepCue ? null : transitionCues.find((c) => c.id === cueId);
+        const sourceCue = sourceKeepCue || sourceTransitionCue;
+        if (!sourceCue) return prev;
+
+        const currentFadeCounts = Number.isFinite(Number(sourceCue.fadeCounts)) ? Math.max(0, Number(sourceCue.fadeCounts)) : 0;
+        if (currentFadeCounts === safeFadeCounts) return prev; // 変化なしなら無駄なUndo履歴を作らない
+
+        const updatedCue = { ...sourceCue, fadeCounts: safeFadeCounts };
+        if (sourceKeepCue) {
+          const nextKeepCues = keepCues.map((c) => (c.id === cueId ? updatedCue : c));
+          const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, cues: nextKeepCues } : sc));
+          return { ...prev, lightingScenes: nextScenes };
+        }
+        const nextTransitionCues = transitionCues.map((c) => (c.id === cueId ? updatedCue : c));
+        return { ...prev, transitionLightingCues: { ...transitionMap, [prevSlide.id]: nextTransitionCues } };
+      });
+      // selectedLightingCueIdは変更しない（updateLightingCueNameCommitと同じ方針）。
+    },
+    [commitWork, selectedLightingCueId, selectedLightingCuePhase]
+  );
+
+  // Lighting Fade v3・7・14章：現在のFormationのLighting Scene.entryFadeCountsだけを変更する
+  // 小さなcommit handler。updateLightingCueFadeCountsCommit()と同じ設計思想（既存fieldの
+  // 探索・spreadだけで更新・変化なしならcommitWork自体を呼ばない）だが、対象はCueではなく
+  // Scene自体。「開始時」選択中（selectedLightingCue===null）だけで使う想定だが、handler自体は
+  // 現在のFormationのSceneを直接操作するため選択状態に依存しない。
+  const updateLightingSceneEntryFadeCountsCommit = useCallback(
+    (entryFadeCounts) => {
+      // 0.5カウント精度対応 v1：整数Math.round()をsnapCountToHalf()へ変更。
+      const safeEntryFadeCounts = Number.isFinite(Number(entryFadeCounts)) ? Math.max(0, snapCountToHalf(Number(entryFadeCounts))) : 0;
+      commitWork((prev) => {
+        const prevSlide = prev.slides[prev.currentSlideIndex];
+        if (!prevSlide) return prev;
+        const scenes = getLightingScenes(prev);
+        const scene = findLightingSceneBySlideId(scenes, prevSlide.id);
+        if (!scene) return prev;
+        const currentEntryFadeCounts = Number.isFinite(Number(scene.entryFadeCounts)) ? Math.max(0, Number(scene.entryFadeCounts)) : 0;
+        if (currentEntryFadeCounts === safeEntryFadeCounts) return prev; // 変化なしなら無駄なUndo履歴を作らない
+        const nextScenes = scenes.map((sc) => (sc.id === scene.id ? { ...sc, entryFadeCounts: safeEntryFadeCounts } : sc));
         return { ...prev, lightingScenes: nextScenes };
       });
     },
-    [updateWorkLive]
+    [commitWork]
   );
 
   // ---- BPM（プロジェクト全体で共通の値。slideごとの値ではない） ----
@@ -10693,7 +17229,53 @@ export default function App() {
   //     animationStateからそのままstartProgressを読んで残りkeep/moveを再生する（24〜26章）
   // という形で、表示・再開ロジックの二重実装を避けている。
   function handleMusicSeekCommit() {
-    if (!(syncPlayback.isActive && syncPlayback.isPaused)) return; // 2・3章：sync一時停止中だけ有効
+    // 編集モード音楽seek（STEP 2G再改訂）：同期再生セッション（syncPlayback.isActive）に
+    // 入っていない場合の分岐。音楽スクラバーは「曲全体から編集したいFormationを探す
+    // ナビゲーション」専用とし、途中時刻のkeep/move preview（人物補間・Lighting Cue
+    // preview）は行わない（C・D章）。resolveTimelineAtMusicTime()が返したresult.slideIndex
+    // のFormationへ、Formationカードを普通に選択したときと全く同じ状態でジャンプするだけ。
+    //   ・currentSlideIndex = result.slideIndex（既存のgoToSlideをそのまま使用）
+    //   ・人物 = そのFormationの正式なplacements（scrubProgress=0で「構成間移動スクラバー」
+    //     未使用状態に戻す。move途中補間は行わない）
+    //   ・Lighting = 通常のmanual Lighting表示（editTimelinePreview相当のstateは撤去済み。
+    //     Cueボタンで通常通りLighting Cueを選択・編集できる＝直前STEPで問題になっていた
+    //     「Cueが操作できなくなる」状態を根本的に解消する）
+    //   ・animationState.playbackState = idleのまま（連続seekのため変更しない）
+    //   ・音楽・syncPlaybackには一切触れない（音楽が勝手に再生されない）
+    // 対象は「構成アニメーションが完全にidleの場合」だけに絞り、手動▶/⏸による一時停止中は
+    // 対象外にする（安全側・最小変更）。
+    if (!(syncPlayback.isActive && syncPlayback.isPaused)) {
+      if (animationState.playbackState !== "idle") return; // 手動再生・一時停止中は対象外
+      const buffer = audioBufferRef.current;
+      if (!buffer) return; // 音源未読込
+      const rawTimeSec = musicOffsetSecRef.current;
+      const timeSec = clamp(rawTimeSec, 0, buffer.duration);
+
+      const result = resolveTimelineAtMusicTime({
+        timeSec,
+        slides,
+        musicSections,
+        transitionCounts,
+        projectBpm,
+      });
+
+      if (!result.found) {
+        setSyncSeekPreview(result);
+        return;
+      }
+
+      // 既存のsync seekと全く同じinternalSlideAdvanceRefパターン（下のif内と同一の考え方）。
+      // これにより、goToSlide()直後の[currentSlideIndex]依存useEffectがscrubProgressを
+      // 誤ってリセットしない（連続seekを可能にするための鍵）。
+      if (result.slideIndex !== currentSlideIndex) {
+        internalSlideAdvanceRef.current = true;
+      }
+      goToSlide(result.slideIndex);
+      // 構成間移動スクラバーは未使用状態へ戻す（move途中位置のpreviewは行わない＝D章）。
+      setScrubProgress(0);
+      setSyncSeekPreview(result);
+      return;
+    }
     const buffer = audioBufferRef.current;
     const rawTimeSec = musicOffsetSecRef.current;
     const timeSec = buffer ? clamp(rawTimeSec, 0, buffer.duration) : rawTimeSec; // 34章
@@ -10801,6 +17383,55 @@ export default function App() {
     }
   }
 
+  // プレゼンモード v1・13・16章：▶/⏸を1つのボタンで扱うための薄いラッパー。
+  // 新しいplayback stateは追加せず、既存のhandlePlaySingleClick（idle→再生開始・
+  // paused→resumeFromPauseへの分岐も内包済み）・handleCompositionPauseClick（通常/同期両方の
+  // 一時停止を吸収済み）・resumeSyncPlayback（同期一時停止からの再開専用）をそのまま組み合わせる。
+  function handlePresentationPlayPauseToggle() {
+    if (syncPlayback.isActive && syncPlayback.isPaused) {
+      resumeSyncPlayback();
+      return;
+    }
+    if (isAnimationRunning) {
+      handleCompositionPauseClick();
+      return;
+    }
+    handlePlaySingleClick();
+  }
+  // ボタンのラベル切替用。実際にrAFが進行中、または同期再生が一時停止していない間は「再生中」。
+  const presentationIsPlaying = isAnimationRunning || (syncPlayback.isActive && !syncPlayback.isPaused);
+  // 何も再生・一時停止していない状態（idle）で、かつそもそも再生を開始できない
+  // （＝canPlayTransitionFinalがfalse。最後の構成でtransitionが無い等）場合だけdisabledにする。
+  // 再生中・一時停止中は常に有効（pause/resumeは常に可能なため）。
+  const presentationPlayPauseDisabled = animationState.playbackState === "idle" && !canPlayTransitionFinal;
+
+  // Presentation Mode v1.1・4〜5章：Bottom Presentation Controls用のstatus表示を、既存state
+  // （syncPlayback / animationState.playbackState / animationState.playbackMode）から導出するだけの
+  // 表示専用derived value。新しいstate（presentationStatus等）は追加しない。判定優先順位は
+  // 「Music同期 → 連続再生 → 通常Transition → idle」（5章：Music同期を最優先で判定する）。
+  // stateは"idle" | "playing" | "paused"の3値のみを持ち、colorやbutton側の分岐には使わない
+  // （純粋にstatus表示のラベル・dot色を決めるためだけの値）。
+  const presentationPlaybackStatus = (() => {
+    if (syncPlayback.isActive) {
+      return syncPlayback.isPaused
+        ? { label: "音楽同期・一時停止中", state: "paused" }
+        : { label: "音楽同期再生中", state: "playing" };
+    }
+    if (animationState.playbackState === "paused") {
+      return {
+        label: animationState.playbackMode === "continuous" ? "連続再生・一時停止中" : "通常再生・一時停止中",
+        state: "paused",
+      };
+    }
+    if (animationState.playbackState === "playing") {
+      return {
+        label: animationState.playbackMode === "continuous" ? "連続再生中" : "通常再生中",
+        state: "playing",
+      };
+    }
+    return { label: "待機中", state: "idle" };
+  })();
+
   // ---- 14・15章：構成の自然終了／音楽の自然終了を、同期セッションの終了へ橋渡しする ----
   // 個々の終了経路（afterKeepForIndexでの連続再生の自然終了、resumeFromPause等のフォールバック、
   // 手動でのスライド変更によるリセットなど）へ同期終了処理を1箇所ずつ埋め込むのではなく、
@@ -10882,7 +17513,11 @@ export default function App() {
   const setKeepCountsCommit = useCallback(
     (rawValue) => {
       if (isTransitionActive) return;
-      const parsed = Math.round(Number(rawValue));
+      // 0.5カウント精度対応 v1：整数Math.round()をsnapCountToHalf()へ変更。
+      // －／＋ボタン（step=1のまま）はvalue±1をそのまま渡すため、7.5→8.5/6.5のように
+      // 0.5単位を保ったまま増減する。直接入力はallowDecimal=trueのDraftNumberField側で
+      // 既にNumber化された値がそのまま渡ってくるため、ここで0.5単位へ正規化する。
+      const parsed = snapCountToHalf(Number(rawValue));
       const next = Number.isFinite(parsed) ? Math.max(MIN_KEEP_COUNTS, parsed) : MIN_KEEP_COUNTS;
       commitWork((prev) => {
         const idx = prev.currentSlideIndex;
@@ -11185,6 +17820,60 @@ export default function App() {
         handleDeleteKeyPress();
         return;
       }
+
+      // プレゼンモード v1・8・34章：presentationMode中だけ、ArrowLeft/ArrowRight/Space/Escapeで
+      // 手動操作できるようにする。isEditableTargetのガードはこの関数の先頭を既に通過済みのため、
+      // 入力欄操作中には一切影響しない。既存のEscape使用箇所（Project名リネームinput内の
+      // 個別onKeyDown）とは別スコープ（windowレベル）かつpresentationMode中限定のため、
+      // 既存Esc用途とは衝突しない。ロジックはhandlePresentationPlayPauseToggleと同じ判断を
+      // ここでも直接使う（依存配列にsyncPlayback等の生の値を含めることで、stale closureを防ぐ）。
+      if (presentationMode) {
+        if (e.key === "ArrowLeft") {
+          if (currentSlideIndex > 0 && !isAnimationRunning) {
+            e.preventDefault();
+            goToPrevSlide();
+          }
+          return;
+        }
+        if (e.key === "ArrowRight") {
+          if (currentSlideIndex < slides.length - 1 && !isAnimationRunning) {
+            e.preventDefault();
+            goToNextSlide();
+          }
+          return;
+        }
+        if (e.key === " " || e.key === "Spacebar") {
+          e.preventDefault();
+          if (syncPlayback.isActive && syncPlayback.isPaused) {
+            resumeSyncPlayback();
+          } else if (isAnimationRunning) {
+            handleCompositionPauseClick();
+          } else if (canPlayTransitionFinal) {
+            handlePlaySingleClick();
+          }
+          return;
+        }
+        if (e.key === "Escape") {
+          // プレゼンモード構成一覧ジャンプ v1・17章：Modalが開いている間はModalだけ閉じ、
+          // プレゼンモードは終了しない（優先順位1）。
+          if (slideListOpen) {
+            e.preventDefault();
+            setSlideListOpen(false);
+            return;
+          }
+          // Fullscreen STEP 4・14〜16章：Fullscreen中のEscapeは基本的にブラウザ自身が
+          // Fullscreen解除に使う。ここでpreventDefault()やexitPresentationMode()を呼ばず、
+          // ブラウザの標準挙動へ完全に任せる（優先順位2）。次にEscapeが押された時点では
+          // document.fullscreenElementが既に無くなっているため、そのときは通常通り
+          // presentationModeが終了する（優先順位3）。
+          if (document.fullscreenElement) {
+            return;
+          }
+          e.preventDefault();
+          exitPresentationMode();
+          return;
+        }
+      }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
@@ -11200,6 +17889,18 @@ export default function App() {
     copyCurrentSlide,
     pasteCopiedSlide,
     handleDeleteKeyPress,
+    presentationMode,
+    currentSlideIndex,
+    isAnimationRunning,
+    syncPlayback,
+    resumeSyncPlayback,
+    canPlayTransitionFinal,
+    handleCompositionPauseClick,
+    handlePlaySingleClick,
+    goToPrevSlide,
+    goToNextSlide,
+    exitPresentationMode,
+    slideListOpen,
   ]);
 
   // 座標を設定すると同時に、そこがどのエリア（ステージ／下手袖／上手袖／舞台奥待機）かを
@@ -11686,16 +18387,61 @@ export default function App() {
 
   return (
     <div
+      ref={appRootRef}
       style={{ background: THEME.bg, color: THEME.text, fontFamily: "'Hiragino Sans', 'Yu Gothic', sans-serif" }}
       className="slsim-app w-full"
     >
       <style>{RESPONSIVE_STYLES}</style>
       {/* ヘッダー */}
       <header style={{ borderBottom: `1px solid ${THEME.border}`, background: THEME.bg }} className="slsim-header px-5 py-3 flex items-center justify-between flex-wrap gap-3">
+        {presentationMode ? (
+          // プレゼンモード v1・6章：既存Headerを複製せず、条件分岐で簡略版へ差し替えるだけ。
+          // Project名・「プレゼンモード」表示・「編集に戻る」の3点だけを残す。
+          <>
+            <div className="flex items-center gap-3">
+              <div style={{ width: 10, height: 10, borderRadius: 999, background: THEME.accent }} />
+              <h1 className="text-lg font-bold" style={{ letterSpacing: "0.02em" }}>{activeProject.name}</h1>
+              <span
+                style={{ color: THEME.accent, border: `1px solid ${THEME.accent}`, borderRadius: 999 }}
+                className="text-xs font-bold px-2 py-0.5"
+              >
+                プレゼンモード
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {/* Fullscreen STEP 4・9・10・29章：presentationMode中だけ表示するボタン。
+                  非対応ブラウザではfullscreenSupportedがfalseになりボタン自体を出さない
+                  （クラッシュさせない）。プレゼン開始時に自動でFullscreenへ入ることはない
+                  （11章：あくまでユーザーが明示的に押した時だけ）。 */}
+              {fullscreenSupported && (
+                <button
+                  type="button"
+                  onClick={toggleFullscreen}
+                  title={isFullscreen ? "全画面表示を終了します" : "ブラウザの全画面表示でプレゼン画面を表示します"}
+                  aria-label={isFullscreen ? "全画面を終了" : "全画面表示"}
+                  style={{ background: THEME.panelBg2, color: THEME.text, border: `1px solid ${THEME.border}` }}
+                  className="px-3 py-1.5 rounded-lg text-sm font-bold"
+                >
+                  {isFullscreen ? "⛶ 全画面を終了" : "⛶ 全画面表示"}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={exitPresentationMode}
+                title="編集画面に戻ります（作品データは変更されません）"
+                aria-label="編集に戻る"
+                style={{ background: THEME.panelBg2, color: THEME.text, border: `1px solid ${THEME.border}` }}
+                className="px-3 py-1.5 rounded-lg text-sm font-bold"
+              >
+                ✕ 編集に戻る
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
         <div className="flex items-center gap-3">
           <div style={{ width: 10, height: 10, borderRadius: 999, background: THEME.accent }} />
-          <h1 className="text-lg font-bold" style={{ letterSpacing: "0.02em" }}>舞台配置シミュレーター</h1>
-          <span style={{ color: THEME.textDim }} className="text-xs hidden sm:inline">第1段階：ステージ設定 / 出演者配置</span>
+          <h1 className="text-lg font-bold" style={{ letterSpacing: "0.02em" }}>ダンス舞台シミュレーター</h1>
           <ProjectSwitcher
             projects={workspace.projects}
             activeProjectId={workspace.activeProjectId}
@@ -11739,8 +18485,8 @@ export default function App() {
           <button
             onClick={toggleHelp}
             aria-pressed={helpOpen}
-            title="操作方法を表示／非表示"
-            aria-label="操作方法を表示／非表示"
+            title="ヘルプを表示／非表示"
+            aria-label="ヘルプを表示／非表示"
             style={{
               background: helpOpen ? THEME.accent : THEME.panelBg2,
               color: helpOpen ? "#141318" : THEME.text,
@@ -11748,7 +18494,7 @@ export default function App() {
             }}
             className="px-3 py-1.5 rounded-lg text-sm font-bold"
           >
-            ？ 操作方法
+            ？ ヘルプ
           </button>
           <button
             onClick={toggleSidebar}
@@ -11780,13 +18526,38 @@ export default function App() {
           <div style={{ width: 1, height: 20, background: THEME.border }} />
           <ViewToggleButton active={viewMode === "top"} onClick={() => setViewMode("top")} label="平面図（真上）" />
           <ViewToggleButton active={viewMode === "front"} onClick={() => setViewMode("front")} label="俯瞰客席ビュー" />
+          <div style={{ width: 1, height: 20, background: THEME.border }} />
+          {/* プレゼンモード v1・2章：Export等の編集操作ボタンと競合しない、ヘッダー右端の
+              独立した入口。既存ViewToggleButtonのすぐ右に配置し、新しいUIトーンは作らない。 */}
+          <button
+            type="button"
+            onClick={enterPresentationMode}
+            disabled={isTransitionActive}
+            title={isTransitionActive ? "再生中は切り替えられません" : "構成・移動・Lightingを見せるためのプレゼン専用画面を開きます"}
+            aria-label="プレゼンモードを開く"
+            style={{
+              background: THEME.panelBg2,
+              color: isTransitionActive ? THEME.textDim : THEME.text,
+              border: `1px solid ${THEME.border}`,
+              opacity: isTransitionActive ? 0.5 : 1,
+              cursor: isTransitionActive ? "not-allowed" : "pointer",
+            }}
+            className="px-3 py-1.5 rounded-lg text-sm font-bold"
+          >
+            🎬 プレゼン
+          </button>
         </div>
+          </>
+        )}
       </header>
 
-      <div className={`slsim-workspace${sidebarOpen ? "" : " slsim-sidebar-collapsed"}`}>
+      <div className={`slsim-workspace${sidebarOpen && !presentationMode ? "" : " slsim-sidebar-collapsed"}`}>
         {/* ステージ表示エリア */}
         <main className="slsim-stage-pane">
-          {/* 視点ごとの表示切替 */}
+          {/* 視点ごとの表示切替。プレゼンモード v1・3・36章：細かい入力フォームを隠し、
+              「文字は少なく」という方針に合わせてこの行ごと非表示にする。showTrajectory等の
+              値自体は変更しない（既存設定をそのまま尊重＝23章）。 */}
+          {!presentationMode && (
           <div className="flex items-center gap-4 mb-2 text-xs flex-wrap shrink-0" style={{ color: THEME.textDim }}>
             {viewMode === "top" && (
               <label className="flex items-center gap-1.5 cursor-pointer select-none">
@@ -11989,12 +18760,18 @@ export default function App() {
                 )}
               </div>
             )}
+            {/* 移動時の姿勢UIはここから右側編集パネル「選択中の出演者」内（既存の「姿勢」の
+                直下）へ移動した。左上（ステージ上部の移動経路付近）には表示しない
+                （同じ操作UIの二重表示を避けるため）。ロジック（selectedTransitionPoseSummary・
+                setSelectedTransitionPoseMode・editablePerformerIds・activeTransitionRef等）は
+                一切変更していない。 */}
             {isMultiSelect && (
               <span style={{ color: THEME.accent }} className="font-bold">
                 {selectedIds.length}人選択中
               </span>
             )}
           </div>
+          )}
 
           {/* ズーム・表示ツールバー */}
           <ZoomToolbar
@@ -12049,19 +18826,33 @@ export default function App() {
                 onViewStateChange={handleViewStateChange}
                 width={containerSize.width}
                 height={containerSize.height}
-                locked={isTransitionActive}
+                locked={isTransitionActive || presentationMode}
                 transitionPaths={transitionPaths}
                 waypointHandle={waypointHandle}
                 onWaypointDrag={updateWaypointLive}
                 floorColorKey={stageAppearance.floorColor}
-                lightingAreas={currentLightingAreas}
-                showLightingAreas={!!(lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled)}
+                lightingAreas={effectiveLightingAreas}
+                showLightingAreas={!!(showLighting && currentLightingScene && currentLightingScene.enabled)}
                 selectedLightingAreaId={selectedLightingAreaId}
-                onSelectLightingArea={setSelectedLightingAreaId}
+                selectedLightingItemKeys={selectedLightingItemKeys}
+                onSelectLightingArea={(areaId, shiftKey) =>
+                  shiftKey ? toggleLightingItemSelect("area", areaId) : selectLightingItemOnly("area", areaId)
+                }
                 onLightingAreaDrag={updateLightingAreaPositionLive}
                 onLightingAreaResize={updateLightingAreaSizeLive}
                 onLightingAreaDragStart={handleDragStart}
                 onLightingAreaDragEnd={handleDragEnd}
+                lightingBeams3D={effectiveLightingBeams3DForDisplay}
+                showLightingBeams3D={!!(showLighting && currentLightingScene && currentLightingScene.enabled)}
+                selectedLightingBeam3DId={selectedLightingBeam3DId}
+                onSelectLightingBeam3D={(beamId, shiftKey) =>
+                  shiftKey ? toggleLightingItemSelect("beam3d", beamId) : selectLightingItemOnly("beam3d", beamId)
+                }
+                onLightingBeam3DSourceDrag={updateLightingBeam3DSourcePositionLive}
+                onLightingBeam3DTargetDrag={updateLightingBeam3DTargetPositionLive}
+                onLightingBeam3DDragStart={handleDragStart}
+                onLightingBeam3DDragEnd={handleDragEnd}
+                trackingBeamPath={selectedLightingBeamTrackingPath}
               />
             ) : (
               <OverheadAudienceView
@@ -12079,12 +18870,14 @@ export default function App() {
                 onViewStateChange={handleViewStateChange}
                 width={containerSize.width}
                 height={containerSize.height}
-                locked={isTransitionActive}
+                locked={isTransitionActive || presentationMode}
                 transitionPaths={transitionPaths}
                 floorColorKey={stageAppearance.floorColor}
                 backdropColorKey={stageAppearance.backdropColor}
-                lightingAreas={currentLightingAreas}
-                showLightingAreas={!!(lightingEnabled && showLighting && currentLightingScene && currentLightingScene.enabled)}
+                lightingAreas={effectiveLightingAreas}
+                showLightingAreas={!!(showLighting && currentLightingScene && currentLightingScene.enabled)}
+                lightingBeams3D={effectiveLightingBeams3DForDisplay}
+                showLightingBeams3D={!!(showLighting && currentLightingScene && currentLightingScene.enabled)}
               />
             )}
 
@@ -12126,6 +18919,12 @@ export default function App() {
             </div>
           </div>
 
+          {/* プレゼンモード v1・17・18章：通常編集向けのCompositionBar/スクラバー/MusicBar/
+              警告バーは、presentationMode中はまとめて非表示にし、代わりに簡潔な
+              Bottom Presentation Controlsへ切り替える。通常編集モードでは以下の構造を
+              一切変更していない（39章：回帰防止）。 */}
+          {!presentationMode && (
+          <>
           {/* 構成バー（複数スライド機能の土台）。ステージの表示領域をなるべく維持するため
               高さは最小限（80〜100px程度）に抑える。構成の切替はUndo対象外。 */}
           <CompositionBar
@@ -12272,38 +19071,219 @@ export default function App() {
               )}
             </div>
           )}
+          </>
+          )}
+
+          {/* プレゼンモード v1・9・12〜17章：Bottom Presentation Controls。既存の
+              CompositionBar/MusicBarを複製せず、その裏側にあるhandler/state（goToPrevSlide・
+              goToNextSlide・handlePlaySingleClick・handleCompositionPauseClick・
+              handlePlayContinuousClick・startSyncPlayback・resumeSyncPlayback等）をそのまま
+              再利用するだけの簡潔な専用バー。プレゼン専用のsetInterval・playback stateは
+              一切追加していない。 */}
+          {presentationMode && (
+            <div
+              className="flex flex-col items-center gap-3 shrink-0"
+              style={{ borderTop: `1px solid ${THEME.border}`, paddingTop: 16, marginTop: 8 }}
+            >
+              <div className="flex items-center gap-4">
+                <button
+                  type="button"
+                  onClick={goToPrevSlide}
+                  disabled={currentSlideIndex <= 0 || isAnimationRunning}
+                  title="前の構成"
+                  aria-label="前の構成"
+                  style={{
+                    background: THEME.panelBg2,
+                    color: THEME.text,
+                    border: `1px solid ${THEME.border}`,
+                    opacity: currentSlideIndex <= 0 || isAnimationRunning ? 0.4 : 1,
+                    cursor: currentSlideIndex <= 0 || isAnimationRunning ? "not-allowed" : "pointer",
+                  }}
+                  className="px-4 py-2 rounded-lg text-base font-bold"
+                >
+                  ← 前
+                </button>
+                <div className="text-center" style={{ minWidth: 160 }}>
+                  <div className="text-xs" style={{ color: THEME.textDim }}>
+                    構成 {slideOrderLabel} / {slideTotalLabel}
+                  </div>
+                  <div className="text-lg font-bold">{currentSlide.name}</div>
+                </div>
+                {/* プレゼンモード構成一覧ジャンプ v1・3・9章：既存SlideListModalを開くだけの
+                    入口。再生中は「Playback stateとの整合が崩れる可能性がある」ため無理に
+                    自動停止せず、ボタン自体をdisabledにする（既存CompositionBarのnavLocked
+                    思想と同じ安全策）。 */}
+                <button
+                  type="button"
+                  onClick={() => setSlideListOpen(true)}
+                  disabled={isAnimationRunning}
+                  title={isAnimationRunning ? "再生中は開けません" : "構成一覧からFormationへジャンプします"}
+                  aria-label="構成一覧"
+                  style={{
+                    background: THEME.panelBg2,
+                    color: THEME.text,
+                    border: `1px solid ${THEME.border}`,
+                    opacity: isAnimationRunning ? 0.4 : 1,
+                    cursor: isAnimationRunning ? "not-allowed" : "pointer",
+                  }}
+                  className="px-3 py-2 rounded-lg text-sm font-bold"
+                >
+                  構成一覧
+                </button>
+                <button
+                  type="button"
+                  onClick={goToNextSlide}
+                  disabled={currentSlideIndex >= slides.length - 1 || isAnimationRunning}
+                  title="次の構成"
+                  aria-label="次の構成"
+                  style={{
+                    background: THEME.panelBg2,
+                    color: THEME.text,
+                    border: `1px solid ${THEME.border}`,
+                    opacity: currentSlideIndex >= slides.length - 1 || isAnimationRunning ? 0.4 : 1,
+                    cursor: currentSlideIndex >= slides.length - 1 || isAnimationRunning ? "not-allowed" : "pointer",
+                  }}
+                  className="px-4 py-2 rounded-lg text-base font-bold"
+                >
+                  次 →
+                </button>
+              </div>
+              {/* Presentation Mode v1.1・4・7・8・14〜15章：Playback status行。既存の
+                  presentationPlaybackStatus（syncPlayback/animationStateからderiveしただけの
+                  表示専用値）をそのまま文字列とdot色に反映するだけで、クリック不可・作品データ
+                  にも一切保存しない。3段構成の中段として、Formation navigation行とPlayback
+                  action行の間に挟むことで、button数の増減（idle/playing/paused）があっても
+                  nav行の位置がズレないようにする（20章）。 */}
+              <div className="flex items-center gap-2 text-xs" style={{ color: THEME.textDim }}>
+                <span
+                  aria-hidden="true"
+                  style={{
+                    display: "inline-block",
+                    width: 7,
+                    height: 7,
+                    borderRadius: 999,
+                    background:
+                      presentationPlaybackStatus.state === "playing"
+                        ? THEME.accent
+                        : presentationPlaybackStatus.state === "paused"
+                        ? `${THEME.accent}99`
+                        : THEME.textDim,
+                  }}
+                />
+                {presentationPlaybackStatus.label}
+              </div>
+              <div className="flex items-center gap-3 flex-wrap justify-center">
+                <button
+                  type="button"
+                  onClick={handlePresentationPlayPauseToggle}
+                  disabled={presentationPlayPauseDisabled}
+                  style={{
+                    background: THEME.accent,
+                    color: "#141318",
+                    border: "none",
+                    opacity: presentationPlayPauseDisabled ? 0.5 : 1,
+                    cursor: presentationPlayPauseDisabled ? "not-allowed" : "pointer",
+                  }}
+                  className="px-5 py-2 rounded-lg text-base font-bold"
+                >
+                  {presentationIsPlaying
+                    ? "⏸ 一時停止"
+                    : syncPlaybackPausedActive
+                    ? "▶ 音楽同期を再開"
+                    : animationState.playbackState === "paused"
+                    ? "▶ 再開"
+                    : "▶ 再生"}
+                </button>
+                {/* プレゼンモード「再生を終了」v1：一時停止中（animationState.playbackState==="paused"、
+                    通常Transition・連続再生・Music同期のいずれも該当）だけ表示する、待機状態への
+                    明示的な戻り口。「✕ 編集に戻る」（presentationMode自体を終了する別操作）とは
+                    完全に別。中身は既存のhandleCompositionReturnToEditClick()をそのまま呼ぶだけで、
+                    新しいdispatcherや終了ロジックは追加しない：
+                    ・syncPlayback.isActive中 → returnToEditFromSync()
+                      （音楽をpauseMusicKeepingPositionで現在位置停止・applySyncPlayback(IDLE_SYNC_PLAYBACK)・forceIdle）
+                    ・それ以外（通常Transition・連続再生） → returnToEdit()（forceIdleのみ）
+                    どちらもcurrentSlideIndex・presentationModeには一切触れないため、押した後は
+                    「現在のFormationを静止表示したまま、構成一覧jump・前後移動・各種再生を
+                    再び開始できる待機状態」に自動的に戻る（forceIdleの既存挙動そのまま）。 */}
+                {animationState.playbackState === "paused" && (
+                  <button
+                    type="button"
+                    onClick={handleCompositionReturnToEditClick}
+                    title="一時停止中の再生を終了し、Formationを自由に切り替えられる状態に戻ります"
+                    style={{
+                      background: THEME.panelBg2,
+                      color: THEME.text,
+                      border: `1px solid ${THEME.danger}88`,
+                    }}
+                    className="px-4 py-2 rounded-lg text-sm font-bold"
+                  >
+                    ■ 再生を終了
+                  </button>
+                )}
+                {/* Presentation Mode v1.1・17〜19章：pause中・playing中は「連続再生」開始buttonを
+                    表示しない（idle時だけ）。既存canPlayContinuousFinal（disabled判定）自体は
+                    変更せず、表示条件へpresentationPlaybackStatus.state==="idle"を追加しただけ。
+                    これによりpause中はprimary resume + 「■ 再生を終了」の2buttonだけになり、
+                    playing中はprimary「⏸ 一時停止」だけが目立つ（20章：レイアウトのガタつき対策と
+                    しては、この行自体をstatus行と分離済みのため、button数が変わってもnav行は動かない）。 */}
+                {presentationPlaybackStatus.state === "idle" && (
+                  <button
+                    type="button"
+                    onClick={handlePlayContinuousClick}
+                    disabled={!canPlayContinuousFinal}
+                    title="現在の構成から最後の構成まで自動的に進みます"
+                    style={{
+                      background: THEME.panelBg2,
+                      color: THEME.text,
+                      border: `1px solid ${THEME.border}`,
+                      opacity: canPlayContinuousFinal ? 1 : 0.5,
+                      cursor: canPlayContinuousFinal ? "pointer" : "not-allowed",
+                    }}
+                    className="px-4 py-2 rounded-lg text-sm font-bold"
+                  >
+                    連続再生
+                  </button>
+                )}
+                {/* Sync Playback Presentation UI整理 v1 + Presentation Mode v1.1・17〜19章：
+                    「音楽同期再生」はidle時だけ表示する。canStartSyncPlayback自体はMusic Anchor・
+                    音源準備状況だけを見ておりplaybackState（再生中かどうか）を判定しないため、
+                    以前は通常Transition/連続再生中でもこのボタンが表示されてしまう隙間があった。
+                    今回、表示条件へpresentationPlaybackStatus.state==="idle"を足すことでその隙間も
+                    合わせて塞ぐ（syncPlaybackPausedActiveチェックはidleなら常にfalseのため実質的に
+                    冗長だが、意図を明確にするため残す）。pause中は上のprimary resumeボタン
+                    （「▶ 音楽同期を再開」）へ一本化し、専用の「音楽同期を再開」ボタンはここでは
+                    描画しない（resumeSyncPlayback自体は削除せず、上のボタンから呼ばれ続ける）。 */}
+                {presentationPlaybackStatus.state === "idle" && canStartSyncPlayback && !syncPlaybackPausedActive && (
+                  <button
+                    type="button"
+                    onClick={startSyncPlayback}
+                    title="音楽に合わせて自動再生します"
+                    style={{ background: THEME.panelBg2, color: THEME.text, border: `1px solid ${THEME.border}` }}
+                    className="px-4 py-2 rounded-lg text-sm font-bold"
+                  >
+                    音楽同期再生
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </main>
 
         {/* 設定パネル */}
+        {/* プレゼンモード v1・3・5章：presentationMode中は右側編集パネル全体を描画しない
+            （display:noneで隠すのではなく、そもそもマウントしない。既存の
+            slsim-sidebar-collapsed CSSクラス＝1カラムレイアウトへ切り替える処理と組み合わせて、
+            ステージ領域を最大限広く使う）。 */}
+        {!presentationMode && (
         <aside className="slsim-sidebar">
-          {/* 操作方法（折りたたみ）：ヘッダーの「？ 操作方法」で開閉。ステージのサイズには影響しない */}
+          {/* Manual v1：ヘッダーの「？ ヘルプ」で開閉。ステージのサイズには影響しない。
+              helpOpenの条件・サイドバー内の表示位置は既存のまま維持し、中身だけを
+              「アプリ概要／はじめての方へ／機能から探す／ショートカット」の新Manualへ置き換える。 */}
           {helpOpen && (
-            <section className="slsim-help-panel">
-              <h3>配置操作</h3>
-              <ul>
-                <li>「出演者の追加」で人を配置します。</li>
-                <li>平面図では出演者をドラッグして移動できます（0.5マス単位で吸着）。</li>
-                <li>ステージ本体だけでなく、下手袖・上手袖・舞台奥の待機エリアにもドラッグして移動できます。</li>
-                <li>出演者をクリックすると選択され、サイドバーで番号・色・身長・座標を編集できます。</li>
-              </ul>
-              <h3>複数選択</h3>
-              <ul>
-                <li>Shift＋クリックで選択の追加・解除ができます。</li>
-                <li>平面図でShift＋空白ドラッグすると矩形範囲選択ができます。</li>
-                <li>選択中の1人をドラッグすると、選択中全員が相対位置を保ったまま一緒に動きます。</li>
-              </ul>
-              <h3>拡大縮小・画面移動</h3>
-              <ul>
-                <li>右上のツールバーの「＋」「−」で拡大縮小、空白部分のドラッグで画面移動できます。</li>
-                <li>キーボードの「+」「−」「0」（Command／Ctrlとの併用も可）でも拡大縮小できます。</li>
-                <li>スマートフォンは指でのドラッグ、トラックパッドは通常のドラッグ（2本指ではない）で移動してください。</li>
-              </ul>
-              <h3>元に戻す／やり直す</h3>
-              <ul>
-                <li>ヘッダーのボタン、またはCommand／Ctrl+Zで元に戻せます。</li>
-                <li>Command／Ctrl+Shift+Z、またはCtrl+Yでやり直せます。</li>
-              </ul>
-            </section>
+            <HelpManual
+              sectionsOpen={helpManualSectionsOpen}
+              onToggleSection={toggleHelpManualSection}
+            />
           )}
 
           {/* 右編集パネルの整理 v1（PART D）：「全体の設定」＝プロジェクト全体に関わる設定
@@ -12313,6 +19293,16 @@ export default function App() {
             icon="🌐"
             open={globalSettingsOpen}
             onToggle={() => setGlobalSettingsOpen((v) => !v)}
+          >
+          {/* 全体設定UI整理・2階層目accordion導入（新規）：「ステージ設定」＋「舞台の外観」を
+              nested CollapsibleGroupでひとまとめにする。既存2sectionの中身は無変更で
+              そのまま子accordionの中へ移動しただけ（handler・データ構造は一切変更なし）。 */}
+          <CollapsibleGroup
+            title="ステージ設定"
+            icon="🎭"
+            open={stageSettingsOpen}
+            onToggle={() => setStageSettingsOpen((v) => !v)}
+            nested
           >
           {/* 1. ステージ設定 */}
           <section>
@@ -12409,17 +19399,32 @@ export default function App() {
               </p>
             </div>
           </section>
+          </CollapsibleGroup>
 
-          <Divider />
-
-          {/* BPM：slideごとの値ではなく、プロジェクト全体で共通の値（work.project.bpm）。
-              「このプロジェクト／使用曲の時間軸を決める値」として扱うため、ステージ設定の
-              すぐ下にまとめて配置する。countsToDurationMsの計算に使われるため、
-              変更するとtransitionCounts・keepCountsの実時間（秒）だけが変わり、
-              カウント数自体やslides/placements/transitionPathsは一切変更しない。
-              再生中・一時停止中は誤操作防止のため編集不可にする（25章：安全性を優先）。 */}
+          {/* 全体設定UI整理・2階層目accordion導入（新規）：「BPM」＋「楽曲セクション」を
+              nested CollapsibleGroupでひとまとめにする（「音楽設定」）。既存2sectionの中身は
+              無変更でそのまま子accordionの中へ移動しただけ（handler・データ構造は一切変更なし）。
+              「ステージ設定」子accordionとの間は、親CollapsibleGroup（全体の設定）のgapで
+              区切りとして十分なため、ここに追加のDividerは置かない。 */}
+          <CollapsibleGroup
+            title="音楽設定"
+            icon="🎵"
+            open={musicSettingsOpen}
+            onToggle={() => setMusicSettingsOpen((v) => !v)}
+            nested
+          >
+          {/* 基準BPM（Music Bar / BPM表示整理 v1.1）：内部field（work.project.bpm）・fallback
+              ロジック（getProjectBpm/getEffectiveBpmForSlide/楽曲セクション生成時の初期値）は
+              一切変更しない。今回はSectionTitleと説明文のみ「基準BPM」表記へ変更し、
+              「音楽位置未設定時の再生速度・新規楽曲セクションの初期値」という実際の役割を
+              正確に伝える（調査結果：楽曲セクションのBPMが設定されている構成では常にそちらが
+              優先される＝getEffectiveBpmForSlide参照）。
+              slideごとの値ではなく、プロジェクト全体で共通の値（work.project.bpm）。
+              countsToDurationMsの計算に使われるため、変更するとtransitionCounts・keepCountsの
+              実時間（秒）だけが変わり、カウント数自体やslides/placements/transitionPathsは
+              一切変更しない。再生中・一時停止中は誤操作防止のため編集不可にする（25章：安全性を優先）。 */}
           <section>
-            <SectionTitle>BPM</SectionTitle>
+            <SectionTitle>基準BPM</SectionTitle>
             <div className="mt-2">
               {/* 入力操作の改善 v2（PART B）：project BPMもDraftNumberFieldへ統一し、
                   ＋／−ボタンに加えてキーボードから直接入力できるようにする（10〜11章）。
@@ -12447,7 +19452,7 @@ export default function App() {
               </div>
               {descOpen.bpm && (
                 <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
-                  このプロジェクト全体で共通のBPMです（構成ごとの値ではありません）。キープ・移動のカウント数はそのままに、実際に再生したときの秒数だけが変わります。
+                  音楽位置が未設定の構成の再生速度や、新しい楽曲セクションを追加したときの初期値として使用します。楽曲セクションのBPMが設定されている場合は、そちらが優先されます。
                 </p>
               )}
             </div>
@@ -12469,7 +19474,7 @@ export default function App() {
             </div>
             {descOpen.musicSection && (
               <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
-                音源の中の「1曲目」「2曲目」などの区切りです。「開始」はそのSectionの音そのものが始まる位置、「カウント開始」は1エイト目・1カウント目が始まる位置です（イントロ等、間に前奏がある場合は分けて設定できます）。通常の同期再生（♫▶）は、構成が指す音楽位置（Anchor）の時刻から音楽と構成アニメーションを同時に開始します。「開始」から自動的にイントロが流れることはありません。曲頭から確認したい場合は、手動Music Anchorを設定した構成の「音楽位置」で再生開始を「曲頭から」に切り替えると、「開始」から音楽が鳴り、Anchorに到達すると構成アニメーションが始まります。時刻は「94.5」のような秒数、「1:34.5」のような分:秒のどちらでも入力できます。BPMは自動解析ではありません。楽曲のBPMを確認して入力してください。
+                音源の中の「1曲目」「2曲目」などの区切りです。「開始」はその楽曲セクションの音そのものが始まる位置、「カウント開始」は1エイト目・1カウント目が始まる位置です（イントロ等、間に前奏がある場合は分けて設定できます）。通常の同期再生（♫▶）は、構成が指す音楽位置の時刻から音楽と構成アニメーションを同時に開始します。「開始」から自動的にイントロが流れることはありません。曲頭から確認したい場合は、音楽位置を手動で設定した構成の「音楽位置」で再生開始を「曲頭から」に切り替えると、「開始」から音楽が鳴り、その音楽位置に到達すると構成アニメーションが始まります。時刻は「94.5」のような秒数、「1:34.5」のような分:秒のどちらでも入力できます。BPMは自動解析ではありません。楽曲のBPMを確認して入力してください。
               </p>
             )}
             <div className="flex flex-col gap-2 mt-2">
@@ -12567,6 +19572,7 @@ export default function App() {
             </button>
           </section>
           </CollapsibleGroup>
+          </CollapsibleGroup>
 
           {/* 「構成ごとの設定」＝現在選択中の構成（currentSlide）・出演者編集に関わる設定
               をひとまとめにする（17章）。 */}
@@ -12619,7 +19625,7 @@ export default function App() {
                 min={MIN_KEEP_COUNTS}
                 max={9999}
                 step={1}
-                allowDecimal={false}
+                allowDecimal
                 onButtonChange={setKeepCountsCommit}
                 onCommit={setKeepCountsCommit}
                 eighthsLabel={formatEighthsLabel(currentKeepCounts)}
@@ -12677,8 +19683,8 @@ export default function App() {
             </div>
             {descOpen.musicAnchor && (
               <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
-                「1エイト目・1カウント目」＝そのMusic Sectionのカウント開始位置（countStartSec）そのものです。曲の開始秒（startSec）とカウント開始秒（countStartSec）は別物で、その間はイントロ等カウント前の区間として扱えます。0エイト目は作りません。通常の同期再生（♫▶）は、この構成が指す音楽位置の時刻から音楽と構成アニメーションを同時に開始するため、startSec〜countStartSecの区間が自動的に再生されることはありません。
-                音楽位置は、前の「手動」位置を起点に、キープ・移動時間から自動計算されます（[自動]）。キープ／移動時間を変更すると、その後ろの自動位置も一緒に調整されます。Section／エイト／カウントを編集するか「手動に固定」を押すと、その構成から新しい手動位置（[手動]）になり、それより前の変更の影響を受けなくなります。
+                「1エイト目・1カウント目」＝その楽曲セクションのカウント開始位置そのものです。「開始」と「カウント開始」は別物で、その間はイントロ等カウント前の区間として扱えます。0エイト目は作りません。通常の同期再生（♫▶）は、この構成が指す音楽位置の時刻から音楽と構成アニメーションを同時に開始するため、「開始」から「カウント開始」までの区間が自動的に再生されることはありません。
+                音楽位置は、前の「手動」位置を起点に、キープ・移動時間から自動計算されます（[自動]）。キープ／移動時間を変更すると、その後ろの自動位置も一緒に調整されます。楽曲セクション／エイト／カウントを編集するか「手動に固定」を押すと、その構成から新しい手動位置（[手動]）になり、それより前の変更の影響を受けなくなります。
               </p>
             )}
             <div className="mt-2">
@@ -12784,7 +19790,7 @@ export default function App() {
                               type="button"
                               onClick={() => setMusicPlaybackStartModeCommit("anchor")}
                               disabled={isTransitionActive}
-                              title={isTransitionActive ? "再生中・一時停止中は変更できません" : "この構成のAnchor時刻から音楽と構成アニメーションを同時に開始します"}
+                              title={isTransitionActive ? "再生中・一時停止中は変更できません" : "この構成の音楽位置の時刻から音楽と構成アニメーションを同時に開始します"}
                               style={modeBtnStyle(currentMode === "anchor")}
                               className="px-2 py-1 rounded-lg text-[11px] font-bold"
                             >
@@ -12794,7 +19800,7 @@ export default function App() {
                               type="button"
                               onClick={() => setMusicPlaybackStartModeCommit("sectionStart")}
                               disabled={isTransitionActive}
-                              title={isTransitionActive ? "再生中・一時停止中は変更できません" : "楽曲セクションの開始位置から音楽を流し、この構成のAnchorで構成アニメーションを開始します"}
+                              title={isTransitionActive ? "再生中・一時停止中は変更できません" : "楽曲セクションの開始位置から音楽を流し、この構成の音楽位置で構成アニメーションを開始します"}
                               style={modeBtnStyle(currentMode === "sectionStart")}
                               className="px-2 py-1 rounded-lg text-[11px] font-bold"
                             >
@@ -12820,7 +19826,7 @@ export default function App() {
                     <p style={{ color: THEME.danger }} className="text-[11px] leading-relaxed">
                       {isMusicAnchorManual
                         ? "⚠ この位置は次の楽曲セクション開始後です"
-                        : "⚠ 自動計算された音楽位置が次の楽曲セクション開始を超えています。必要に応じて次の構成へ手動Anchorを設定してください。"}
+                        : "⚠ 自動計算された音楽位置が次の楽曲セクション開始を超えています。必要に応じて次の構成の音楽位置を「手動に固定」してください。"}
                     </p>
                   )}
 
@@ -12844,7 +19850,7 @@ export default function App() {
                         type="button"
                         onClick={promoteAutoMusicAnchorToManualCommit}
                         disabled={isTransitionActive}
-                        title={isTransitionActive ? "再生中・一時停止中は変更できません" : "今の自動計算位置をこの構成の手動Anchorにします"}
+                        title={isTransitionActive ? "再生中・一時停止中は変更できません" : "今の自動計算位置を、この構成の音楽位置として手動に固定します"}
                         style={{ background: THEME.panelBg2, border: `1px solid ${THEME.accent}`, color: THEME.accent, opacity: isTransitionActive ? 0.5 : 1 }}
                         className="px-2 py-1 rounded-lg text-[11px] font-bold"
                       >
@@ -13113,6 +20119,65 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* 移動時の姿勢：右側編集パネルへ移動（左上「移動経路」付近のUIは廃止）。
+                      ロジックは既存のselectedTransitionPoseSummary・setSelectedTransitionPoseMode・
+                      editablePerformerIds・activeTransitionRを完全にそのまま再利用し、UI配置だけを
+                      変更する。移動先/移動元のFormationが無い場合（editablePerformerIds.length===0）は
+                      既存仕様通り操作不可にする。 */}
+                  <div className="flex items-center gap-2">
+                    <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">移動時の姿勢</label>
+                    <div className="flex gap-2 items-center flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedTransitionPoseMode("start")}
+                        disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                        title="移動中は開始Formationの姿勢のまま移動します（既定）"
+                        style={{
+                          background: selectedTransitionPoseSummary === "start" || selectedTransitionPoseSummary === null ? THEME.accent : THEME.panelBg2,
+                          color: selectedTransitionPoseSummary === "start" || selectedTransitionPoseSummary === null ? "#141318" : THEME.text,
+                          border: `1px solid ${THEME.border}`,
+                          opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                        }}
+                        className="px-3 py-1 rounded text-sm font-bold"
+                      >
+                        開始時の姿勢
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedTransitionPoseMode("standing")}
+                        disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                        title="移動中だけ立ちの姿勢にします（到着すると到着先Formationの姿勢へ戻ります）"
+                        style={{
+                          background: selectedTransitionPoseSummary === "standing" ? THEME.accent : THEME.panelBg2,
+                          color: selectedTransitionPoseSummary === "standing" ? "#141318" : THEME.text,
+                          border: `1px solid ${THEME.border}`,
+                          opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                        }}
+                        className="px-3 py-1 rounded text-sm font-bold"
+                      >
+                        立ち
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedTransitionPoseMode("kneeling")}
+                        disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                        title="移動中だけ片膝の姿勢にします（到着すると到着先Formationの姿勢へ戻ります）"
+                        style={{
+                          background: selectedTransitionPoseSummary === "kneeling" ? THEME.accent : THEME.panelBg2,
+                          color: selectedTransitionPoseSummary === "kneeling" ? "#141318" : THEME.text,
+                          border: `1px solid ${THEME.border}`,
+                          opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                        }}
+                        className="px-3 py-1 rounded text-sm font-bold"
+                      >
+                        片膝
+                      </button>
+                      {selectedTransitionPoseSummary === "mixed" && (
+                        <span style={{ color: THEME.textDim }} className="text-[11px]">（複数の設定）</span>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="flex items-center gap-2">
                     <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">横位置</label>
                     <input
@@ -13333,6 +20398,65 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 移動時の姿勢：右側編集パネルへ移動（左上「移動経路」付近のUIは廃止）。
+                    ロジックは既存のselectedTransitionPoseSummary・setSelectedTransitionPoseMode・
+                    editablePerformerIds・activeTransitionRefを完全にそのまま再利用し、UI配置だけを
+                    変更する。移動先/移動元のFormationが無い場合（editablePerformerIds.length===0）は
+                    既存仕様通り操作不可にする。 */}
+                <div className="flex items-center gap-2">
+                  <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">移動時の姿勢</label>
+                  <div className="flex gap-2 flex-wrap items-center">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTransitionPoseMode("start")}
+                      disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                      title="移動中は開始Formationの姿勢のまま移動します（既定）"
+                      style={{
+                        background: selectedTransitionPoseSummary === "start" || selectedTransitionPoseSummary === null ? THEME.accent : THEME.panelBg2,
+                        color: selectedTransitionPoseSummary === "start" || selectedTransitionPoseSummary === null ? "#141318" : THEME.text,
+                        border: `1px solid ${THEME.border}`,
+                        opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                      }}
+                      className="px-3 py-1 rounded text-sm font-bold"
+                    >
+                      開始時の姿勢
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTransitionPoseMode("standing")}
+                      disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                      title="移動中だけ立ちの姿勢にします（到着すると到着先Formationの姿勢へ戻ります）"
+                      style={{
+                        background: selectedTransitionPoseSummary === "standing" ? THEME.accent : THEME.panelBg2,
+                        color: selectedTransitionPoseSummary === "standing" ? "#141318" : THEME.text,
+                        border: `1px solid ${THEME.border}`,
+                        opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                      }}
+                      className="px-3 py-1 rounded text-sm font-bold"
+                    >
+                      立ち
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTransitionPoseMode("kneeling")}
+                      disabled={editablePerformerIds.length === 0 || isTransitionActive}
+                      title="移動中だけ片膝の姿勢にします（到着すると到着先Formationの姿勢へ戻ります）"
+                      style={{
+                        background: selectedTransitionPoseSummary === "kneeling" ? THEME.accent : THEME.panelBg2,
+                        color: selectedTransitionPoseSummary === "kneeling" ? "#141318" : THEME.text,
+                        border: `1px solid ${THEME.border}`,
+                        opacity: editablePerformerIds.length > 0 && !isTransitionActive ? 1 : 0.5,
+                      }}
+                      className="px-3 py-1 rounded text-sm font-bold"
+                    >
+                      片膝
+                    </button>
+                    {selectedTransitionPoseSummary === "mixed" && (
+                      <span style={{ color: THEME.textDim }} className="text-[11px]">（複数の設定）</span>
+                    )}
+                  </div>
+                </div>
+
                 <div className="flex items-center gap-2">
                   <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">横位置</label>
                   <input
@@ -13428,8 +20552,13 @@ export default function App() {
           {/* Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層に独立した
               「照明の設定」グループを新設する。既存のCollapsibleGroupをそのまま再利用し、
               Lighting専用の別形式アコーディオンは作らない（C章の方針）。
-              G章：lightingEnabledがfalseでもグループ自体は常に表示し、中身を「照明機能を使う」
-              チェックボックスだけに絞る（現在の構成のScene UIはlightingEnabled時のみ表示）。 */}
+              Lighting UI整理・Prototype卒業・F〜I章：Project全体の「照明機能を使う」は正式UI
+              から削除した（Area/Beamを追加しなければ使わない、という運用で十分なため）。
+              work.project.lightingEnabledというfield自体は保存データ互換性のため残っている
+              （既存Projectの互換性を壊さない）が、今回から表示条件としては一切使用しない
+              （Q章）。ユーザーが目にする主要なON/OFFは「照明を表示」（編集画面の表示だけを
+              切り替えるUI state）と、Formationごとの「この構成で照明を使用」（Scene.enabled）
+              の2つだけに整理する（I章）。 */}
           <CollapsibleGroup
             title="照明の設定"
             icon="💡"
@@ -13440,39 +20569,43 @@ export default function App() {
             <SectionTitle>照明機能</SectionTitle>
             <div className="mt-2">
               <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: THEME.text }}>
-                <input
-                  type="checkbox"
-                  checked={lightingEnabled}
-                  onChange={(e) => setLightingEnabledCommit(e.target.checked)}
-                />
-                照明機能を使う
+                <input type="checkbox" checked={showLighting} onChange={(e) => setShowLighting(e.target.checked)} />
+                照明を表示
               </label>
               <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
-                振付師の照明イメージ・要望を構成ごとに記録します。
+                編集画面上の照明表示だけを切り替えます。保存した照明データは消えません。
               </p>
-              {lightingEnabled && (
-                <>
-                  <label className="flex items-center gap-2 text-xs cursor-pointer mt-3" style={{ color: THEME.text }}>
-                    <input type="checkbox" checked={showLighting} onChange={(e) => setShowLighting(e.target.checked)} />
-                    舞台上に照明表示を出す
-                  </label>
-                  <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
-                    表示だけを切り替えます。保存した照明データは消えません。
-                  </p>
-                </>
-              )}
             </div>
           </section>
 
           {/* Lighting v0・O・P章（UI整理v1・E章で「構成ごとの設定」からここへ移動）：
-              現在のFormationのLighting Scene UI。lightingEnabledがtrueの場合のみ表示する
-              （F・G章の方針）。Sceneが無ければ作成ボタンのみ、あれば ON/OFF・メモ・削除の
-              最小限のUIを表示する。handler・データ処理自体は一切変更していない（UI移動のみ）。 */}
-          {lightingEnabled && (
-            <section>
-              <SectionTitle>現在の構成の照明</SectionTitle>
-              <div className="mt-2">
-                {!currentLightingScene ? (
+              現在のFormationのLighting Scene UI。Lighting UI整理・Prototype卒業・F〜R章：
+              Project-level lightingEnabledには依存させず、常に表示する（新規Projectでも
+              直接この導線へアクセスできるようにするため＝R章）。Sceneが無ければ作成ボタンのみ、
+              あれば ON/OFF・メモ・削除の最小限のUIを表示する。handler・データ処理自体は
+              一切変更していない（表示条件のみ変更）。 */}
+          <section>
+            <SectionTitle>現在の構成の照明</SectionTitle>
+            <div className="mt-2">
+              {!currentLightingScene ? (
+                <div className="flex flex-col gap-2">
+                  {/* Lighting Area Formation間logical identity v1・STEP 6：最初のFormation
+                      （currentSlideIndex===0）には直前Formationが存在しないため、この
+                      ボタン自体を表示しない（既存の「開始時」専用UI等と同じ、条件付き
+                      非表示パターンを踏襲。disabledではなく非表示を選んだのは、直前
+                      Formationが概念として存在しない場合にdisabledボタンを常に見せておく
+                      意味が薄いため）。STEP 12：Sceneが無い時だけこのブロック自体が
+                      表示されるため、二重の安全ガードとして自然に機能する。 */}
+                  {currentSlideIndex > 0 && (
+                    <button
+                      type="button"
+                      onClick={inheritLightingFromPreviousFormationCommit}
+                      style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                      className="w-full rounded-lg py-1.5 text-xs font-bold"
+                    >
+                      ← 前の構成から引き継ぐ
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={addLightingSceneForCurrentSlide}
@@ -13481,51 +20614,894 @@ export default function App() {
                   >
                     ＋ この構成に照明設定を追加
                   </button>
+                  {/* v2・N章：個別Lighting clipboard（Area/Beam v2）も、Sceneが無いFormationへ
+                      直接貼り付けられる（貼り付け時にScene自体を新規作成する）。 */}
+                  <button
+                    type="button"
+                    onClick={pasteLightingItemToCurrentSlide}
+                    disabled={!hasCopiedLightingItem}
+                    style={
+                      hasCopiedLightingItem
+                        ? { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                        : { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
+                    }
+                    className="w-full rounded-lg py-1.5 text-xs font-bold"
+                  >
+                    {pasteLightingItemLabel}
+                  </button>
+                  {/* Lighting Cue STEP 2B・Q章：Sceneが無い構成ではCue UI自体を表示せず、
+                      Scene作成が先であることだけを小さく案内する（Cue追加操作からSceneを
+                      自動生成しない＝Lighting Scene作成の既存責務を維持する）。 */}
+                  <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                    照明の変化（キュー）は、先に「＋ この構成に照明設定を追加」してから使えます。
+                  </div>
+                </div>
                 ) : (
                   <div className="flex flex-col gap-2">
+                    {/* v2・K章：個別照明の貼り付け入口。clipboardの中身（Area/Beam v2）に
+                        応じてlabelを変える（type別labelの方が分かりやすいというご要望の
+                        ため）。空ならdisabled。
+                        最終照明コピー廃止 v1：以前ここにあったScene全体copy/paste
+                        （「最終照明をコピー」／「照明設定を貼り付け」）は、「← 前の構成から
+                        引き継ぐ」・「照明状態をコピー/貼り付け」・Area/Beam個別コピー・
+                        「前の構成との接続」の4機能で完全に代替できることを確認したうえで
+                        削除した（旧Project互換のためpositionMoveFromAreaId schemaと
+                        resolveFinalLightingStateForSlide()自体は削除していない）。 */}
+                    <button
+                      type="button"
+                      onClick={pasteLightingItemToCurrentSlide}
+                      disabled={!hasCopiedLightingItem}
+                      style={
+                        hasCopiedLightingItem
+                          ? { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                          : { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
+                      }
+                      className="w-full rounded-lg py-1.5 text-xs font-bold"
+                    >
+                      {pasteLightingItemLabel}
+                    </button>
                     <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: THEME.text }}>
                       <input
                         type="checkbox"
                         checked={!!currentLightingScene.enabled}
                         onChange={(e) => setLightingSceneEnabledCommit(currentLightingScene.id, e.target.checked)}
                       />
-                      この構成の照明を有効にする
+                      この構成で照明を使用
                     </label>
-                    <div>
-                      <div style={{ color: THEME.textDim }} className="text-xs mb-1">メモ</div>
-                      <textarea
-                        value={currentLightingScene.note || ""}
-                        onFocus={beginEdit}
-                        onChange={(e) => updateLightingSceneNoteLive(currentLightingScene.id, e.target.value)}
-                        onBlur={endEdit}
-                        placeholder="例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
-                        rows={3}
-                        style={inputStyle}
-                        className="w-full rounded px-2 py-1.5 text-xs resize-y"
-                      />
+
+                    {/* Lighting Cue STEP 2B〜2G：keep Cue / transition Cueの追加・一覧・選択・
+                        削除、および「開始時へ戻る」ボタンを行うコンパクトなUI。本格的な
+                        timeline componentではなく、count順の小ボタン列＋count入力＋追加
+                        ボタンのみ。「照明の変化（キュー）」という独立したnested CollapsibleGroupは
+                        新設せず、右パネルを圧迫しないよう「現在の構成の照明」直下・Area/Beam
+                        アコーディオンの手前に配置する。
+                        STEP 2G・I〜N章：内部データ（lightingScene.cues／transitionLightingCues・
+                        keep Cue・transition Cue）は一切変更していない。画面上だけ「1〜全体カウント」
+                        というダンサー向けの1始まり表示へ変換する。変換はこのJSXブロック内のUI
+                        display用の値だけで行い、resolveLightingCueState()が使う内部elapsedCounts
+                        の意味・既存Cueの実発火タイミングには一切影響しない（S章）。
+                          ・displayCount = 内部timeline count + 1
+                          ・「開始時」＝Cueではない固定Base Scene（selectedLightingCueId=null）で、
+                            displayCount軸には乗らない。専用の「開始時」ボタンで選ぶ（S章とは別）
+                          ・displayCount 1＝「1カウント目Cue」（内部count=0の通常Cue）として
+                            追加可能。開始時とdisplayCount 1は今回から明確に別概念（Lighting Cue
+                            1カウント目分離 v1）
+                          ・追加・変更可能なCueはdisplayCount 1〜totalCounts
+                          ・displayCount <= keepCounts → keep Cue（内部count = displayCount - 1）
+                          ・displayCount >  keepCounts → transition Cue
+                            （内部local count = displayCount - keepCounts）
+                        という対応関係で、既存のaddLightingCueForCurrentSceneCommit()が使う
+                        「0始まりの内部displayCount」へ変換するadapterだけをこのブロックに追加する
+                        （addLightingCueForCurrentSceneCommit自体・resolveLightingCueState・
+                        Cue schemaは無変更）。 */}
+                    <div style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 10 }} className="flex flex-col gap-1.5">
+                      <div className="flex items-center gap-1">
+                        <div style={{ color: THEME.text }} className="text-xs font-bold">照明の変化（キュー）</div>
+                        {/* 説明UI改善：既存の「説明を見る」パターン（descOpen/toggleDesc/InfoToggle、
+                            keepCounts等の設定パネルで既に使われている折りたたみ説明UI）をそのまま
+                            再利用する。Lighting Cue専用の新しいUI frameworkは作らない。titleによる
+                            hoverツールチップ（クリックでは開閉できなかった）から、クリックで
+                            開閉できる既存InfoToggleへ差し替えた。 */}
+                        <InfoToggle open={!!descOpen.lightingCue} onToggle={() => toggleDesc("lightingCue")} />
+                      </div>
+                      {descOpen.lightingCue && (
+                        <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                          構成の途中で照明を変化させるタイミングを設定できます。「開始時」は1カウント目の照明です。2カウント目以降に、照明の変化（キュー）を追加できます。キープ中だけでなく、次の構成への移動中にも照明の変化を設定できます。
+                        </p>
+                      )}
+                      <div style={{ color: THEME.textDim }} className="text-[11px]">
+                        全体 {currentKeepCounts + (currentTransitionCounts || 0)}カウント
+                        {hasNextSlideForTransition && `／${currentKeepCounts + 1}カウント目から次へ移動`}
+                      </div>
+                      {/* Lighting Cue STEP 2C・U章、STEP 2D・Z章：「今、開始時のLightingを編集
+                          しているのか、何カウント目のCueを編集しているのか」が絶対に曖昧になら
+                          ないよう、コンパクトな1行で常に明示する。transition Cueでも内部のphase名は
+                          出さず、UI上の1始まりdisplayCountだけを見せる。既存THEMEの色のみ使用。 */}
+                      <div style={{ color: (selectedLightingCue || isEditingNextFormationLightingBase) ? THEME.accent : THEME.textDim }} className="text-[11px] font-bold">
+                        {isEditingNextFormationLightingBase
+                          ? "編集中：次構成1（次の構成の開始時）"
+                          : selectedLightingCue
+                          ? `編集中：${
+                              (selectedLightingCuePhase === "transition"
+                                ? currentKeepCounts + selectedLightingCue.count + 1
+                                : selectedLightingCue.count + 1)
+                            }カウント目${
+                              // Lighting Cueへ短い名前/メモを付けられる機能・7章：名前が設定されている
+                              // 場合だけ「　・　名前」を追記する。lightingCueLabel（Export側の時点表示）
+                              // とは完全に別のfield（cue.name）を参照するだけ。
+                              typeof selectedLightingCue.name === "string" && selectedLightingCue.name
+                                ? `　・　${selectedLightingCue.name}`
+                                : ""
+                            }`
+                          : "編集中：開始時"}
+                      </div>
+                      {/* 「次構成1」reference view v1・STEP 10：次Formationにまだ
+                          Lighting Sceneが存在しない場合の案内。ユーザーの明示操作
+                          （[← 前の構成から引き継ぐ] または [＋ 照明設定を作成]）を必ず
+                          経由し、自動生成・自動引き継ぎはしない。既存の「Sceneが無い
+                          Formation」向けUIパターン（ボタン＋短い案内文）を踏襲し、新しい
+                          modal等は作らない。 */}
+                      {isEditingNextFormationLightingBase && !nextLightingSceneForReference && (
+                        <div className="flex flex-col gap-2" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                          <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                            次の構成にはまだ照明設定がありません。
+                          </div>
+                          <button
+                            type="button"
+                            onClick={inheritLightingFromPreviousFormationCommit}
+                            style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                            className="w-full rounded-lg py-1.5 text-xs font-bold"
+                          >
+                            ← 前の構成から引き継ぐ
+                          </button>
+                          <button
+                            type="button"
+                            onClick={addLightingSceneForNextFormation}
+                            style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                            className="w-full rounded-lg py-1.5 text-xs font-bold"
+                          >
+                            ＋ 照明設定を作成
+                          </button>
+                        </div>
+                      )}
+                      {/* Lighting Fade v3・7・8章：「開始時」選択中（selectedLightingCue===null）
+                          だけ表示する開始フェード編集UI。通常Cueの「カウントを変更」「＋名前」
+                          「フェード」UIとは完全に別ブロックにして混同を防ぐ。最初のFormation
+                          （currentSlideIndex===0）では直前Formationが存在せずPlayback上
+                          意味を持たないため、ボタンをdisabledにし理由を小さく表示する。
+                          ただし保存済みentryFadeCountsは書き換えない（並び替えで後から
+                          2番目以降になる可能性があるため＝8章）。 */}
+                      {!selectedLightingCue && !isEditingNextFormationLightingBase && !lightingSceneEntryFadeCountsEditing && (
+                        <div className="flex flex-col gap-1">
+                          <div>
+                            <button
+                              type="button"
+                              disabled={isTransitionActive || currentSlideIndex === 0}
+                              onClick={() => setLightingSceneEntryFadeCountsEditing(true)}
+                              style={{
+                                background: "transparent",
+                                border: `1px solid ${THEME.border}`,
+                                color: THEME.textDim,
+                                opacity: isTransitionActive || currentSlideIndex === 0 ? 0.5 : 1,
+                              }}
+                              className="rounded-lg px-2 py-0.5 text-[11px]"
+                            >
+                              {editLightingSceneEntryFadeCounts > 0 ? `開始フェード ${editLightingSceneEntryFadeCounts}` : "開始フェード"}
+                            </button>
+                          </div>
+                          {currentSlideIndex === 0 && (
+                            <span style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                              最初の構成には直前の構成がないため、開始フェードは使用できません
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {!selectedLightingCue && !isEditingNextFormationLightingBase && lightingSceneEntryFadeCountsEditing && (
+                        <div className="flex flex-col gap-1">
+                          <div className="flex items-center gap-1.5">
+                            <span style={{ color: THEME.textDim }} className="text-[11px]">開始フェード</span>
+                            <input
+                              type="number"
+                              value={editLightingSceneEntryFadeCounts}
+                              min={0}
+                              step={1}
+                              disabled={isTransitionActive}
+                              autoFocus
+                              onChange={(e) => {
+                                const raw = e.target.value;
+                                setEditLightingSceneEntryFadeCounts(raw === "" ? "" : Number(raw));
+                              }}
+                              onKeyDown={(e) => {
+                                // IME判定は数値inputのため不要（既存のCue fade入力と同じ扱い）。
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  updateLightingSceneEntryFadeCountsCommit(editLightingSceneEntryFadeCounts);
+                                  setLightingSceneEntryFadeCountsEditing(false);
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  setEditLightingSceneEntryFadeCounts(
+                                    currentLightingScene && Number.isFinite(Number(currentLightingScene.entryFadeCounts))
+                                      ? Math.max(0, Number(currentLightingScene.entryFadeCounts))
+                                      : 0
+                                  );
+                                  setLightingSceneEntryFadeCountsEditing(false);
+                                }
+                              }}
+                              style={{ ...inputStyle, width: 56, colorScheme: "dark" }}
+                              className="rounded px-2 py-1 text-xs"
+                            />
+                            <span style={{ color: THEME.textDim }} className="text-[11px]">カウント</span>
+                            <button
+                              type="button"
+                              disabled={isTransitionActive}
+                              onClick={() => {
+                                updateLightingSceneEntryFadeCountsCommit(editLightingSceneEntryFadeCounts);
+                                setLightingSceneEntryFadeCountsEditing(false);
+                              }}
+                              style={{
+                                background: THEME.panelBg2,
+                                border: `1px solid ${THEME.border}`,
+                                color: THEME.text,
+                                opacity: isTransitionActive ? 0.5 : 1,
+                              }}
+                              className="rounded-lg px-3 py-1 text-xs font-bold"
+                            >
+                              確定
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditLightingSceneEntryFadeCounts(
+                                  currentLightingScene && Number.isFinite(Number(currentLightingScene.entryFadeCounts))
+                                    ? Math.max(0, Number(currentLightingScene.entryFadeCounts))
+                                    : 0
+                                );
+                                setLightingSceneEntryFadeCountsEditing(false);
+                              }}
+                              style={{ background: "transparent", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+                              className="rounded-lg px-3 py-1 text-xs font-bold"
+                            >
+                              キャンセル
+                            </button>
+                          </div>
+                          <span style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                            直前の構成から、この開始時照明へフェードします
+                          </span>
+                        </div>
+                      )}
+                      {/* Lighting Cue カウント変更UI整理：通常時は「カウントを変更」という
+                          コンパクトなボタンだけを表示し、押したときだけ数値inputへ切り替える
+                          （新規Cue追加UIとの見た目の混同を防ぐ）。「開始時」選択中はボタンごと
+                          表示しない（従来通り）。既存のupdateLightingCueCountCommit()・
+                          editLightingCueCount・selectedLightingCue*には一切手を加えず、
+                          このJSXブロックの表示切替だけを変更する。 */}
+                      {/* Lighting Cue編集UI横並び調整 v1：「カウントを変更」「＋名前/名前を変更」の
+                          2ボタンを、通常時（どちらも編集モードでない時）は同じ1行へ横並びにする。
+                          新しい大きなUI componentは作らず、既存の各ボタン単体をこの1つのflex row
+                          コンテナで囲うだけ。片方だけ編集中の時は、そのボタンだけがこの行から
+                          消え、対応する編集UI（下のブロック）がそのまま表示される既存挙動を維持
+                          する（カウント編集UI・名前編集UI自体には一切手を加えない）。 */}
+                      {/* 照明フェード v1・STEP 13：「フェード」ボタンも同じ横並びflex row内へ追加する
+                          （カウント・名前と同じコンパクトさ）。 */}
+                      {selectedLightingCue &&
+                        (!lightingCueCountEditing || !lightingCueNameEditing || !lightingCueFadeCountsEditing) && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "nowrap" }}>
+                          {!lightingCueCountEditing && (
+                            <button
+                              type="button"
+                              disabled={isTransitionActive}
+                              onClick={() => setLightingCueCountEditing(true)}
+                              style={{
+                                background: "transparent",
+                                border: `1px solid ${THEME.border}`,
+                                color: THEME.textDim,
+                                opacity: isTransitionActive ? 0.5 : 1,
+                              }}
+                              className="rounded-lg px-2 py-0.5 text-[11px]"
+                            >
+                              カウントを変更
+                            </button>
+                          )}
+                          {!lightingCueNameEditing && (
+                            <button
+                              type="button"
+                              disabled={isTransitionActive}
+                              onClick={() => setLightingCueNameEditing(true)}
+                              style={{
+                                background: "transparent",
+                                border: `1px solid ${THEME.border}`,
+                                color: THEME.textDim,
+                                opacity: isTransitionActive ? 0.5 : 1,
+                              }}
+                              className="rounded-lg px-2 py-0.5 text-[11px]"
+                            >
+                              {typeof selectedLightingCue.name === "string" && selectedLightingCue.name ? "名前を変更" : "＋ 名前"}
+                            </button>
+                          )}
+                          {!lightingCueFadeCountsEditing && (
+                            <button
+                              type="button"
+                              disabled={isTransitionActive}
+                              onClick={() => setLightingCueFadeCountsEditing(true)}
+                              style={{
+                                background: "transparent",
+                                border: `1px solid ${THEME.border}`,
+                                color: THEME.textDim,
+                                opacity: isTransitionActive ? 0.5 : 1,
+                              }}
+                              className="rounded-lg px-2 py-0.5 text-[11px]"
+                            >
+                              {(() => {
+                                const currentFade = Number.isFinite(Number(selectedLightingCue.fadeCounts))
+                                  ? Math.max(0, Number(selectedLightingCue.fadeCounts))
+                                  : 0;
+                                return currentFade > 0 ? `フェード ${currentFade}` : "フェード";
+                              })()}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {selectedLightingCue &&
+                        lightingCueCountEditing &&
+                        (() => {
+                          // 重複判定（表示専用のlive check）。既存のhasConflict判定をそのまま
+                          // 再利用し、別の重複判定ロジックは作らない（要件8）。編集モード中だけ
+                          // 表示する。
+                          const editUiCount = editLightingCueCount === "" ? null : Number(editLightingCueCount);
+                          const allDisplayCounts = [
+                            ...currentLightingCues.map((cue) => ({ id: cue.id, displayCount: cue.count + 1 })),
+                            ...currentTransitionLightingCues.map((cue) => ({
+                              id: cue.id,
+                              displayCount: currentKeepCounts + cue.count + 1,
+                            })),
+                          ];
+                          const hasConflict =
+                            editUiCount != null &&
+                            allDisplayCounts.some((c) => c.id !== selectedLightingCue.id && c.displayCount === editUiCount);
+                          const totalCountsForEdit = currentKeepCounts + (currentTransitionCounts || 0);
+                          return (
+                            <div className="flex flex-col gap-1">
+                              <div className="flex items-center gap-1.5">
+                                <span style={{ color: THEME.textDim }} className="text-[11px]">カウント</span>
+                                <input
+                                  type="number"
+                                  value={editLightingCueCount}
+                                  min={1}
+                                  max={Math.max(1, totalCountsForEdit)}
+                                  step={1}
+                                  disabled={isTransitionActive}
+                                  autoFocus
+                                  onFocus={beginEdit}
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    setEditLightingCueCount(raw === "" ? "" : Number(raw));
+                                  }}
+                                  onBlur={endEdit}
+                                  style={{ ...inputStyle, width: 56, colorScheme: "dark" }}
+                                  className="rounded px-2 py-1 text-xs"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={isTransitionActive || editUiCount == null || hasConflict}
+                                  onClick={() => {
+                                    if (editUiCount == null) return;
+                                    // 確定：既存のupdateLightingCueCountCommit()をそのまま呼ぶ
+                                    // （新しい保存ロジックは作らない＝要件5）。成功後は編集モードを
+                                    // 閉じ、通常表示（カウントを変更ボタン）へ戻す。Cueの選択状態は
+                                    // updateLightingCueCountCommit()自体がselectedLightingCueIdを
+                                    // 変更しないため、そのまま維持される。
+                                    updateLightingCueCountCommit(editUiCount);
+                                    setLightingCueCountEditing(false);
+                                  }}
+                                  style={{
+                                    background: THEME.panelBg2,
+                                    border: `1px solid ${THEME.border}`,
+                                    color: THEME.text,
+                                    opacity: isTransitionActive || editUiCount == null || hasConflict ? 0.5 : 1,
+                                  }}
+                                  className="rounded-lg px-3 py-1 text-xs font-bold"
+                                >
+                                  確定
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    // キャンセル：作品データは一切変更せず、editLightingCueCountを
+                                    // 現在選択中Cueの現在の表示カウントへ戻す（既存の表示カウント
+                                    // 計算式をそのまま再利用し、キャンセル専用の別計算は作らない
+                                    // ＝要件6）。
+                                    const keepNow = getKeepCounts(currentSlide);
+                                    const displayCount =
+                                      selectedLightingCuePhase === "transition"
+                                        ? keepNow + selectedLightingCue.count + 1
+                                        : selectedLightingCue.count + 1;
+                                    setEditLightingCueCount(displayCount);
+                                    setLightingCueCountEditing(false);
+                                  }}
+                                  style={{ background: "transparent", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+                                  className="rounded-lg px-3 py-1 text-xs font-bold"
+                                >
+                                  キャンセル
+                                </button>
+                              </div>
+                              {hasConflict && (
+                                <span style={{ color: THEME.textDim }} className="text-[11px]">
+                                  そのカウントには既にキューがあります
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      {/* Lighting Cueへ短い名前/メモを付けられる機能・7〜10章：カウント変更UIと
+                          全く同じ「通常時はコンパクトなボタンだけ、押した時だけinputへ切り替える」
+                          パターン。「開始時」選択中（selectedLightingCueがnull）はこのUI自体を
+                          一切表示しない（8章）。textareaにはせず1行のinput type="text"のみ
+                          （改行不可）。 */}
+                      {selectedLightingCue && lightingCueNameEditing && (
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={editLightingCueName}
+                            disabled={isTransitionActive}
+                            autoFocus
+                            placeholder="例：センター追尾"
+                            onChange={(e) => setEditLightingCueName(e.target.value)}
+                            onKeyDown={(e) => {
+                              // 10章：Enter/確定ボタンで保存、Escape/キャンセルボタンで破棄する
+                              // 明示確定方式。blurでの自動保存はしない（誤クリックだけでUndo履歴が
+                              // 作られるのを避けるため）。IME変換確定のEnterは既存の
+                              // isImeComposingEvent()で除外し、新しいIME判定は作らない。
+                              if (e.key === "Enter") {
+                                if (isImeComposingEvent(e)) return;
+                                e.preventDefault();
+                                updateLightingCueNameCommit(editLightingCueName);
+                                setLightingCueNameEditing(false);
+                              } else if (e.key === "Escape") {
+                                e.preventDefault();
+                                setEditLightingCueName(typeof selectedLightingCue.name === "string" ? selectedLightingCue.name : "");
+                                setLightingCueNameEditing(false);
+                              }
+                            }}
+                            style={{ ...inputStyle, width: 160, colorScheme: "dark" }}
+                            className="rounded px-2 py-1 text-xs"
+                          />
+                          <button
+                            type="button"
+                            disabled={isTransitionActive}
+                            onClick={() => {
+                              updateLightingCueNameCommit(editLightingCueName);
+                              setLightingCueNameEditing(false);
+                            }}
+                            style={{
+                              background: THEME.panelBg2,
+                              border: `1px solid ${THEME.border}`,
+                              color: THEME.text,
+                              opacity: isTransitionActive ? 0.5 : 1,
+                            }}
+                            className="rounded-lg px-3 py-1 text-xs font-bold"
+                          >
+                            確定
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditLightingCueName(typeof selectedLightingCue.name === "string" ? selectedLightingCue.name : "");
+                              setLightingCueNameEditing(false);
+                            }}
+                            style={{ background: "transparent", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+                            className="rounded-lg px-3 py-1 text-xs font-bold"
+                          >
+                            キャンセル
+                          </button>
+                        </div>
+                      )}
+                      {/* 照明フェード v1・STEP 14：Cue count/name編集UIと全く同じpattern
+                          （number input・Enter確定・Escapeキャンセル・確定/キャンセルボタン・
+                          blur自動保存なし）。0以上の整数、過剰な上限値は設けない
+                          （実際の有効fade区間はresolve時に前Cue/phase開始へclampされるため）。 */}
+                      {selectedLightingCue && lightingCueFadeCountsEditing && (
+                        <div className="flex items-center gap-1.5">
+                          <span style={{ color: THEME.textDim }} className="text-[11px]">フェード</span>
+                          <input
+                            type="number"
+                            value={editLightingCueFadeCounts}
+                            min={0}
+                            step={1}
+                            disabled={isTransitionActive}
+                            autoFocus
+                            onChange={(e) => {
+                              const raw = e.target.value;
+                              setEditLightingCueFadeCounts(raw === "" ? "" : Number(raw));
+                            }}
+                            onKeyDown={(e) => {
+                              // IME判定は数値inputのため不要（既存のCue count入力と同じ扱い）。
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                updateLightingCueFadeCountsCommit(editLightingCueFadeCounts);
+                                setLightingCueFadeCountsEditing(false);
+                              } else if (e.key === "Escape") {
+                                e.preventDefault();
+                                setEditLightingCueFadeCounts(
+                                  Number.isFinite(Number(selectedLightingCue.fadeCounts))
+                                    ? Math.max(0, Number(selectedLightingCue.fadeCounts))
+                                    : 0
+                                );
+                                setLightingCueFadeCountsEditing(false);
+                              }
+                            }}
+                            style={{ ...inputStyle, width: 56, colorScheme: "dark" }}
+                            className="rounded px-2 py-1 text-xs"
+                          />
+                          <span style={{ color: THEME.textDim }} className="text-[11px]">カウント</span>
+                          <button
+                            type="button"
+                            disabled={isTransitionActive}
+                            onClick={() => {
+                              updateLightingCueFadeCountsCommit(editLightingCueFadeCounts);
+                              setLightingCueFadeCountsEditing(false);
+                            }}
+                            style={{
+                              background: THEME.panelBg2,
+                              border: `1px solid ${THEME.border}`,
+                              color: THEME.text,
+                              opacity: isTransitionActive ? 0.5 : 1,
+                            }}
+                            className="rounded-lg px-3 py-1 text-xs font-bold"
+                          >
+                            確定
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditLightingCueFadeCounts(
+                                Number.isFinite(Number(selectedLightingCue.fadeCounts))
+                                  ? Math.max(0, Number(selectedLightingCue.fadeCounts))
+                                  : 0
+                              );
+                              setLightingCueFadeCountsEditing(false);
+                            }}
+                            style={{ background: "transparent", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+                            className="rounded-lg px-3 py-1 text-xs font-bold"
+                          >
+                            キャンセル
+                          </button>
+                        </div>
+                      )}
+                      {/* 照明フェード v1.1・J章：フェード編集UIの近くへ、何が変化するのかの
+                          短い補足文を追加する。既存UIと同じtext-[11px]・THEME.textDimで、
+                          大きな説明パネルやtooltip systemは新設しない。 */}
+                      {selectedLightingCue && lightingCueFadeCountsEditing && (
+                        <span style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                          このCueで明るさ・追加・削除が変化する照明に適用
+                        </span>
+                      )}
+                      {/* Lighting状態 clipboard v2：開始時／keep Cue／transition Cueの3種類
+                          すべてで使える「照明状態をコピー／貼り付け」UI。「カウントを変更」とは
+                          独立した操作で、貼り付けてもlightingCueCountEditingへは一切影響しない。
+                          この行が描画される時点で既にcurrentLightingScene（Lighting Scene）は
+                          存在することが保証されている（外側の{!currentLightingScene ? ... : ...}
+                          分岐の中にあるため）ので、「開始時」選択中（selectedLightingCueが
+                          無い状態）でも常に表示する。既存のScene/Area/Beamコピーボタンと
+                          同じ見た目・サイズ感（text-[11px]・rounded-lg）に揃え、
+                          「＋ キュー追加」ボタンとは配置・文言を分けて混同を防ぐ。 */}
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={toggleLightingCueCopy}
+                          style={{
+                            background: isSelectedLightingCueCopySource ? THEME.panelBg2 : "transparent",
+                            border: `1px solid ${isSelectedLightingCueCopySource ? THEME.accent : THEME.border}`,
+                            color: isSelectedLightingCueCopySource ? THEME.accent : THEME.textDim,
+                          }}
+                          className="rounded-lg px-2 py-0.5 text-[11px]"
+                        >
+                          {isSelectedLightingCueCopySource ? "コピー済み" : "照明状態をコピー"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!hasCopiedLightingCue || isTransitionActive}
+                          onClick={pasteLightingCueToSelected}
+                          style={{
+                            background: "transparent",
+                            border: `1px solid ${THEME.border}`,
+                            color: THEME.textDim,
+                            opacity: hasCopiedLightingCue && !isTransitionActive ? 1 : 0.4,
+                          }}
+                          className="rounded-lg px-2 py-0.5 text-[11px]"
+                        >
+                          照明状態を貼り付け
+                        </button>
+                      </div>
+                      {(currentLightingCues.length > 0 || currentTransitionLightingCues.length > 0 || selectedLightingCue || nextSlideForLighting) && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {/* Lighting Cue STEP 2C・T章：Cue選択を解除し、基本Lighting Sceneの
+                              編集へ戻るためのボタン。setSelectedLightingCueId(null)だけを行う。
+                              Lighting Cue 1カウント目分離 v1：「開始時」はdisplayCount軸に乗らない
+                              固定Base Sceneであり、displayCount 1（＝1カウント目Cue）とは別物。
+                              displayCount 1のCueが存在する場合も、このボタンは「開始時」という
+                              文言のまま維持し、Cue一覧側にdisplayCount「1」が別途表示される
+                              （旧STEP 2G・K・N章の「1=開始時」という対応は今回廃止）。 */}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedLightingCueId(null);
+                              setIsEditingNextFormationLightingBase(false);
+                            }}
+                            style={{
+                              background: !selectedLightingCue && !isEditingNextFormationLightingBase ? THEME.panelBg2 : "transparent",
+                              border: `1px solid ${!selectedLightingCue && !isEditingNextFormationLightingBase ? THEME.accent : THEME.border}`,
+                              color: !selectedLightingCue && !isEditingNextFormationLightingBase ? THEME.accent : THEME.text,
+                            }}
+                            className="rounded-lg px-2 py-1 text-xs font-bold"
+                          >
+                            開始時
+                          </button>
+                          {/* Lighting Cue STEP 2D・L・R章：keep Cue・transition Cueを1つの配列へ
+                              統合し、displayCount昇順でUI表示だけsortする（保存配列自体は
+                              sortしない＝R章）。STEP 2G再々改訂：displayCount = 内部timeline
+                              elapsed count + 1という単一の考え方で統一する。keepはcue.count+1、
+                              transitionはtransition local count自体が「keep終了直後からの
+                              経過count」であるため、内部timeline上のelapsed count＝
+                              currentKeepCounts + cue.countとなり、displayCountはそれに+1した
+                              currentKeepCounts + cue.count + 1になる（例：keep=4の場合、
+                              transition local count=0＝表示5、local count=1＝表示6）。 */}
+                          {[
+                            ...currentLightingCues.map((cue) => ({ cue, phase: "keep", displayCount: cue.count + 1 })),
+                            ...currentTransitionLightingCues.map((cue) => ({
+                              cue,
+                              phase: "transition",
+                              displayCount: currentKeepCounts + cue.count + 1,
+                            })),
+                          ]
+                            .sort((a, b) => a.displayCount - b.displayCount)
+                            .map(({ cue, displayCount }) => (
+                              <button
+                                key={cue.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedLightingCueId(cue.id);
+                                  setIsEditingNextFormationLightingBase(false);
+                                }}
+                                style={{
+                                  background: cue.id === selectedLightingCueId && !isEditingNextFormationLightingBase ? THEME.panelBg2 : "transparent",
+                                  border: `1px solid ${cue.id === selectedLightingCueId && !isEditingNextFormationLightingBase ? THEME.accent : THEME.border}`,
+                                  color: cue.id === selectedLightingCueId && !isEditingNextFormationLightingBase ? THEME.accent : THEME.text,
+                                }}
+                                className="rounded-lg px-2 py-1 text-xs"
+                              >
+                                {displayCount}
+                              </button>
+                            ))}
+                          {/* 「次構成1」reference view v1・STEP 11：Lighting Cue timelineの
+                              最後に表示する。時間を1カウント追加するCueではなく、
+                              transition終了＝次Formation開始という同一時刻の、次Formation
+                              Base Sceneへのreference viewであることを示すため、通常の
+                              displayCount番号ボタンとは視覚的に少し区別する（文字ラベル・
+                              やや異なる強調色）。nextSlideForLightingが存在する場合のみ表示
+                              （最終Formationでは自然に非表示＝STEP 6・TEST B）。 */}
+                          {nextSlideForLighting && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedLightingCueId(null);
+                                setIsEditingNextFormationLightingBase(true);
+                              }}
+                              style={{
+                                background: isEditingNextFormationLightingBase ? THEME.panelBg2 : "transparent",
+                                border: `1px dashed ${isEditingNextFormationLightingBase ? THEME.accent : THEME.border}`,
+                                color: isEditingNextFormationLightingBase ? THEME.accent : THEME.textDim,
+                              }}
+                              className="rounded-lg px-2 py-1 text-xs font-bold"
+                            >
+                              次構成1
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {(() => {
+                        // Lighting Cue 新規追加時の重複防止 v1・8章：既存のCueカウント変更UIの
+                        // hasConflict判定（allDisplayCounts.some(...)）と全く同じ考え方
+                        // （cue.count+1／currentKeepCounts+cue.count+1というdisplayCount計算式）
+                        // を再利用し、新規重複判定engineは作らない。新規追加には「自分自身」が
+                        // まだ存在しないため、編集UIのidExclude比較（c.id !== selectedLightingCue.id）
+                        // は不要（新規追加は常に既存Cue全件と比較するだけでよい）。
+                        const newUiCount = newLightingCueCount === "" ? null : Number(newLightingCueCount);
+                        const allDisplayCountsForAdd = [
+                          ...currentLightingCues.map((cue) => ({ displayCount: cue.count + 1 })),
+                          ...currentTransitionLightingCues.map((cue) => ({
+                            displayCount: currentKeepCounts + cue.count + 1,
+                          })),
+                        ];
+                        const hasAddConflict =
+                          newUiCount != null && allDisplayCountsForAdd.some((c) => c.displayCount === newUiCount);
+                        return (
+                          <div className="flex flex-col gap-1">
+                            <div className="flex items-center gap-1.5">
+                              {/* Lighting Cue 1カウント目分離 v1・2章：count入力欄の表示範囲は
+                                  引き続き1〜totalCounts。ただし旧仕様の「1は開始時なので実際の
+                                  追加可能範囲は2〜」という考え方は今回廃止した。1は「1カウント目Cue」
+                                  （内部count=0の通常Cue）として正式に追加できる。「開始時」は
+                                  そのFormationの固定Base Sceneのままで、専用の「開始時」ボタンから
+                                  選ぶ既存UIと完全に分離している（Cue入力欄へ1を入れても「開始時」を
+                                  選択したことにはならない）。 */}
+                              <span style={{ color: THEME.textDim }} className="text-[11px]">カウント</span>
+                              <input
+                                type="number"
+                                value={newLightingCueCount}
+                                min={1}
+                                max={Math.max(1, currentKeepCounts + (currentTransitionCounts || 0))}
+                                step={1}
+                                onFocus={beginEdit}
+                                onChange={(e) => {
+                                  const raw = e.target.value;
+                                  // count input操作性改善：空欄（""）を入力途中の値として一時的に
+                                  // stateへ保持できるようにする。従来は空欄になった瞬間に0へ戻して
+                                  // いたため、Backspaceで0を消してもすぐ0が復活し「01」のように
+                                  // なってしまっていた。空欄はonBlur（下記）で初めて1へfallbackする
+                                  // （STEP 2G：1始まり表示のため、fallback先も0ではなく1にする）。
+                                  setNewLightingCueCount(raw === "" ? "" : Number(raw));
+                                }}
+                                onBlur={() => {
+                                  // 空欄のままフォーカスが外れた場合だけ1へ戻す。既存の
+                                  // beginEdit/endEdit（beginWorkBatch/endWorkBatch）パターンは
+                                  // そのまま維持し、value自体の安全化とは独立させる。
+                                  if (newLightingCueCount === "") setNewLightingCueCount(1);
+                                  endEdit();
+                                }}
+                                style={{ ...inputStyle, width: 56, colorScheme: "dark" }}
+                                className="rounded px-2 py-1 text-xs"
+                              />
+                              <button
+                                type="button"
+                                disabled={hasAddConflict}
+                                onClick={() => {
+                                  // キュー追加時の安全化：入力欄が一時的に""を保持できるようになった
+                                  // ため、追加を押した瞬間に""だった場合は1として扱う。
+                                  const uiCount = newLightingCueCount === "" ? 1 : Number(newLightingCueCount);
+                                  // Lighting Cue 新規追加時の重複防止 v1：disabledで基本的に
+                                  // 押せないが、念のためクリックハンドラ側でも同じ判定でreturnする
+                                  // （実際の最終防御はaddLightingCueForCurrentSceneCommit内部・
+                                  // commit側の二重チェック＝5章）。
+                                  if (hasAddConflict) return;
+                                  // Lighting Cue 1カウント目分離 v1・6章：uiCount===1（＝1カウント目）
+                                  // も、今後は「開始時」選択にフォールバックせず正式にCueを追加する
+                                  // （旧: uiCount<=1なら setSelectedLightingCueId(null) して終了、
+                                  // という早期returnを廃止した）。「開始時」を選びたい場合は、この
+                                  // 入力欄ではなく既存の「開始時」ボタンを使う（7章）。
+                                  // STEP 2G再々改訂・L・M・P章：1始まりのUI表示countを、既存の
+                                  // addLightingCueForCurrentSceneCommit()へ渡す内部displayCountへ
+                                  // 変換するadapter。displayCount = 内部timeline elapsed count + 1
+                                  // という単一の考え方に統一したため、keep/transitionで分岐せず
+                                  // 常にinternalDisplayCount = uiCount - 1でよい（例：keep=4の場合、
+                                  // uiCount=5 → internalDisplayCount=4。uiCount=1 →
+                                  // internalDisplayCount=0＝1カウント目Cue。
+                                  // addLightingCueForCurrentSceneCommit内部のisTransitionCue判定
+                                  // 「safeDisplayCount >= keep」・resolveLightingCueStateの発火式・
+                                  // Cue schema・localCountの計算式自体は一切変更していない）。
+                                  const internalDisplayCount = uiCount - 1;
+                                  addLightingCueForCurrentSceneCommit(internalDisplayCount);
+                                }}
+                                style={
+                                  hasAddConflict
+                                    ? { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
+                                    : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                                }
+                                className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                              >
+                                ＋ キュー追加
+                              </button>
+                            </div>
+                            {hasAddConflict && (
+                              <span style={{ color: THEME.textDim }} className="text-[11px]">
+                                そのカウントには既にキューがあります
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
+                      {selectedLightingCue && (
+                        <button
+                          type="button"
+                          onClick={() => deleteLightingCue(selectedLightingCue.id)}
+                          style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                          className="rounded-lg py-1.5 text-xs font-bold"
+                        >
+                          キューを削除
+                        </button>
+                      )}
                     </div>
 
                     {/* Lighting Area v1・Q章：Area一覧＋選択中Areaの設定。Scene→Areaという
-                        親子関係のため、Sceneがある場合だけこのブロックが現れる（G章）。 */}
-                    <div style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 10 }}>
-                      <div style={{ color: THEME.textDim }} className="text-xs mb-1">照明エリア</div>
-                      {currentLightingAreas.length > 0 && (
+                        親子関係のため、Sceneがある場合だけこのブロックが現れる（G章）。
+                        Lighting UI整理・Prototype卒業・J章：折りたたみ可能にする。見出し行は
+                        常に表示し、件数を出す。詳細UI（一覧・追加ボタン・選択中Areaの編集欄）は
+                        lightingAreaSectionOpenがtrueの場合だけ表示する。 */}
+                    {/* 照明UI整理・nested CollapsibleGroup統一（新規）：独自の
+                        borderTop+button+矢印アコーディオンを廃止し、「全体の設定」内の
+                        「ステージ設定」「音楽設定」と同じnested CollapsibleGroupへ統一する。
+                        open stateは既存のlightingAreaSectionOpenをそのまま再利用し、
+                        新しいstateは追加しない。中身（一覧・追加・選択中Areaの編集欄など）は
+                        一切変更せず、そのままchildrenへ移動しただけ。 */}
+                    <CollapsibleGroup
+                      title={`照明エリア（${displayLightingAreas.length}）`}
+                      icon="🟡"
+                      open={lightingAreaSectionOpen}
+                      onToggle={() => setLightingAreaSectionOpen((v) => !v)}
+                      nested
+                    >
+                      <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed -mt-1">
+                        舞台上の照らしたい範囲
+                      </p>
+                      {displayLightingAreas.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 mb-2">
-                          {currentLightingAreas.map((area, idx) => (
+                          {displayLightingAreas.map((area, idx) => {
+                            const isMultiSelected = selectedLightingItemKeys.some((k) => k.type === "area" && k.id === area.id);
+                            return (
+                              <button
+                                key={area.id}
+                                type="button"
+                                onClick={(e) =>
+                                  e.shiftKey ? toggleLightingItemSelect("area", area.id) : selectLightingItemOnly("area", area.id)
+                                }
+                                style={{
+                                  background: isMultiSelected ? THEME.panelBg2 : "transparent",
+                                  border: `1px solid ${isMultiSelected ? THEME.accent : THEME.border}`,
+                                  color: THEME.text,
+                                }}
+                                className="rounded-lg px-2 py-1 text-xs"
+                              >
+                                照明エリア {idx + 1}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {/* Lighting複数選択 v1：削除操作を追加ボタンに近い位置へ整理する
+                          （実制作での削除頻度の高さに合わせる）。単一選択時は「選択中の照明を
+                          削除」、複数選択時（Area/Beam合算）は「選択した照明を削除（N）」に
+                          文言が変わる。deleteSelectedLightingItems()は既存のreadActive/
+                          writeActiveLightingLists()を使う1回のcommitWorkで、開始時/keep/
+                          transitionのうち現在の編集対象だけを削除する。Area詳細設定下部の
+                          既存の個別削除ボタンはこのボタンと役割が重複するため削除した
+                          （deleteLightingArea自体は他から使われる可能性を確認済みで、
+                          関数定義自体は変更していない）。
+                          Lighting要素clipboard統合 v1：複数選択時（2件以上）だけ、削除ボタンの
+                          隣に「選択した照明をコピー（N）」を追加する。1件選択時は既存の個別
+                          コピーUI（この照明エリア/ビームをコピー）と二重表示になるため出さない
+                          （10章）。copySelectedLightingItems()は作品データを変更しないため
+                          danger styleにはせず、削除ボタンと視覚的に区別する。
+                          Lighting要素clipboard複数copyフィードバック v1：押した直後、現在の
+                          選択集合がclipboardのコピー元集合と一致する間は「✓ N個コピー済み」
+                          へ切り替える（isSelectedLightingItemsCopySource）。単体copyの
+                          「✓ コピー済み」と同じaccent border/text系の見た目。 */}
+                      {selectedLightingItemKeys.length > 0 && (
+                        <div className="flex gap-2 mb-2">
+                          {selectedLightingItemKeys.length > 1 && (
                             <button
-                              key={area.id}
                               type="button"
-                              onClick={() => setSelectedLightingAreaId(area.id)}
-                              style={{
-                                background: area.id === selectedLightingAreaId ? THEME.panelBg2 : "transparent",
-                                border: `1px solid ${area.id === selectedLightingAreaId ? THEME.accent : THEME.border}`,
-                                color: THEME.text,
-                              }}
-                              className="rounded-lg px-2 py-1 text-xs"
+                              onClick={copySelectedLightingItems}
+                              style={
+                                isSelectedLightingItemsCopySource
+                                  ? { background: THEME.panelBg2, border: `1px solid ${THEME.accent}`, color: THEME.accent }
+                                  : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                              }
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
                             >
-                              照明エリア {idx + 1}
+                              {isSelectedLightingItemsCopySource
+                                ? `✓ ${selectedLightingItemKeys.length}個コピー済み`
+                                : `選択した照明をコピー（${selectedLightingItemKeys.length}）`}
                             </button>
-                          ))}
+                          )}
+                          <button
+                            type="button"
+                            onClick={deleteSelectedLightingItems}
+                            style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                            className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                          >
+                            {selectedLightingItemKeys.length > 1
+                              ? `選択した照明を削除（${selectedLightingItemKeys.length}）`
+                              : "選択中の照明を削除"}
+                          </button>
                         </div>
                       )}
                       <button
@@ -13542,21 +21518,28 @@ export default function App() {
                           <div>
                             <div style={{ color: THEME.textDim }} className="text-xs mb-1">形</div>
                             <div className="flex gap-1.5">
-                              {LIGHTING_AREA_SHAPES.map((shapeKey) => (
-                                <button
-                                  key={shapeKey}
-                                  type="button"
-                                  onClick={() => setLightingAreaShapeCommit(selectedLightingArea.id, shapeKey)}
-                                  style={{
-                                    background: selectedLightingArea.shape === shapeKey ? THEME.panelBg2 : "transparent",
-                                    border: `1px solid ${selectedLightingArea.shape === shapeKey ? THEME.accent : THEME.border}`,
-                                    color: THEME.text,
-                                  }}
-                                  className="flex-1 rounded-lg py-1 text-xs"
-                                >
-                                  {LIGHTING_AREA_SHAPE_LABELS[shapeKey]}
-                                </button>
-                              ))}
+                              {LIGHTING_AREA_SHAPES.map((shapeKey) => {
+                                // Lighting Area整理 v1・B・C章：矩形はUIから削除済み（LIGHTING_AREA_SHAPES
+                                // 自体が["circle","ellipse"]の2つだけになった）。旧rectデータ（あるいは
+                                // 未知の値）は normalizeLightingAreaShape() で必ず"ellipse"として扱われる
+                                // ため、「楕円」ボタンが選択中として表示される（C章のfallback要件）。
+                                const isActive = normalizeLightingAreaShape(selectedLightingArea.shape) === shapeKey;
+                                return (
+                                  <button
+                                    key={shapeKey}
+                                    type="button"
+                                    onClick={() => setLightingAreaShapeCommit(selectedLightingArea.id, shapeKey)}
+                                    style={{
+                                      background: isActive ? THEME.panelBg2 : "transparent",
+                                      border: `1px solid ${isActive ? THEME.accent : THEME.border}`,
+                                      color: THEME.text,
+                                    }}
+                                    className="flex-1 rounded-lg py-1 text-xs"
+                                  >
+                                    {LIGHTING_AREA_SHAPE_LABELS[shapeKey]}
+                                  </button>
+                                );
+                              })}
                             </div>
                           </div>
 
@@ -13599,12 +21582,16 @@ export default function App() {
                                 allowDecimal
                                 onCommit={(v) =>
                                   commitWork((prev) => {
-                                    const slide = prev.slides[prev.currentSlideIndex];
-                                    if (!slide) return prev;
-                                    const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, selectedLightingArea.id, {
-                                      x: clamp(Number(v), -prev.stage.width / 2, prev.stage.width / 2),
-                                    });
-                                    return { ...prev, lightingScenes: nextScenes };
+                                    const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+                                    if (!targetSlideId) return prev;
+                                    return applyActiveLightingUpdate(
+                                      prev,
+                                      targetSlideId,
+                                      activeLightingCueSelectionForEdit,
+                                      "area",
+                                      selectedLightingArea.id,
+                                      { x: clamp(Number(v), -prev.stage.width / 2, prev.stage.width / 2) }
+                                    );
                                   })
                                 }
                               />
@@ -13617,12 +21604,16 @@ export default function App() {
                                 allowDecimal
                                 onCommit={(v) =>
                                   commitWork((prev) => {
-                                    const slide = prev.slides[prev.currentSlideIndex];
-                                    if (!slide) return prev;
-                                    const nextScenes = updateLightingAreaInScenes(getLightingScenes(prev), slide.id, selectedLightingArea.id, {
-                                      y: clamp(Number(v), 0, prev.stage.depth),
-                                    });
-                                    return { ...prev, lightingScenes: nextScenes };
+                                    const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+                                    if (!targetSlideId) return prev;
+                                    return applyActiveLightingUpdate(
+                                      prev,
+                                      targetSlideId,
+                                      activeLightingCueSelectionForEdit,
+                                      "area",
+                                      selectedLightingArea.id,
+                                      { y: clamp(Number(v), 0, prev.stage.depth) }
+                                    );
                                   })
                                 }
                               />
@@ -13631,7 +21622,7 @@ export default function App() {
 
                           <div className="flex flex-col gap-2">
                             <div style={{ color: THEME.textDim }} className="text-xs">
-                              サイズ{selectedLightingArea.shape === "circle" ? "（円は幅＝奥行き）" : ""}
+                              サイズ{normalizeLightingAreaShape(selectedLightingArea.shape) === "circle" ? "（円は幅＝奥行き）" : ""}
                             </div>
                             <div className="flex gap-2">
                               <DraftNumberField
@@ -13650,7 +21641,7 @@ export default function App() {
                                 max={LIGHTING_AREA_MAX_SIZE}
                                 step={0.5}
                                 allowDecimal
-                                disabled={selectedLightingArea.shape === "circle"}
+                                disabled={normalizeLightingAreaShape(selectedLightingArea.shape) === "circle"}
                                 onCommit={(v) => setLightingAreaSizeCommit(selectedLightingArea.id, "height", v)}
                               />
                             </div>
@@ -13684,17 +21675,821 @@ export default function App() {
                             </div>
                           </div>
 
+                          {/* Lighting Area Move v1・Boundary Move v1・STEP 4・5：Areaの「移動」
+                              設定。Cue上部のカウント/名前/フェード欄には置かず、既存Beamの
+                              「追尾」（🎯 追尾…select＋短い説明文）と同じ考え方で、Areaの個別
+                              設定内へ配置する。選択中Lighting Cueがある時はCue間Move
+                              （PART A・既存Lighting Area Move v1）、「開始時」編集中は
+                              Lighting Area Boundary Move v1（PART B・構成境界Move）を表示する
+                              （STEP 3B：大きな説明パネルは追加しない）。 */}
+                          <div className="flex flex-col gap-1.5">
+                            <div style={{ color: THEME.textDim }} className="text-xs">移動</div>
+                            {selectedLightingCueSelection ? (
+                              <>
+                                <DraftNumberField
+                                  ariaLabel="照明エリアの移動カウント"
+                                  value={getLightingAreaPositionMoveCounts(selectedLightingArea)}
+                                  min={0}
+                                  max={999}
+                                  step={0.5}
+                                  allowDecimal
+                                  suffix="カウント"
+                                  onCommit={(v) => setLightingAreaPositionMoveCountsCommit(selectedLightingArea.id, v)}
+                                  inputClassName="w-full text-center rounded-lg py-1.5 text-sm font-bold"
+                                />
+                                <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                  直前の照明位置から、このキューの位置へ移動します
+                                </div>
+                              </>
+                            ) : isEditingNextFormationLightingBase || currentSlideIndex > 0 ? (
+                              <>
+                                {/* Lighting Area Boundary Move v1・STEP 3B：既存Beam追尾selectと
+                                    同じUIパターン（select＋条件付き追加フィールド＋短い説明文）。
+                                    2番目以降のFormationの「開始時」でだけ使用可能
+                                    （STEP 3B：最初のFormationは直前Formationが存在しないため
+                                    設定不可）。
+                                    「次構成1」reference view v1：isEditingNextFormationLightingBase
+                                    がtrueの間は、currentSlideIndexの値に関わらず必ずこの
+                                    Boundary Move UIを表示する（「次構成1」＝次Formationの
+                                    開始時は、その定義上、常に現在Formationという直前Formationを
+                                    持つため。currentSlideIndex===0であっても「次構成1」自体は
+                                    2番目以降のFormationを指すので対象外にしない）。 */}
+                                <select
+                                  value={getLightingAreaPositionMoveMode(selectedLightingArea)}
+                                  onChange={(e) => setLightingAreaPositionMoveModeCommit(selectedLightingArea.id, e.target.value)}
+                                  aria-label="照明エリアの構成境界移動"
+                                  style={inputStyle}
+                                  className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                                >
+                                  <option value="none">移動なし</option>
+                                  <option value="transition">構成間の移動に合わせる</option>
+                                  <option value="custom">指定する</option>
+                                </select>
+                                {getLightingAreaPositionMoveMode(selectedLightingArea) === "custom" && (
+                                  <DraftNumberField
+                                    ariaLabel="照明エリアの構成境界移動カウント"
+                                    value={getLightingAreaPositionMoveCounts(selectedLightingArea)}
+                                    min={0}
+                                    max={999}
+                                    step={0.5}
+                                    allowDecimal
+                                    suffix="カウント"
+                                    onCommit={(v) => setLightingAreaPositionMoveCountsCommit(selectedLightingArea.id, v)}
+                                    inputClassName="w-full text-center rounded-lg py-1.5 text-sm font-bold"
+                                  />
+                                )}
+                                {getLightingAreaPositionMoveMode(selectedLightingArea) !== "none" && (
+                                  <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                    直前の構成の照明位置から、この構成の開始位置へ移動します
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                最初の構成のため設定できません
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Cue間・前の状態との接続 v1・STEP11・12：Cue選択中のAreaに、
+                              「現在Cueより前に実在する最後のLighting状態」との接続UIを
+                              「移動」欄のすぐ下へ追加する。Base Scene編集中（cueLighting
+                              AreaConnectionCandidatesはactiveLightingCueSelectionForEdit
+                              ===nullの間は常に[]になる設計）では自然に非表示になる
+                              （STEP11：Base Sceneでは既存の「前の構成との接続」のみ使う）。
+                              候補が1件も無ければブロックごと表示しない。 */}
+                          {cueLightingAreaConnectionCandidates.length > 0 && (
+                            <div className="flex flex-col gap-1.5" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                              <div style={{ color: THEME.textDim }} className="text-xs">前の状態との接続</div>
+                              <select
+                                value={
+                                  getLightingAreaLogicalId(selectedLightingArea) &&
+                                  cueLightingAreaConnectionCandidates.some(
+                                    (a) => getLightingAreaLogicalId(a) === getLightingAreaLogicalId(selectedLightingArea)
+                                  )
+                                    ? cueLightingAreaConnectionCandidates.find(
+                                        (a) => getLightingAreaLogicalId(a) === getLightingAreaLogicalId(selectedLightingArea)
+                                      ).id
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  if (e.target.value === "") {
+                                    disconnectLightingAreaFromPreviousFormationCommit(selectedLightingArea.id);
+                                  } else {
+                                    connectLightingAreaToPreviousCueStateCommit(selectedLightingArea.id, e.target.value);
+                                  }
+                                }}
+                                aria-label="前の状態の照明エリアと接続"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">接続しない</option>
+                                {cueLightingAreaConnectionCandidates.map((area, i) => (
+                                  <option key={area.id} value={area.id}>
+                                    前の状態の照明エリア {i + 1}（{LIGHTING_AREA_COLOR_LABELS[area.color] || area.color}・
+                                    {normalizeLightingAreaShape(area.shape) === "circle" ? "円形" : "楕円"}）
+                                  </option>
+                                ))}
+                              </select>
+                              {lightingAreaConnectionWarning && (
+                                <div style={{ color: THEME.danger }} className="text-[11px] leading-relaxed">
+                                  {lightingAreaConnectionWarning}
+                                </div>
+                              )}
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                位置・色・大きさは変更せず、前の状態と同じ照明エリアの続きとして扱います
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Lighting Area 後付け接続 v1・STEP 5・6：普通にcopy/pasteして
+                              作ったAreaを、後から直前Formationの最終Lighting Areaと接続する
+                              ためのUI。「移動」欄のすぐ下、Boundary Move UIと同じ表示条件
+                              （isEditingNextFormationLightingBase || currentSlideIndex > 0、
+                              かつactiveLightingCueSelectionForEdit===null＝Base Scene編集中）
+                              の時だけ表示する（STEP6：Cue snapshot内では表示しない）。候補が
+                              1件も無ければブロックごと表示しない（不要な密度増加を避ける）。 */}
+                          {lightingAreaConnectionCandidates.length > 0 && (
+                            <div className="flex flex-col gap-1.5" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                              <div style={{ color: THEME.textDim }} className="text-xs">前の構成との接続</div>
+                              <select
+                                value={
+                                  getLightingAreaLogicalId(selectedLightingArea) &&
+                                  lightingAreaConnectionCandidates.some(
+                                    (a) => getLightingAreaLogicalId(a) === getLightingAreaLogicalId(selectedLightingArea)
+                                  )
+                                    ? lightingAreaConnectionCandidates.find(
+                                        (a) => getLightingAreaLogicalId(a) === getLightingAreaLogicalId(selectedLightingArea)
+                                      ).id
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  if (e.target.value === "") {
+                                    disconnectLightingAreaFromPreviousFormationCommit(selectedLightingArea.id);
+                                  } else {
+                                    connectLightingAreaToPreviousFormationCommit(selectedLightingArea.id, e.target.value);
+                                  }
+                                }}
+                                aria-label="前の構成の照明エリアと接続"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">接続しない</option>
+                                {lightingAreaConnectionCandidates.map((area, i) => (
+                                  <option key={area.id} value={area.id}>
+                                    前の構成の照明エリア {i + 1}（{LIGHTING_AREA_COLOR_LABELS[area.color] || area.color}・
+                                    {normalizeLightingAreaShape(area.shape) === "circle" ? "円形" : "楕円"}）
+                                  </option>
+                                ))}
+                              </select>
+                              {lightingAreaConnectionWarning && (
+                                <div style={{ color: THEME.danger }} className="text-[11px] leading-relaxed">
+                                  {lightingAreaConnectionWarning}
+                                </div>
+                              )}
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                位置・色・大きさは変更せず、同じ照明エリアの続きとして扱います
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Lighting Area 回転 v1・6・11・12章：ellipse選択時のみ回転編集UIを表示する
+                              （circleは回転しても見た目が変わらないため非表示のまま＝不要な複雑さを
+                              追加しない）。既存のtype="range"スライダー（構成間スクラバー等と同じ
+                              スタイル無しの標準input）とDraftNumberField（数値でも正確に指定できる
+                              ように＝12章）を両方用意し、新しいUIデザイン体系は作らない。 */}
+                          {normalizeLightingAreaShape(selectedLightingArea.shape) === "ellipse" && (
+                            <div className="flex flex-col gap-2">
+                              <div style={{ color: THEME.textDim }} className="text-xs">回転</div>
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={359}
+                                  step={1}
+                                  value={Number(selectedLightingArea.rotation) || 0}
+                                  onChange={(e) => setLightingAreaRotationCommit(selectedLightingArea.id, e.target.value)}
+                                  className="flex-1"
+                                />
+                                <DraftNumberField
+                                  ariaLabel="回転角度"
+                                  value={Number(selectedLightingArea.rotation) || 0}
+                                  min={0}
+                                  max={359}
+                                  step={1}
+                                  onCommit={(v) => setLightingAreaRotationCommit(selectedLightingArea.id, v)}
+                                  inputClassName="w-16 text-center rounded-lg py-1.5 text-sm font-bold"
+                                />
+                                <span style={{ color: THEME.textDim }} className="text-xs">°</span>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Lighting個別コピー v2・G・P章：「複製」＝同一Formation内で即座に
+                              増やす、「コピー」＝別Formationへ持っていくためclipboardへ保存、
+                              という役割の違いをボタン文言で明確にする。コピー中（このAreaが
+                              個別clipboardのコピー元）はTHEME.accentで強調表示する
+                              （Scene丸ごとコピーの「✓」表示と同じ考え方）。 */}
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => duplicateLightingArea(selectedLightingArea.id)}
+                              style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              この照明エリアを複製
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => toggleLightingAreaCopy(selectedLightingArea.id)}
+                              style={
+                                isSelectedAreaCopySource
+                                  ? { background: THEME.panelBg2, border: `1px solid ${THEME.accent}`, color: THEME.accent }
+                                  : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                              }
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              {isSelectedAreaCopySource ? "✓ コピー済み" : "この照明エリアをコピー"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </CollapsibleGroup>
+
+                    {/* 照明UI整理・nested CollapsibleGroup統一（新規）：Beam v1と同じく、
+                        独自の折りたたみUIを廃止し、nested CollapsibleGroupへ統一する。
+                        open stateは既存のlightingBeam3DSectionOpenをそのまま再利用する。
+                        中身（一覧・追加・「選択中の出演者を照らす」・選択中Beamの編集欄など）は
+                        一切変更せず、そのままchildrenへ移動しただけ。
+                        Area/Beam2つのnested CollapsibleGroup間は、親CollapsibleGroup
+                        （照明の設定）のgapで区切りとして十分なため、追加のDividerは置かない。 */}
+                    <CollapsibleGroup
+                      title={`照明ビーム（${displayLightingBeams3D.length}）`}
+                      icon="🔦"
+                      open={lightingBeam3DSectionOpen}
+                      onToggle={() => setLightingBeam3DSectionOpen((v) => !v)}
+                      nested
+                    >
+                      <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed -mt-1">
+                        上空の発光元から舞台へ伸びる光
+                      </p>
+                      {displayLightingBeams3D.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {displayLightingBeams3D.map((beam, idx) => {
+                            const isMultiSelected = selectedLightingItemKeys.some((k) => k.type === "beam3d" && k.id === beam.id);
+                            return (
+                              <button
+                                key={beam.id}
+                                type="button"
+                                onClick={(e) =>
+                                  e.shiftKey ? toggleLightingItemSelect("beam3d", beam.id) : selectLightingItemOnly("beam3d", beam.id)
+                                }
+                                aria-label={`照明ビーム ${idx + 1}`}
+                                style={{
+                                  background: isMultiSelected ? THEME.panelBg2 : "transparent",
+                                  border: `1px solid ${isMultiSelected ? THEME.accent : THEME.border}`,
+                                  color: THEME.text,
+                                }}
+                                className="rounded-lg px-2 py-1 text-xs"
+                              >
+                                照明ビーム {idx + 1}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {/* Lighting複数選択 v1：Beam側にも同じ一括削除ボタンを配置する
+                          （Area+Beam混在選択でもどちらの節から見ても削除できるようにするため）。
+                          呼び出す関数・表示ロジックはArea側と全く同じdeleteSelectedLightingItems
+                          を再利用し、別の削除ロジックは作らない。Beam詳細設定下部の既存の
+                          個別削除ボタンはこのボタンと役割が重複するため削除した。
+                          Lighting要素clipboard統合 v1：Area側と同じく、複数選択時（2件以上）だけ
+                          「選択した照明をコピー（N）」を隣に表示する。同じcopySelectedLightingItems()
+                          を再利用し、Beam専用のcopyロジックは作らない。
+                          Lighting要素clipboard複数copyフィードバック v1：Area側と全く同じ
+                          isSelectedLightingItemsCopySourceを再利用し、Beam専用の判定は作らない。 */}
+                      {selectedLightingItemKeys.length > 0 && (
+                        <div className="flex gap-2 mb-2">
+                          {selectedLightingItemKeys.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={copySelectedLightingItems}
+                              style={
+                                isSelectedLightingItemsCopySource
+                                  ? { background: THEME.panelBg2, border: `1px solid ${THEME.accent}`, color: THEME.accent }
+                                  : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                              }
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              {isSelectedLightingItemsCopySource
+                                ? `✓ ${selectedLightingItemKeys.length}個コピー済み`
+                                : `選択した照明をコピー（${selectedLightingItemKeys.length}）`}
+                            </button>
+                          )}
                           <button
                             type="button"
-                            onClick={() => deleteLightingArea(selectedLightingArea.id)}
+                            onClick={deleteSelectedLightingItems}
                             style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
-                            className="rounded-lg py-1.5 text-xs font-bold"
+                            className="flex-1 rounded-lg py-1.5 text-xs font-bold"
                           >
-                            この照明エリアを削除
+                            {selectedLightingItemKeys.length > 1
+                              ? `選択した照明を削除（${selectedLightingItemKeys.length}）`
+                              : "選択中の照明を削除"}
                           </button>
                         </div>
                       )}
-                    </div>
+                      <button
+                        type="button"
+                        onClick={addLightingBeam3DForCurrentScene}
+                        aria-label="照明ビームを追加"
+                        style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                        className="w-full rounded-lg py-1.5 text-xs font-bold"
+                      >
+                        ＋ 照明ビームを追加
+                      </button>
+
+                      {/* 照明ビーム操作性整理 v1・B〜G章：出演者を選択した状態でこのボタンを押すと、
+                          その人物の真上（source.z=20）から真下（target.z=0）へ落ちる新しい照明
+                          ビームを自動追加し、追加したBeamを自動選択する。既存Beamの選択有無は
+                          条件にしない（E章：既存Beamを選択しないと出せない場所には置かない）。
+                          出演者0人・待機エリアのみ選択・再生中はdisabled（F章）。
+                          複数出演者スポット v1・2・4・16章：選択出演者が2人以上の場合、
+                          「選択中の出演者を照らす（N）」として実際に生成されるBeam本数を
+                          表示する。1人の場合は従来通りの文言のまま（既存UXを変えない）。 */}
+                      <button
+                        type="button"
+                        onClick={() => addLightingBeam3DAtSelectedPerformersCommit(selectedPerformerIdsForSpotlight)}
+                        disabled={!canLightSelectedPerformersWithBeam3D}
+                        aria-label="選択中の出演者を照らす"
+                        title={
+                          isTransitionActive
+                            ? "再生中は追加できません"
+                            : selectedIds.length === 0
+                            ? "出演者を選択してください"
+                            : selectedPerformerIdsForSpotlight.length === 0
+                            ? "待機エリアの出演者は対象外です"
+                            : selectedPerformerIdsForSpotlight.length > 1
+                            ? `選択中の出演者${selectedPerformerIdsForSpotlight.length}人それぞれの真上に新しい照明ビームを追加します`
+                            : "選択中の出演者の真上に新しい照明ビームを追加します"
+                        }
+                        style={{
+                          background: THEME.panelBg2,
+                          border: `1px solid ${THEME.border}`,
+                          color: canLightSelectedPerformersWithBeam3D ? THEME.text : THEME.textDim,
+                          opacity: canLightSelectedPerformersWithBeam3D ? 1 : 0.5,
+                          cursor: canLightSelectedPerformersWithBeam3D ? "pointer" : "not-allowed",
+                        }}
+                        className="w-full rounded-lg py-1.5 text-xs font-bold mt-1.5"
+                      >
+                        {selectedPerformerIdsForSpotlight.length > 1
+                          ? `選択中の出演者を照らす（${selectedPerformerIdsForSpotlight.length}）`
+                          : "選択中の出演者を照らす"}
+                      </button>
+
+                      {selectedLightingBeam3D && (
+                        <div className="flex flex-col gap-2 mt-2">
+                          <div className="flex flex-col gap-2">
+                            <div style={{ color: THEME.textDim }} className="text-xs">
+                              発光元（平面図上でドラッグしても移動できます）
+                            </div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="X"
+                                ariaLabel="照明ビーム発光元X"
+                                value={selectedLightingBeam3D.source.x}
+                                min={-halfW}
+                                max={halfW}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) => setLightingBeam3DSourcePositionCommit(selectedLightingBeam3D.id, "x", v)}
+                              />
+                              <DraftNumberField
+                                label="Y"
+                                ariaLabel="照明ビーム発光元Y"
+                                value={selectedLightingBeam3D.source.y}
+                                min={0}
+                                max={stage.depth}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) => setLightingBeam3DSourcePositionCommit(selectedLightingBeam3D.id, "y", v)}
+                              />
+                            </div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="高さ"
+                                ariaLabel="照明ビーム発光元高さ"
+                                value={selectedLightingBeam3D.source.z}
+                                min={LIGHTING_BEAM_3D_MIN_Z}
+                                max={LIGHTING_BEAM_3D_MAX_Z}
+                                step={0.5}
+                                allowDecimal
+                                onCommit={(v) => setLightingBeam3DSourceZCommit(selectedLightingBeam3D.id, v)}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex flex-col gap-2">
+                            <div style={{ color: THEME.textDim }} className="text-xs">
+                              照射先（平面図上でドラッグしても移動できます）
+                            </div>
+                            {/* Lighting Beam 3D 追尾UI改善 v1・3・4章：追尾設定を「独立した項目」
+                                として見つけやすくするため、既存select直前に小見出しを追加した。
+                                新しいCollapsibleGroup・新しいカードは作らず、既存の見出しスタイル
+                                （text-xs、色付きラベル）をそのまま踏襲する。追尾中はTHEME.accentで
+                                見出し文字＋左borderを軽く強調するだけに留める（4章：派手な背景色は
+                                使わない）。舞台上（Top View/Audience View）へは何も追加しない（2章、
+                                今回はこのJSXブロック以外変更していない）。 */}
+                            <div
+                              style={{
+                                borderLeft: `2px solid ${selectedLightingBeam3D.followPerformerId ? THEME.accent : "transparent"}`,
+                                paddingLeft: 8,
+                              }}
+                              className="flex flex-col gap-1.5"
+                            >
+                              <div
+                                style={{ color: selectedLightingBeam3D.followPerformerId ? THEME.accent : THEME.textDim }}
+                                className="text-xs mb-1"
+                              >
+                                🎯 追尾{selectedLightingBeam3D.followPerformerId ? "中" : ""}
+                              </div>
+                              {/* Lighting Beam 3D 追尾 v1・5・6章：既存のselect UIパターン（Music
+                                  Anchorのsection選択等）を再利用し、新しいUIデザイン体系は作らない。
+                                  「追尾しない」＋Projectの出演者一覧から選ぶ。保存値は必ず
+                                  performer.id（名前・番号文字列は保存しない＝6章）。 */}
+                              <select
+                                value={selectedLightingBeam3D.followPerformerId || ""}
+                                onChange={(e) => setLightingBeam3DFollowPerformerCommit(selectedLightingBeam3D.id, e.target.value)}
+                                aria-label="照明ビームの追尾対象"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">追尾しない</option>
+                                {performers.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.number}番{getPerformerName(p) ? ` ${getPerformerName(p)}` : ""}
+                                  </option>
+                                ))}
+                              </select>
+                              {/* 25章：追尾中は「追尾：出演者名」が分かるようにする。既存target
+                                  座標編集欄は消さず、disabledにして「出演者位置が優先される」ことを
+                                  説明する方式を採用した（25章の2案のうちdisabled案）。 */}
+                              {selectedLightingBeam3D.followPerformerId &&
+                                (() => {
+                                  const followedPerformer = performers.find((p) => p.id === selectedLightingBeam3D.followPerformerId);
+                                  const followedLabel = followedPerformer
+                                    ? `${followedPerformer.number}番${getPerformerName(followedPerformer) ? ` ${getPerformerName(followedPerformer)}` : ""}`
+                                    : "出演者（見つかりません）";
+                                  return (
+                                    <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                      追尾：{followedLabel}（追尾中は表示上、出演者位置が優先されます）
+                                    </div>
+                                  );
+                                })()}
+                            </div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="X"
+                                ariaLabel="照明ビーム照射先X"
+                                value={selectedLightingBeam3D.target.x}
+                                min={-halfW}
+                                max={halfW}
+                                step={0.5}
+                                allowDecimal
+                                disabled={!!selectedLightingBeam3D.followPerformerId}
+                                onCommit={(v) => setLightingBeam3DTargetPositionCommit(selectedLightingBeam3D.id, "x", v)}
+                              />
+                              <DraftNumberField
+                                label="Y"
+                                ariaLabel="照明ビーム照射先Y"
+                                value={selectedLightingBeam3D.target.y}
+                                min={0}
+                                max={stage.depth}
+                                step={0.5}
+                                allowDecimal
+                                disabled={!!selectedLightingBeam3D.followPerformerId}
+                                onCommit={(v) => setLightingBeam3DTargetPositionCommit(selectedLightingBeam3D.id, "y", v)}
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <div style={{ color: THEME.textDim }} className="text-xs mb-1">色</div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {LIGHTING_AREA_COLOR_KEYS.map((colorKey) => (
+                                <button
+                                  key={colorKey}
+                                  type="button"
+                                  onClick={() => setLightingBeam3DColorCommit(selectedLightingBeam3D.id, colorKey)}
+                                  title={LIGHTING_AREA_COLOR_LABELS[colorKey]}
+                                  aria-label={`照明ビームの色を${LIGHTING_AREA_COLOR_LABELS[colorKey]}にする`}
+                                  style={{
+                                    width: 26,
+                                    height: 26,
+                                    borderRadius: 6,
+                                    background: LIGHTING_AREA_COLOR_PRESETS[colorKey],
+                                    border:
+                                      selectedLightingBeam3D.color === colorKey
+                                        ? `2px solid ${THEME.accent}`
+                                        : `1px solid ${THEME.border}`,
+                                    boxShadow: selectedLightingBeam3D.color === colorKey ? `0 0 0 2px ${THEME.panelBg}` : "none",
+                                    cursor: "pointer",
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          </div>
+
+                          <div>
+                            <div style={{ color: THEME.textDim }} className="text-xs mb-1">明るさ</div>
+                            <div className="flex gap-1.5">
+                              {[0, 0.25, 0.5, 0.75, 1].map((v) => (
+                                <button
+                                  key={v}
+                                  type="button"
+                                  onClick={() => setLightingBeam3DIntensityCommit(selectedLightingBeam3D.id, v)}
+                                  style={{
+                                    background:
+                                      Math.abs((selectedLightingBeam3D.intensity ?? DEFAULT_LIGHTING_BEAM_3D_INTENSITY) - v) < 0.001
+                                        ? THEME.panelBg2
+                                        : "transparent",
+                                    border: `1px solid ${
+                                      Math.abs((selectedLightingBeam3D.intensity ?? DEFAULT_LIGHTING_BEAM_3D_INTENSITY) - v) < 0.001
+                                        ? THEME.accent
+                                        : THEME.border
+                                    }`,
+                                    color: THEME.text,
+                                  }}
+                                  className="flex-1 rounded-lg py-1 text-xs"
+                                >
+                                  {Math.round(v * 100)}%
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Cue間Beam Move v1・STEP12・13：Cue選択中はCue間Beam Move欄を
+                              表示する。Lighting Beam 3D Formation間Move v1・PART P・Q：
+                              Cue選択中でない（＝Base Scene編集中、「次構成1」含む）場合は、
+                              Area版resolveMovePhaseLightingWithEntryFadeのBoundary Move UI
+                              と全く同じ3分岐構造（Cue Move欄／Formation間Move mode欄／
+                              「最初の構成のため設定できません」）をBeamへ対称に追加した。
+                              追尾中Beamは、Cue間Move欄・Formation間Move欄のどちらでも
+                              disabled相当の説明文のみを表示する（PART H：追尾中はMove
+                              対象外という二重ガード）。 */}
+                          <div className="flex flex-col gap-1.5">
+                            <div style={{ color: THEME.textDim }} className="text-xs">移動</div>
+                            {activeLightingCueSelectionForEdit ? (
+                              selectedLightingBeam3D.followPerformerId ? (
+                                <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                  追尾を解除すると移動を設定できます
+                                </div>
+                              ) : (
+                                <>
+                                  <DraftNumberField
+                                    ariaLabel="照明ビームの移動カウント"
+                                    value={getLightingBeam3DPositionMoveCounts(selectedLightingBeam3D)}
+                                    min={0}
+                                    max={999}
+                                    step={0.5}
+                                    allowDecimal
+                                    suffix="カウント"
+                                    onCommit={(v) => setLightingBeam3DPositionMoveCountsCommit(selectedLightingBeam3D.id, v)}
+                                    inputClassName="w-full text-center rounded-lg py-1.5 text-sm font-bold"
+                                  />
+                                  <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                    直前の照明位置から、このキューの位置へ移動します
+                                  </div>
+                                </>
+                              )
+                            ) : isEditingNextFormationLightingBase || currentSlideIndex > 0 ? (
+                              selectedLightingBeam3D.followPerformerId ? (
+                                <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                  追尾を解除すると移動を設定できます
+                                </div>
+                              ) : (
+                                <>
+                                  <select
+                                    value={getLightingBeam3DPositionMoveMode(selectedLightingBeam3D)}
+                                    onChange={(e) => setLightingBeam3DPositionMoveModeCommit(selectedLightingBeam3D.id, e.target.value)}
+                                    aria-label="照明ビームの構成境界移動"
+                                    style={inputStyle}
+                                    className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                                  >
+                                    <option value="none">移動なし</option>
+                                    <option value="transition">構成間の移動に合わせる</option>
+                                    <option value="custom">指定する</option>
+                                  </select>
+                                  {getLightingBeam3DPositionMoveMode(selectedLightingBeam3D) === "custom" && (
+                                    <DraftNumberField
+                                      ariaLabel="照明ビームの構成境界移動カウント"
+                                      value={getLightingBeam3DPositionMoveCounts(selectedLightingBeam3D)}
+                                      min={0}
+                                      max={999}
+                                      step={0.5}
+                                      allowDecimal
+                                      suffix="カウント"
+                                      onCommit={(v) => setLightingBeam3DPositionMoveCountsCommit(selectedLightingBeam3D.id, v)}
+                                      inputClassName="w-full text-center rounded-lg py-1.5 text-sm font-bold"
+                                    />
+                                  )}
+                                  {getLightingBeam3DPositionMoveMode(selectedLightingBeam3D) !== "none" && (
+                                    <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                      直前の構成の照明位置から、この構成の開始位置へ移動します
+                                    </div>
+                                  )}
+                                </>
+                              )
+                            ) : (
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                最初の構成のため設定できません
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Cue間Beam・前の状態との接続 v1・PART I：Area版の「前の状態との
+                              接続」UIと全く同じ構造・文言パターンを、照明エリア→照明ビームへ
+                              対称に置き換えただけ。cueLightingBeam3DConnectionCandidatesは
+                              Base Scene編集中（「次構成1」含む）は常に[]になる設計のため、
+                              このブロックは自然にCue選択中だけ表示される（PART I：Base
+                              Sceneでは表示しない）。候補が1件も無ければブロックごと表示しない。
+                              PART J：追尾中Beam（followPerformerId有り）でも接続自体は許可
+                              する（接続＝identity、Move可否＝別概念のため、Move欄のような
+                              disabled分岐はここでは行わない）。 */}
+                          {cueLightingBeam3DConnectionCandidates.length > 0 && (
+                            <div className="flex flex-col gap-1.5" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                              <div style={{ color: THEME.textDim }} className="text-xs">前の状態との接続</div>
+                              <select
+                                value={
+                                  getLightingBeamLogicalId(selectedLightingBeam3D) &&
+                                  cueLightingBeam3DConnectionCandidates.some(
+                                    (b) => getLightingBeamLogicalId(b) === getLightingBeamLogicalId(selectedLightingBeam3D)
+                                  )
+                                    ? cueLightingBeam3DConnectionCandidates.find(
+                                        (b) => getLightingBeamLogicalId(b) === getLightingBeamLogicalId(selectedLightingBeam3D)
+                                      ).id
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  if (e.target.value === "") {
+                                    disconnectLightingBeamFromPreviousCueStateCommit(selectedLightingBeam3D.id);
+                                  } else {
+                                    connectLightingBeamToPreviousCueStateCommit(selectedLightingBeam3D.id, e.target.value);
+                                  }
+                                }}
+                                aria-label="前の状態の照明ビームと接続"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">接続しない</option>
+                                {cueLightingBeam3DConnectionCandidates.map((beam, i) => (
+                                  <option key={beam.id} value={beam.id}>
+                                    前の状態の照明ビーム {i + 1}（{LIGHTING_AREA_COLOR_LABELS[beam.color] || beam.color}）
+                                  </option>
+                                ))}
+                              </select>
+                              {lightingBeamConnectionWarning && (
+                                <div style={{ color: THEME.danger }} className="text-[11px] leading-relaxed">
+                                  {lightingBeamConnectionWarning}
+                                </div>
+                              )}
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                位置や設定は変更せず、前の状態と同じ照明ビームの続きとして扱います
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Lighting Beam 3D Formation間identity / 前の構成との接続 v1・
+                              PART H：Area版「前の構成との接続」UIと全く同じ構造・文言
+                              パターンを、照明エリア→照明ビームへ対称に置き換えただけ。
+                              lightingBeamConnectionCandidatesはCue選択中は常に[]になる
+                              設計のため、このブロックは自然にBase Scene編集中（「次構成1」
+                              含む）だけ表示される。候補が1件も無ければブロックごと表示
+                              しない。PART J：追尾中Beam（followPerformerId有り）でも接続
+                              自体は許可する。 */}
+                          {lightingBeamConnectionCandidates.length > 0 && (
+                            <div className="flex flex-col gap-1.5" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                              <div style={{ color: THEME.textDim }} className="text-xs">前の構成との接続</div>
+                              <select
+                                value={
+                                  getLightingBeamLogicalId(selectedLightingBeam3D) &&
+                                  lightingBeamConnectionCandidates.some(
+                                    (b) => getLightingBeamLogicalId(b) === getLightingBeamLogicalId(selectedLightingBeam3D)
+                                  )
+                                    ? lightingBeamConnectionCandidates.find(
+                                        (b) => getLightingBeamLogicalId(b) === getLightingBeamLogicalId(selectedLightingBeam3D)
+                                      ).id
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  if (e.target.value === "") {
+                                    disconnectLightingBeamFromPreviousFormationCommit(selectedLightingBeam3D.id);
+                                  } else {
+                                    connectLightingBeamToPreviousFormationCommit(selectedLightingBeam3D.id, e.target.value);
+                                  }
+                                }}
+                                aria-label="前の構成の照明ビームと接続"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">接続しない</option>
+                                {lightingBeamConnectionCandidates.map((beam, i) => (
+                                  <option key={beam.id} value={beam.id}>
+                                    前の構成の照明ビーム {i + 1}（{LIGHTING_AREA_COLOR_LABELS[beam.color] || beam.color}）
+                                  </option>
+                                ))}
+                              </select>
+                              {lightingBeamConnectionWarning && (
+                                <div style={{ color: THEME.danger }} className="text-[11px] leading-relaxed">
+                                  {lightingBeamConnectionWarning}
+                                </div>
+                              )}
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                位置や設定は変更せず、前の構成と同じ照明ビームの続きとして扱います
+                              </div>
+                            </div>
+                          )}
+
+
+                          <div className="flex flex-col gap-2">
+                            <div style={{ color: THEME.textDim }} className="text-xs">光の幅</div>
+                            <div className="flex gap-2">
+                              <DraftNumberField
+                                label="根元"
+                                ariaLabel="照明ビーム根元幅"
+                                value={selectedLightingBeam3D.sourceWidth}
+                                min={LIGHTING_BEAM_3D_MIN_SOURCE_WIDTH}
+                                max={LIGHTING_BEAM_3D_MAX_WIDTH}
+                                step={0.1}
+                                allowDecimal
+                                onCommit={(v) => setLightingBeam3DSourceWidthCommit(selectedLightingBeam3D.id, v)}
+                              />
+                              <DraftNumberField
+                                label="先端"
+                                ariaLabel="照明ビーム先端幅"
+                                value={selectedLightingBeam3D.targetWidth}
+                                min={LIGHTING_BEAM_3D_MIN_WIDTH}
+                                max={LIGHTING_BEAM_3D_MAX_WIDTH}
+                                step={0.1}
+                                allowDecimal
+                                onCommit={(v) => setLightingBeam3DTargetWidthCommit(selectedLightingBeam3D.id, v)}
+                              />
+                            </div>
+                          </div>
+
+                          {/* Lighting Beam 反転 v1・STEP5・6：発光元/照射先・幅設定のすぐ下へ、
+                              独立したボタン1つとして配置する（新しいカード／
+                              CollapsibleGroupは作らない）。STEP4：追尾中はボタンをdisabledに
+                              し、短い説明文で理由を伝える（勝手に追尾解除しない）。 */}
+                          <div className="flex flex-col gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => flipLightingBeam3DDirectionCommit(selectedLightingBeam3D.id)}
+                              disabled={!!selectedLightingBeam3D.followPerformerId}
+                              style={
+                                selectedLightingBeam3D.followPerformerId
+                                  ? { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
+                                  : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                              }
+                              className="w-full rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              ↕ 発光元と照射先を入れ替える
+                            </button>
+                            {selectedLightingBeam3D.followPerformerId && (
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                追尾を解除すると入れ替えられます
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Lighting個別コピー v2・H・P章：Area側と同じ役割分担
+                              （複製＝同一Formation内、コピー＝別Formationへ）。 */}
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => duplicateLightingBeam3D(selectedLightingBeam3D.id)}
+                              aria-label="この照明ビームを複製"
+                              style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              この照明ビームを複製
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => toggleLightingBeam3DCopy(selectedLightingBeam3D.id)}
+                              aria-label="この照明ビームをコピー"
+                              style={
+                                isSelectedBeam3DCopySource
+                                  ? { background: THEME.panelBg2, border: `1px solid ${THEME.accent}`, color: THEME.accent }
+                                  : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
+                              }
+                              className="flex-1 rounded-lg py-1.5 text-xs font-bold"
+                            >
+                              {isSelectedBeam3DCopySource ? "✓ コピー済み" : "この照明ビームをコピー"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </CollapsibleGroup>
 
                     <button
                       type="button"
@@ -13709,7 +22504,6 @@ export default function App() {
                 )}
               </div>
             </section>
-          )}
           </CollapsibleGroup>
 
           <Divider />
@@ -13721,6 +22515,7 @@ export default function App() {
             {isMultiSelect && `${selectedIds.length}人`}
           </p>
         </aside>
+        )}
       </div>
 
       {/* 構成一覧：通常モード（カードクリック→goToSlide→モーダルを閉じる。17章：従来通り）と、
@@ -13736,6 +22531,8 @@ export default function App() {
           performers={performers}
           stage={stage}
           zones={zones}
+          lightingScenes={lightingScenes}
+          lightingEnabled={lightingEnabled}
           currentSlideIndex={currentSlideIndex}
           isTransitionActive={isTransitionActive}
           onSelectSlide={goToSlide}
@@ -13765,6 +22562,8 @@ export default function App() {
           pendingBulkDeleteIds={pendingBulkSlideDeleteIds}
           onConfirmBulkDelete={confirmBulkSlideDelete}
           onCancelBulkDelete={cancelBulkSlideDelete}
+          selectionOnly={presentationMode}
+          syncPlaybackPausedActive={presentationMode && syncPlaybackPausedActive}
         />
       )}
 
@@ -13787,6 +22586,8 @@ export default function App() {
           onShowTrajectoryChange={setExportShowTrajectory}
           trajectoryMode={exportTrajectoryMode}
           onTrajectoryModeChange={setExportTrajectoryMode}
+          showLightingTrackingPaths={exportShowLightingTrackingPaths}
+          onShowLightingTrackingPathsChange={setExportShowLightingTrackingPaths}
           showPerformerNames={exportShowPerformerNames}
           onShowPerformerNamesChange={setExportShowPerformerNames}
           showMusicTime={exportShowMusicTime}
@@ -13804,6 +22605,13 @@ export default function App() {
           onConfirmExport={handleExportCenterConfirm}
           confirmDisabled={exportConfirmDisabled}
           confirmLabel={exportConfirmLabel}
+          lightingCueMode={exportLightingCueMode}
+          onLightingCueModeChange={handleExportLightingCueModeChange}
+          lightingCueModeAvailable={exportLightingCueModeAvailable}
+          includePerformerList={exportIncludePerformerList}
+          onIncludePerformerListChange={setExportIncludePerformerList}
+          performerListOnly={exportPerformerListOnly}
+          onPerformerListOnlyChange={handleExportPerformerListOnlyChange}
         />
       )}
 
@@ -13925,28 +22733,371 @@ function Divider() {
 // 複数グループぶんの合計の高さがサイドバーの表示領域を超えたとき、責任を持つのは
 // 常に親の.slsim-sidebar（overflow-y:auto）だけになり、CollapsibleGroup自身はサイドバー全体の
 // scrollを止めるようなoverflow設定を一切持たない（5章の推奨構造）。
-function CollapsibleGroup({ title, icon, open, onToggle, children }) {
+// 全体設定UI整理・2階層目accordion導入（新規）：nested propを追加。
+// nested未指定（false、既存3箇所＝全体の設定／構成ごとの設定／照明の設定）は
+// 従来と完全に同じJSX・スタイルのままにし、既存の見た目を一切変えない。
+// nested=trueのときだけ、2階層目のaccordion（例：全体の設定の中の「ステージ設定」
+// 「音楽設定」）向けに、header・paddingをひとまわり小さくし、背景をTHEME.panelBg2へ
+// 変えることで「箱の中の箱」感を抑える。新しい色定数は増やさず、既存THEMEの色のみ使用する。
+// 開閉矢印・icon・titleの3要素はnestedでも維持する。
+function CollapsibleGroup({ title, icon, open, onToggle, children, nested = false }) {
   return (
     <div
-      style={{ background: THEME.panelBg, border: `1px solid ${THEME.border}`, borderRadius: 12, flexShrink: 0 }}
+      style={{
+        background: nested ? THEME.panelBg2 : THEME.panelBg,
+        border: `1px solid ${THEME.border}`,
+        borderRadius: nested ? 10 : 12,
+        flexShrink: 0,
+      }}
     >
       <button
         type="button"
         onClick={onToggle}
         style={{ color: THEME.text, background: "transparent" }}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left"
+        className={`w-full flex items-center gap-2 text-left ${nested ? "px-2.5 py-1.5" : "px-3 py-2"}`}
         aria-expanded={open}
       >
         <span style={{ color: THEME.accent, width: 12, flexShrink: 0 }} className="text-[10px]">{open ? "▼" : "▶"}</span>
         {icon && <span className="shrink-0">{icon}</span>}
-        <span className="text-sm font-bold flex-1">{title}</span>
+        <span className={`font-bold flex-1 ${nested ? "text-xs" : "text-sm"}`}>{title}</span>
       </button>
       {open && (
-        <div className="px-3 pb-3 flex flex-col gap-3" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 10 }}>
+        <div
+          className={`flex flex-col gap-3 ${nested ? "px-2.5 pb-2.5" : "px-3 pb-3"}`}
+          style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: nested ? 8 : 10 }}
+        >
           {children}
         </div>
       )}
     </div>
+  );
+}
+
+// ------------------------------------------------------------------
+// Manual v1（初見ユーザー向けヘルプ）
+// ------------------------------------------------------------------
+// ヘッダーの「？ ヘルプ」（helpOpen）を入口とする簡易マニュアル。
+// 「アプリ概要」「はじめての方へ」（常時展開・Manualの主役）「機能から探す」（accordion）
+// 「ショートカット」の4階層構成。ここに書く内容はすべて最新App.jsxの実装を調査して
+// 確定したものであり、未実装の機能（AI関連・Playback強化・自動チェック等）は含めない。
+// 既存Formation/Project/Playback/Music/Lighting/Export等のengineには一切触れない、
+// 表示専用の静的コンテンツ。
+
+// 「はじめての方へ」：作業順（1〜7）だけを短く示す。全機能の説明はしない。
+const MANUAL_GETTING_STARTED_STEPS = [
+  {
+    title: "1. ステージを設定",
+    lines: [
+      "「全体の設定 → ステージ設定」で舞台の幅・奥行を設定します。",
+      "1マス＝90cmです。舞台上の位置を確認するための目盛り（バミリ）として使用できます。",
+    ],
+  },
+  {
+    title: "2. 出演者を配置",
+    lines: [
+      "「出演者の追加」から出演者を追加し、平面図上でドラッグして配置します。",
+      "位置は0.25マス単位で設定できます。",
+      "出演者ごとに番号・名前・色・身長を設定できます。",
+    ],
+  },
+  {
+    title: "3. 音楽を設定",
+    lines: [
+      "使用する音源を読み込み、楽曲セクションごとにBPMを設定します。",
+      "BPMは自動解析されないため、数値を手動で設定してください。",
+      "曲中でBPMやカウントの基準が変わる場合は、「楽曲セクション」を追加して区間ごとに設定します。",
+    ],
+  },
+  {
+    title: "4. 構成を作成",
+    lines: [
+      "出演者を配置したら、次の構成を追加します。",
+      "各構成では、出演者の位置と姿勢（立ち／片膝）を個別に設定できます。",
+    ],
+  },
+  {
+    title: "5. キープ・移動時間を設定",
+    lines: [
+      "各構成の「キープ」と、次の構成までの「移動時間」を設定します。",
+      "必要に応じて出演者ごとの移動経路も編集できます。",
+    ],
+  },
+  {
+    title: "6. 音楽位置を合わせる",
+    lines: [
+      "各構成が音楽上のどこに対応するかを「音楽位置」で設定します。",
+      "基準位置を手動で設定すると、以降はキープ・移動時間から自動計算できます。",
+    ],
+  },
+  {
+    title: "7. 再生して確認",
+    lines: [
+      "通常再生と音楽同期再生で、構成と移動を確認できます。",
+      "平面図・俯瞰客席ビューの切り替え、プレゼンモードも利用できます。",
+    ],
+  },
+];
+
+// 「機能から探す」：作業順ではなく、機能単位のリファレンス。10分類で固定する
+// （出演者と構成、再生と表示はそれぞれ独立させる＝統合しない）。
+const HELP_MANUAL_FUNCTION_SECTIONS = [
+  {
+    key: "stage",
+    icon: "🎭",
+    title: "ステージ",
+    bullets: [
+      "「全体の設定 → ステージ設定」で舞台の幅・奥行を設定できます。",
+      "1マス＝90cm。舞台グリッドは画面上0.5マス刻みで表示されます。",
+      "舞台上の位置を確認するための目盛り（バミリ）として使用できます。",
+      "横方向は中央が0、下手が−、上手が＋。奥行は舞台前端が0です。",
+      "「全体の設定 → 舞台の外観」で床・壁の色を設定できます。",
+    ],
+  },
+  {
+    key: "performers",
+    icon: "🧍",
+    title: "出演者",
+    bullets: [
+      "「出演者の追加」から追加できます（複数人まとめての追加も可能）。",
+      "出演者ごとに番号・名前・色・身長（小・中・大）を設定できます。",
+      "出演者一覧、またはステージ上のクリックで選択できます。",
+      "Shift＋クリックで複数選択の追加・解除、空白部分のShift＋ドラッグで矩形範囲選択ができます。",
+      "平面図上のドラッグで移動できます。位置は0.25マス単位で設定されます（数値入力欄でも同じ単位です）。",
+      "選択中の1人をドラッグすると、選択中全員が相対位置を保ったまま一緒に移動します。",
+      "Delete／Backspaceで削除できます（出演者選択時）。",
+    ],
+    note: "姿勢（立ち・片膝）は出演者本体の設定ではなく、構成ごとの設定です。「構成」の項目を参照してください。",
+  },
+  {
+    key: "slides",
+    icon: "🎬",
+    title: "構成",
+    bullets: [
+      "「＋ 新しい構成を追加」で、現在の構成の配置を引き継いだ新しい構成を作成できます。",
+      "構成名は右サイドバーの「構成名」欄で編集できます。",
+      "構成一覧から選択して切り替えられます。",
+      "コピー／貼り付けは構成一覧の「⋯」メニュー、またはCommand／Ctrl＋C・Vで行えます（出演者未選択時）。",
+      "Delete／Backspaceで削除できます（出演者未選択時）。",
+      "構成バーをドラッグ＆ドロップして並べ替えられます。",
+      "「キープ」でその構成を維持するカウント数を設定できます。",
+    ],
+    note: "出演者の位置・姿勢（立ち／片膝）は、構成ごとに個別に設定されます。",
+  },
+  {
+    key: "music",
+    icon: "🎵",
+    title: "音楽",
+    bullets: [
+      "音源ファイルを読み込めます。",
+      "BPMは楽曲セクションごとに設定します。自動解析されないため、数値を手動で設定してください。",
+      "曲中でBPMやカウントの基準が変わる場合は、「楽曲セクション」を追加して区間ごとに設定できます。",
+      "「音楽位置」で、各構成が音楽上のどこに対応するかを設定できます。",
+      "前に手動で設定した音楽位置を基準に、後続の構成はキープ・移動時間から自動計算されます（[自動]）。",
+      "「手動に固定」を使うと、その構成の音楽位置を新しい基準位置（[手動]）にできます。",
+      "音楽位置が未設定の構成の速度や、新しい楽曲セクションの初期値には「基準BPM」（全体の設定 → 音楽設定）が使われます。",
+    ],
+  },
+  {
+    key: "movement",
+    icon: "➡️",
+    title: "移動",
+    bullets: [
+      "次の構成までの移動時間は構成バー側で設定します。",
+      "出演者ごとに移動経路を編集できます。",
+      "移動経路は直線／曲線を切り替えられます。",
+      "移動中の姿勢は、移動元・移動先の構成設定に従います。",
+    ],
+  },
+  {
+    key: "lighting",
+    icon: "💡",
+    title: "照明",
+    bullets: [
+      "照明エリアを追加・編集できます。",
+      "照明ビームを追加できます。選択中の出演者への追尾ビームも設定できます。",
+      "照明キューで、構成を維持している間・移動している間の照明を設定できます。",
+      "キューごとにフェード時間を設定できます。",
+      "「照明を表示」チェックボックスで、編集画面上の表示だけをON/OFFできます（データは消えません）。",
+    ],
+  },
+  {
+    key: "playback",
+    icon: "▶",
+    title: "再生",
+    bullets: [
+      "通常再生：単発の移動、または連続再生ができます。",
+      "音楽同期再生（♫▶）：音楽位置を基準に、音楽と構成アニメーションを同時に開始します。",
+      "再生中は一時停止・再開ができます。",
+      "構成バーから任意の構成へ直接切り替えられます。",
+    ],
+  },
+  {
+    key: "display",
+    icon: "🖥",
+    title: "表示",
+    bullets: [
+      "平面図（真上）と俯瞰客席ビューを切り替えられます。",
+      "プレゼンモードでは編集用のUIを隠し、再生に専念できます。",
+      "出演者名の表示・非表示を切り替えられます。",
+      "待機エリアの表示・非表示を切り替えられます。",
+      "移動軌跡の表示・非表示を切り替えられます。",
+      "ズームは＋／−／0キー、または全体表示・ステージに合わせる・選択中の出演者へフォーカスから調整できます。",
+    ],
+  },
+  {
+    key: "export",
+    icon: "📤",
+    title: "出力",
+    bullets: [
+      "「Export Center」から出力できます。",
+      "出力形式はPNGまたはPDFです。複数構成を選ぶとZIPでまとめて出力されます。",
+      "ビューは現在のビュー／平面図／俯瞰客席ビューから選べます。",
+      "移動軌跡・追尾スポット軌跡・出演者名・音源内時間の表示をそれぞれON/OFFできます。",
+      "照明キューごとの出力にも対応しています。",
+      "出演者一覧のみの出力にも対応しています。",
+    ],
+  },
+  {
+    key: "project",
+    icon: "💾",
+    title: "Project・保存",
+    bullets: [
+      "ヘッダーのProject切り替えメニューから、新規作成・複製・名前変更・削除ができます。",
+      "編集内容は自動保存されます（ヘッダーに保存状態が表示されます）。",
+      "Project Backupのエクスポート／インポートができます（メニュー内「プロジェクトを読み込む」）。",
+    ],
+  },
+];
+
+// ショートカット一覧：既存keydown listenerの実装から確認済みのものだけを掲載する。
+const HELP_MANUAL_SHORTCUTS = [
+  { action: "元に戻す", key: "Cmd/Ctrl + Z" },
+  { action: "やり直す", key: "Cmd/Ctrl + Shift + Z ／ Ctrl + Y" },
+  { action: "拡大", key: "+ または =" },
+  { action: "縮小", key: "− または _" },
+  { action: "100%表示に戻す", key: "0" },
+  { action: "構成をコピー", key: "Cmd/Ctrl + C（出演者未選択時）" },
+  { action: "構成を貼り付け", key: "Cmd/Ctrl + V（出演者未選択時）" },
+  { action: "削除（出演者優先、未選択なら構成）", key: "Delete ／ Backspace" },
+  { action: "前の構成（プレゼンモード）", key: "←" },
+  { action: "次の構成（プレゼンモード）", key: "→" },
+  { action: "再生／一時停止（プレゼンモード）", key: "Space" },
+  { action: "閉じる／終了（プレゼンモード）", key: "Esc" },
+];
+
+// HelpManual本体：既存THEME・SectionTitle・Divider・CollapsibleGroupのみを再利用し、
+// 新しいデザイン体系・新しいCSSクラスは作らない。Manual v1.1：「はじめての方へ」「機能から探す」
+// 「ショートカット」の3ブロックはすべてCollapsibleGroupで統一する（見た目の一貫性のため）。
+// 「はじめての方へ」はManualの主役のため初期状態OPEN、「ショートカット」は必要な時だけ開く
+// ものとして初期状態CLOSEDにする（開閉状態はsectionsOpen.gettingStarted / .shortcutsで管理、
+// 「機能から探す」内の10項目はsectionsOpenの各key（stage/performers/...）で管理する＝
+// 3ブロックとも同じ1つのstateオブジェクトを共有する）。
+function HelpManual({ sectionsOpen, onToggleSection }) {
+  return (
+    <section
+      style={{ background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, borderRadius: 12, padding: "12px 14px" }}
+      className="flex flex-col gap-3"
+    >
+      {/* アプリ概要：長い前置きは置かない */}
+      <div>
+        <h2 style={{ color: THEME.text }} className="text-sm font-bold">ダンス舞台シミュレーター</h2>
+        <p style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-1">
+          構成・移動・音楽・照明を、ひとつの時間軸で設計するツール。
+        </p>
+        <p style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-1">
+          出演者の立ち位置だけでなく、構成間の移動経路、音楽との同期、照明キューまで設定できます。
+          作成した構成は、再生してアニメーションで確認。
+          平面図・俯瞰客席ビューをPNG／PDFで出力できます。
+        </p>
+      </div>
+
+      <Divider />
+
+      {/* はじめての方へ：Manualの主役。CollapsibleGroupだが初期状態はOPEN（gettingStarted:true）。 */}
+      <CollapsibleGroup
+        title="はじめての方へ"
+        icon="🔰"
+        open={!!sectionsOpen.gettingStarted}
+        onToggle={() => onToggleSection("gettingStarted")}
+        nested
+      >
+        <div className="flex flex-col gap-3">
+          {MANUAL_GETTING_STARTED_STEPS.map((step) => (
+            <div key={step.title}>
+              <h3 style={{ color: THEME.text }} className="text-xs font-bold">{step.title}</h3>
+              {step.lines.map((line, i) => (
+                <p key={i} style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-0.5">
+                  {line}
+                </p>
+              ))}
+            </div>
+          ))}
+        </div>
+      </CollapsibleGroup>
+
+      <Divider />
+
+      {/* 機能から探す：作業順ではなく機能単位のリファレンス。10項目のaccordion（現状維持）。 */}
+      <div>
+        <SectionTitle>機能から探す</SectionTitle>
+        <div className="flex flex-col gap-2 mt-2">
+          {HELP_MANUAL_FUNCTION_SECTIONS.map((sec) => (
+            <CollapsibleGroup
+              key={sec.key}
+              title={sec.title}
+              icon={sec.icon}
+              open={!!sectionsOpen[sec.key]}
+              onToggle={() => onToggleSection(sec.key)}
+              nested
+            >
+              <ul className="flex flex-col gap-1 pl-4" style={{ listStyle: "disc", color: THEME.textDim }}>
+                {sec.bullets.map((b, i) => (
+                  <li key={i} className="text-[11px] leading-relaxed">
+                    {b}
+                  </li>
+                ))}
+              </ul>
+              {sec.note && (
+                <p
+                  style={{ color: THEME.textDim, borderLeft: `2px solid ${THEME.borderSoft}` }}
+                  className="text-[11px] leading-relaxed pl-2 mt-1"
+                >
+                  {sec.note}
+                </p>
+              )}
+            </CollapsibleGroup>
+          ))}
+        </div>
+      </div>
+
+      <Divider />
+
+      {/* ショートカット：初期状態CLOSED（shortcuts:未設定＝falsy）。必要な時だけ開く想定。 */}
+      <CollapsibleGroup
+        title="ショートカット"
+        icon="⌨"
+        open={!!sectionsOpen.shortcuts}
+        onToggle={() => onToggleSection("shortcuts")}
+        nested
+      >
+        <div className="flex flex-col">
+          {HELP_MANUAL_SHORTCUTS.map((row, i) => (
+            <div
+              key={row.action}
+              className="flex items-center justify-between gap-3 py-1"
+              style={{ borderBottom: i < HELP_MANUAL_SHORTCUTS.length - 1 ? `1px solid ${THEME.borderSoft}` : "none" }}
+            >
+              <span style={{ color: THEME.textDim }} className="text-[11px]">
+                {row.action}
+              </span>
+              <span style={{ color: THEME.text }} className="text-[11px] font-bold shrink-0 text-right">
+                {row.key}
+              </span>
+            </div>
+          ))}
+        </div>
+      </CollapsibleGroup>
+    </section>
   );
 }
 
@@ -14299,7 +23450,7 @@ function ProjectBackupMessageModal({ tone, text, onClose }) {
   );
 }
 
-// 各設定パネル内の「説明を見る」トグル（PART E・新規）。ヘッダーの「？ 操作方法」（アプリ全体の
+// 各設定パネル内の「説明を見る」トグル（PART E・新規）。ヘッダーの「？ ヘルプ」（アプリ全体の
 // 操作方法）とは役割を分け、こちらは「その設定固有の意味」だけを扱う小さなボタン（28章）。
 // 押すたびに開閉するだけのシンプルな見た目に留め、常時大きく表示しない（25章）。
 function InfoToggle({ open, onToggle }) {
@@ -14307,6 +23458,7 @@ function InfoToggle({ open, onToggle }) {
     <button
       type="button"
       onClick={onToggle}
+      aria-expanded={open}
       style={{ color: THEME.textDim, background: "transparent", border: "none", padding: 0 }}
       className="text-[10px] underline decoration-dotted"
     >
@@ -14553,7 +23705,7 @@ function useDraftNumberInput({ value, min, max, allowDecimal = false, onCommit }
 // NumberField（ステージ幅等で使用中。今回は変更しない＝26章）にほぼ揃えつつ、中身は
 // useDraftNumberInputへ委ねる。onButtonChangeを渡した場合だけ－／＋ボタンを表示する
 // （10章：既存の＋／－操作は維持しつつ、元々ボタンの無い楽曲セクションのstartSec等には追加しない）。
-function DraftNumberField({ label, value, min, max, step, allowDecimal = false, onCommit, onButtonChange, suffix, disabled, inputClassName }) {
+function DraftNumberField({ label, ariaLabel, value, min, max, step, allowDecimal = false, onCommit, onButtonChange, suffix, disabled, inputClassName }) {
   const { displayValue, handleFocus, handleChange, handleBlur, handleKeyDown } = useDraftNumberInput({ value, min, max, allowDecimal, onCommit });
   const disabledStyle = { background: THEME.panelBg, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim };
   const enabledBtnStyle = { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text };
@@ -14583,7 +23735,7 @@ function DraftNumberField({ label, value, min, max, step, allowDecimal = false, 
           inputMode={allowDecimal ? "decimal" : "numeric"}
           value={displayValue}
           disabled={disabled}
-          aria-label={label || undefined}
+          aria-label={ariaLabel || label || undefined}
           onFocus={handleFocus}
           onChange={handleChange}
           onBlur={handleBlur}
@@ -14970,13 +24122,12 @@ function MusicBar({
             </span>
           )}
 
-          {/* project BPMの参照表示のみ（編集UIは右パネルの「BPM」セクションを維持し、ここには
-              重複した編集UIを新設しない＝30章）。durationSecが取得できていれば、将来の
-              「総エイト数」表示への布石として簡単な目安も添える（16章：優先度は低いが軽量なので表示）。 */}
-          <span style={{ flexShrink: 0 }}>
-            BPM {projectBpm}
-            {hasDuration && musicTotalEighths != null && ` ・ 約${(Math.round(musicTotalEighths * 10) / 10).toFixed(1)}エイト`}
-          </span>
+          {/* Music Bar表示整理 v1.1：楽曲セクションごとに異なるBPMを持てる現在の仕様では、
+              このBar単体で「BPM 120」だけを表示すると「音源から自動解析したBPM」等と
+              誤認されやすく、「約○○エイト」（音源全体×基準BPMの概算）も複数楽曲セクションが
+              ある場合は意味が曖昧になるため、両方とも表示から外した（BPMそのものの編集UIは
+              引き続き右パネルの「音楽設定 → 基準BPM」、楽曲セクションごとのBPMは
+              「音楽設定 → 楽曲セクション」に残っている）。 */}
 
           <button
             type="button"
@@ -15258,7 +24409,7 @@ function CompositionBar({
     value: transitionCounts,
     min: MIN_TRANSITION_COUNTS,
     max: 9999,
-    allowDecimal: false,
+    allowDecimal: true,
     onCommit: onCommitTransitionCounts,
   });
   // 「実際にrAFで進行中」の厳密な再生中フラグ。一時停止ボタンの有効化・ステータスラベルの
@@ -16023,6 +25174,11 @@ function SlideListModal({
   performers,
   stage,
   zones,
+  // 構成一覧サムネイルLighting反映・STEP4A：既存のwork.lightingScenes・getLightingEnabled()を
+  // そのままpropsとして受け取るだけ。新しいstateは作らない。normal/export-selection両モードで
+  // 同じ描画になる（mode切替ロジック自体には触れない）。
+  lightingScenes,
+  lightingEnabled,
   currentSlideIndex,
   isTransitionActive,
   onSelectSlide,
@@ -16069,6 +25225,16 @@ function SlideListModal({
   // ため、「直近のコピーが複数選択からの一括コピーだったか」をApp側のreactive stateとして
   // 受け取る。「⋯」メニューの「ここに貼り付け」のdisabled判定にのみ使う（表示専用）。
   hasBulkClipboard,
+  // プレゼンモード構成一覧ジャンプ v1・2・12・13章：presentationModeから開いた場合だけtrueにする、
+  // 「選ぶだけ」read-onlyフラグ。既存のmode="normal"のクリック→goToSlide→Modal close挙動は
+  // そのまま維持しつつ、削除・複製・並び替え・「選択」bulk-copyモード・「…」メニューだけを
+  // 隠す。デフォルトfalseのため、渡さない既存呼び出し（通常編集画面）には一切影響しない。
+  selectionOnly = false,
+  // Sync Playback Presentation UI整理 v1：syncPlayback state全体はここでは受け取らず、
+  // App側で既にderive済みの意味のあるboolean（presentationMode && syncPlaybackPausedActive）
+  // だけを受け取る。デフォルトfalseのため、渡さない既存呼び出し（通常編集画面・Export Center）
+  // には一切影響しない。
+  syncPlaybackPausedActive = false,
 }) {
   const isExportMode = mode === "export-selection";
 
@@ -16152,7 +25318,7 @@ function SlideListModal({
   // 判定ロジック自体はv2.1でも一切変更していない）。挿入位置の見せ方だけをv2.1で、
   // グリッド全幅の細い横線から「カード1枚分の挿入プレースホルダー」（SlideListDropPlaceholderCard）
   // へ変更した。判定・確定ロジックの骨格はCompositionBarと同一のまま。
-  const isReorderable = !isMultiSelectMode && !!onReorderSlide;
+  const isReorderable = !isMultiSelectMode && !selectionOnly && !!onReorderSlide;
   const [dragIndex, setDragIndex] = useState(null);
   const [dropBeforeIndex, setDropBeforeIndex] = useState(null);
   const clearDragState = useCallback(() => {
@@ -16282,8 +25448,10 @@ function SlideListModal({
           </h2>
           <div className="flex items-center gap-2">
             {/* 複数構成一括コピー v1・STEP1：normalモード・選択モードOFFの時だけ「選択」ボタンを出す。
-                export-selectionモード中はこのボタン自体が無関係（Export Center専用の別入口から開くため）。 */}
-            {mode === "normal" && !isCopySelectionActive && (
+                export-selectionモード中はこのボタン自体が無関係（Export Center専用の別入口から開くため）。
+                プレゼンモード構成一覧ジャンプ v1・12章：selectionOnly中は「選ぶだけ」にするため、
+                このボタンごと非表示にする。 */}
+            {mode === "normal" && !isCopySelectionActive && !selectionOnly && (
               <button
                 type="button"
                 onClick={enterCopySelectionMode}
@@ -16378,9 +25546,35 @@ function SlideListModal({
             onCancel={onCancelBulkDelete}
           />
         )}
-        {!isMultiSelectMode && isTransitionActive && (
+        {!isMultiSelectMode && isTransitionActive && !syncPlaybackPausedActive && (
           <p style={{ color: THEME.textDim, flexShrink: 0 }} className="text-xs mb-2">
-            再生中・同期再生中は構成を切り替えられません。「編集に戻る」の後にご利用ください。
+            {selectionOnly
+              ? "再生を一時停止中です。「■ 再生を終了」すると構成を変更できます。"
+              : "再生中・同期再生中は構成を切り替えられません。「編集に戻る」の後にご利用ください。"}
+          </p>
+        )}
+        {/* Sync Playback Presentation UI整理 v1・11章：presentationMode中に音楽同期再生を
+            pauseした場合だけ表示する専用banner。上のisTransitionActive汎用noticeとは排他
+            （syncPlaybackPausedActive中はそちらを出さない＝重複表示を避ける）。通常編集画面
+            （syncPlaybackPausedActiveは常にfalseで渡される）・Export Center側のModalには
+            一切表示されない。alert()は使わず、既存カード群と同じTHEME色でこのModal内に
+            常設表示するだけの、読み取り専用の説明文。
+            プレゼンモード「再生を終了」v1：文言をBottom Controlsの新しい「■ 再生を終了」
+            ボタンに合わせて更新（「編集に戻る」という、presentationModeでは意味の異なる
+            表現は使わない）。 */}
+        {!isMultiSelectMode && syncPlaybackPausedActive && (
+          <p
+            style={{
+              color: THEME.accent,
+              background: THEME.panelBg2,
+              border: `1px solid ${THEME.accent}66`,
+              borderRadius: 8,
+              padding: "6px 10px",
+              flexShrink: 0,
+            }}
+            className="text-xs mb-2 font-bold"
+          >
+            音楽同期再生を一時停止中です。「■ 再生を終了」すると構成を変更できます。
           </p>
         )}
         {/* 構成一覧v2・第2段階①・3章：コピー中であることを分かるようにする、控えめな状態表示。
@@ -16479,6 +25673,33 @@ function SlideListModal({
               // バッジ・強調とは紛れないよう常にfalseにする。
               const isCopySource = !isMultiSelectMode && !!copiedSlideId && copiedSlideId === slide.id;
               const isRecentlyPasted = !isMultiSelectMode && !!recentlyPastedSlideId && recentlyPastedSlideId === slide.id;
+              // 構成一覧サムネイルLighting表示 回帰修正 v1・1〜3章：メインのTop View側は
+              // 現在「showLighting && currentLightingScene && currentLightingScene.enabled」
+              // という条件になっており（Lighting UI整理により、project-level lightingEnabled
+              // はTop View側の表示条件としてもう使われていない）、構成一覧側だけがその前の
+              // 「project-level lightingEnabled && scene.enabled」という旧gateのまま残っていた
+              // ことが、「メイン画面では見えるのに構成一覧では一切見えない」回帰の原因だった。
+              // 構成一覧は作品データ確認用の場所であり、編集画面の一時的なUI state
+              // （showLighting）にも、project-level lightingEnabledにも依存させず、
+              // 「Lighting Sceneが存在し、そのScene.enabled === trueか」だけで判定する
+              // （＝保存された開始時Lightingを常に表示するという既存方針の維持）。
+              // 新しいLighting Scene検索ロジックは作らず、既存のfindLightingSceneBySlideId・
+              // getLightingAreas・getLightingBeams3Dだけを使う。scene.areas/scene.beams3Dへの
+              // 直接アクセスはしない。条件を満たさない場合は常に空配列にし、
+              // FormationThumbnail側は「lightingAreas.length > 0か」だけを見ればよい。
+              // Lighting Beam 3D 追尾UI改善・Thumbnail修正 v1・13章：追尾Beam（followPerformerId
+              // あり）はgetLightingBeams3D()が返す生のtargetのままだと保存済みの古い座標を指して
+              // しまうため、Top View/Audience View/Exportと全く同じresolveLightingBeams3DForDisplay()
+              // を通し、このFormation自身のslide.placements（静止画のためdisplayPlacements等の
+              // アニメーション値は不要＝14章）でeffective targetへ解決する（この部分は前回修正の
+              // まま維持）。Thumbnail専用のfollow判定ロジックは作らない。
+              let thumbnailLightingAreas = [];
+              let thumbnailLightingBeams3D = [];
+              const thumbnailScene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
+              if (thumbnailScene && thumbnailScene.enabled) {
+                thumbnailLightingAreas = getLightingAreas(thumbnailScene);
+                thumbnailLightingBeams3D = resolveLightingBeams3DForDisplay(getLightingBeams3D(thumbnailScene), slide.placements || {});
+              }
               return (
                 <React.Fragment key={slide.id}>
                   {/* 構成一覧v2・第1段階：挿入位置インジケーター（グリッド全幅の横線）。
@@ -16521,6 +25742,11 @@ function SlideListModal({
                       overflow: "hidden",
                       cursor: cardDisabled ? "default" : isReorderable ? "grab" : "pointer",
                       opacity: isDraggingThis ? 0.4 : cardDisabled && !isCurrent ? 0.55 : 1,
+                      // Sync Playback Presentation UI整理 v1・13章：selectionOnly（プレゼンモード）中の
+                      // disabledカードだけ、既存opacityに軽いgrayscaleを重ねる。サムネイル内容が
+                      // 見えなくなるほど強くはせず、「閲覧できるが操作できない」ことが分かる程度に留める。
+                      // 通常編集画面（selectionOnlyがfalse）の見た目は一切変更しない。
+                      filter: selectionOnly && cardDisabled && !isCurrent ? "grayscale(0.6)" : "none",
                       display: "flex",
                       flexDirection: "column",
                       position: "relative",
@@ -16547,7 +25773,14 @@ function SlideListModal({
                         4:3のaspect-ratioはカード幅（＝列数とモーダル幅で決まる）だけに連動し、
                         構成数（行数）には一切影響されない。 */}
                     <div style={{ width: "100%", aspectRatio: "4 / 3", background: THEME.bg, position: "relative" }}>
-                      <FormationThumbnail stage={stage} zones={zones} performers={performers} placements={slide.placements} />
+                      <FormationThumbnail
+                        stage={stage}
+                        zones={zones}
+                        performers={performers}
+                        placements={slide.placements}
+                        lightingAreas={thumbnailLightingAreas}
+                        lightingBeams3D={thumbnailLightingBeams3D}
+                      />
                       {/* 構成一覧v2・第2段階②・PART A：コピー元カードだけに出す、控えめな
                           「コピー中」バッジ。「現在」／✓バッジ（右上）・「…」メニュー（左上）とは
                           別の角（左下）に置き、既存バッジ類と重ならないようにする。 */}
@@ -16616,8 +25849,10 @@ function SlideListModal({
                           normalモードかつ選択モードOFFの時だけ、目立ちすぎない小さなボタンとして
                           左上に置く（右上は「現在」バッジと共存させないため、あえて反対側に配置）。
                           複数構成一括コピー v1・STEP1：copy-selectionモード中は非表示にする
-                          （export-selectionと同じ考え方＝複数選択中に単体操作が混ざらないようにする）。 */}
-                      {!isMultiSelectMode && (
+                          （export-selectionと同じ考え方＝複数選択中に単体操作が混ざらないようにする）。
+                          プレゼンモード構成一覧ジャンプ v1・12章：selectionOnly中も非表示にする
+                          （「選ぶだけ」の一覧にするため）。 */}
+                      {!isMultiSelectMode && !selectionOnly && (
                         <SlideCardMenuButton
                           disabled={isTransitionActive}
                           canDelete={!!canDeleteSlide}
@@ -16658,7 +25893,7 @@ function SlideListModal({
                       </span>
                       {/* 22章：手動Music Anchorがある構成だけ、控えめな♫アイコンを添える（詳細情報は出さない） */}
                       {hasManualAnchor && (
-                        <span style={{ color: THEME.textDim, flexShrink: 0 }} className="text-xs" title="この構成には手動Music Anchorが設定されています">
+                        <span style={{ color: THEME.textDim, flexShrink: 0 }} className="text-xs" title="この構成には音楽位置が手動で設定されています">
                           ♫
                         </span>
                       )}
@@ -16683,8 +25918,8 @@ function SlideListModal({
                           musicLabel.isUnset
                             ? "音楽位置が未設定です"
                             : musicLabel.isManual
-                            ? "手動Music Anchorによる音楽位置です"
-                            : "Auto Chainによる自動計算の音楽位置です"
+                            ? "手動で設定した音楽位置です"
+                            : "キープ・移動時間から自動計算した音楽位置です"
                         }
                       >
                         {musicLabel.text}
@@ -16891,6 +26126,10 @@ function ExportCenterModal({
   onShowTrajectoryChange,
   trajectoryMode,
   onTrajectoryModeChange,
+  // 追尾スポット軌跡Export v1・18〜19・23〜24章：showTrajectory（出演者の移動軌跡）とは
+  // 完全に別のcheckbox。UI上も別々の行として表示し、一方のON/OFFが他方を連動させない。
+  showLightingTrackingPaths,
+  onShowLightingTrackingPathsChange,
   showPerformerNames,
   onShowPerformerNamesChange,
   // Export音楽位置・音源内時間 v1：「音源内時間を表示」チェックボックス用。他の表示オプション
@@ -16910,9 +26149,41 @@ function ExportCenterModal({
   onConfirmExport,
   confirmDisabled,
   confirmLabel,
+  // Lighting Cue Export v1・3章：既存Export Centerへ追加する「照明キューごとに出力」設定。
+  // 新しい別モーダルは作らず、この1つのcheckboxとして既存UIへ組み込む。
+  lightingCueMode,
+  onLightingCueModeChange,
+  lightingCueModeAvailable, // 34・35章：現在の構成にLighting Scene（enabled）が無ければfalse
+  // 出演者一覧 Export v1・14・31章：PDF形式選択時だけ意味を持つ「出演者一覧を先頭に付ける」設定。
+  includePerformerList,
+  onIncludePerformerListChange,
+  // 出演者一覧単体Export v1・1・23章：「出演者一覧のみ出力」設定。lightingCueModeと相互排他
+  // （onPerformerListOnlyChange側で相手を必ずOFFにする＝App側のhandleExportPerformerListOnlyChange）。
+  performerListOnly,
+  onPerformerListOnlyChange,
 }) {
   const radioRowStyle = { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" };
-  const sectionTitleStyle = { color: THEME.textDim, fontWeight: 700, letterSpacing: "0.02em" };
+  // 出力モーダル視認性改善 v1・STEP2：LEVEL1（セクション見出し）用style。
+  // 見出し色 v2：THEME.textDim・12px → THEME.text・13pxへ強めた後、今回さらに
+  // THEME.accent（既存の黄色アクセント。新しい色値は追加しない）へ変更し、
+  // 「黄色＝セクション見出し／既存アクセント、白＝操作項目、薄いグレー＝補足説明」
+  // という視覚階層を明確にした。
+  const sectionTitleStyle = { color: THEME.accent, fontWeight: 700, fontSize: 13, letterSpacing: "0.02em" };
+  // 出力モーダル視認性改善 v1・STEP5・11：LEVEL4（補足説明）用の共通style。既存の
+  // style={{color:THEME.textDim}} className="text-[11px] leading-relaxed" という組み合わせが
+  // モーダル内で複数箇所重複していたため、色・太さ・行間だけをこの1つのobjectへ集約する
+  // （font-sizeはTailwindのtext-[11px]のまま、className側で指定する既存方針を維持）。
+  // 大規模なDesign Systemは作らず、既存コードのstyle object 1個の追加に留める。
+  const exportHelperTextStyle = { color: THEME.textDim, fontWeight: 400, lineHeight: 1.5 };
+  // Lighting Cue Export 複数Formation対応 v1・2・48章：Formation scope selection
+  // （現在/選択/すべての構成）は、出演者一覧のみExport中だけ意味を持たないためdisableし、
+  // Lighting Cue Mode中はもう固定しない（通常Formation Exportと同じscopeを使えるようにする）。
+  const disableFormationScope = performerListOnly;
+  // Lighting Cue Export 軌跡対応 v1・27〜30章：「出力する構成」等のFormation target selectionの
+  // disable条件（disableFormationScope）と、移動軌跡・追尾スポット軌跡checkboxのdisable条件を
+  // 分離する。Lighting Cue Mode中は軌跡checkboxを使用可能にしたいが、出演者一覧のみExport中は
+  // 引き続き軌跡に意味が無いためdisabledのまま（28章）。
+  const disableTrajectoryOptions = performerListOnly;
 
   return (
     <div
@@ -16961,18 +26232,29 @@ function ExportCenterModal({
 
         {/* 出力する構成：現在の構成 / 構成を選択 / すべての構成（2・3・4・5章） */}
         <div className="flex flex-col gap-2">
-          <span className="text-xs" style={sectionTitleStyle}>
+          <span style={sectionTitleStyle}>
             出力する構成
           </span>
-          <label style={radioRowStyle} className="text-sm" title={`現在表示中の構成${currentSlideNumber}だけを出力します`}>
-            <input type="radio" name="export-target-mode" checked={targetMode === "current"} onChange={() => onTargetModeChange("current")} />
+          <label
+            style={{ ...radioRowStyle, opacity: disableFormationScope ? 0.5 : 1 }}
+            className="text-sm"
+            title={`現在表示中の構成${currentSlideNumber}だけを出力します`}
+          >
+            <input
+              type="radio"
+              name="export-target-mode"
+              checked={targetMode === "current"}
+              disabled={disableFormationScope}
+              onChange={() => onTargetModeChange("current")}
+            />
             <span style={{ color: THEME.text }}>現在の構成（構成{currentSlideNumber}）</span>
           </label>
-          <label style={radioRowStyle} className="text-sm">
+          <label style={{ ...radioRowStyle, opacity: disableFormationScope ? 0.5 : 1 }} className="text-sm">
             <input
               type="radio"
               name="export-target-mode"
               checked={targetMode === "selection"}
+              disabled={disableFormationScope}
               onChange={() => {
                 onTargetModeChange("selection");
                 onOpenSlidePicker();
@@ -16993,85 +26275,171 @@ function ExportCenterModal({
               </button>
             )}
           </label>
-          <label style={radioRowStyle} className="text-sm" title={`全${totalSlideCount}構成をスライド順に出力します`}>
-            <input type="radio" name="export-target-mode" checked={targetMode === "all"} onChange={() => onTargetModeChange("all")} />
+          <label
+            style={{ ...radioRowStyle, opacity: disableFormationScope ? 0.5 : 1 }}
+            className="text-sm"
+            title={`全${totalSlideCount}構成をスライド順に出力します`}
+          >
+            <input
+              type="radio"
+              name="export-target-mode"
+              checked={targetMode === "all"}
+              disabled={disableFormationScope}
+              onChange={() => onTargetModeChange("all")}
+            />
             <span style={{ color: THEME.text }}>すべての構成（全{totalSlideCount}構成）</span>
           </label>
         </div>
 
-        {/* 表示オプション：待機エリア（既存のexportShowWaitingAreasをそのまま再利用＝13章）・
-            移動軌跡（Export Center専用state・trajectoryMode「次に／前に」も含む＝13・15章） */}
-        <div className="flex flex-col gap-2">
-          <span className="text-xs" style={sectionTitleStyle}>
-            表示オプション
+        {/* Lighting Cue Export 複数Formation対応 v1・27〜29・46〜48章：checkbox自体は
+            lightingCueModeAvailableでdisabledにしない（Lighting Cue Modeは基本選択可能にし、
+            選ばれたscopeに有効Lighting Sceneが存在するかはConfirm button側の
+            exportConfirmDisabledで判定する＝大規模なUI制御にしない）。
+            出演者一覧単体Export v1・24章：performerListOnlyとは相互排他（onChangeハンドラ側
+            ＝App側のhandleExportLightingCueModeChangeで相手を必ずOFFにする）。 */}
+        <div className="flex flex-col" style={{ gap: 4 }}>
+          <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
+            <input type="checkbox" checked={lightingCueMode} onChange={(e) => onLightingCueModeChange(e.target.checked)} />
+            照明キューごとに出力
+          </label>
+          <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+            選択した構成の開始時・各照明キューを出力します
           </span>
+          {lightingCueMode && !lightingCueModeAvailable && (
+            <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+              選択した構成に有効な照明設定がありません。
+            </span>
+          )}
+        </div>
+
+        {/* 出演者一覧単体Export v1・1・3章：Export Center既存UIへ最小差分で追加する
+            「出演者一覧のみ出力」設定。既存の照明キューcheckboxと同じ見た目・配置パターンを
+            踏襲し、新しいUIデザイン体系は作らない。lightingCueModeとは相互排他
+            （onPerformerListOnlyChange側で相手を必ずOFFにする）。 */}
+        <div className="flex flex-col" style={{ gap: 4 }}>
           <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
-            <input type="checkbox" checked={showWaitingAreas} onChange={(e) => onShowWaitingAreasChange(e.target.checked)} />
-            待機エリア
+            <input
+              type="checkbox"
+              checked={performerListOnly}
+              onChange={(e) => onPerformerListOnlyChange(e.target.checked)}
+            />
+            出演者一覧のみ出力
           </label>
-          <div className="flex items-center gap-2 flex-wrap">
+          <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+            番号・名前一覧の1ページ／1画像だけを出力します
+          </span>
+        </div>
+
+        {/* 表示オプション：待機エリア（既存のexportShowWaitingAreasをそのまま再利用＝13章）・
+            移動軌跡（Export Center専用state・trajectoryMode「次に／前に」も含む＝13・15章）・
+            追尾スポット軌跡・出演者名・音源内時間を、すべて同じ「表示オプション」セクションへ
+            まとめる（出力モーダル視認性改善 v1・STEP14：舞台図へ何を表示するかを決める設定
+            グループとして一体で見えるようにする。ロジック・handler・disabled判定は無変更で、
+            JSXの入れ子構造とgap/indentだけを調整した）。 */}
+        <div className="flex flex-col" style={{ gap: 10 }}>
+          <span style={sectionTitleStyle}>表示オプション</span>
+          <div className="flex flex-col" style={{ gap: 10 }}>
             <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
-              <input type="checkbox" checked={showTrajectory} onChange={(e) => onShowTrajectoryChange(e.target.checked)} />
-              移動軌跡
+              <input type="checkbox" checked={showWaitingAreas} onChange={(e) => onShowWaitingAreasChange(e.target.checked)} />
+              待機エリア
             </label>
-            {showTrajectory && (
-              <div
-                className="flex items-center gap-0.5"
-                style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, borderRadius: 8, padding: 2 }}
-                role="group"
-                aria-label="移動軌跡の参照方向"
-              >
-                <button
-                  type="button"
-                  onClick={() => onTrajectoryModeChange("next")}
-                  style={{
-                    background: trajectoryMode === "next" ? THEME.accent : "transparent",
-                    color: trajectoryMode === "next" ? "#141318" : THEME.textDim,
-                    border: "none",
-                    borderRadius: 6,
-                  }}
-                  className="px-2 py-0.5 text-xs font-bold"
+
+            <div className="flex flex-col" style={{ gap: 4 }}>
+              <div className="flex items-center gap-2 flex-wrap">
+                <label
+                  className="flex items-center gap-2 text-sm cursor-pointer"
+                  style={{ color: THEME.text, opacity: disableTrajectoryOptions ? 0.5 : 1 }}
                 >
-                  次に
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onTrajectoryModeChange("previous")}
-                  style={{
-                    background: trajectoryMode === "previous" ? THEME.accent : "transparent",
-                    color: trajectoryMode === "previous" ? "#141318" : THEME.textDim,
-                    border: "none",
-                    borderRadius: 6,
-                  }}
-                  className="px-2 py-0.5 text-xs font-bold"
-                >
-                  前に
-                </button>
+                  <input
+                    type="checkbox"
+                    checked={showTrajectory}
+                    disabled={disableTrajectoryOptions}
+                    onChange={(e) => onShowTrajectoryChange(e.target.checked)}
+                  />
+                  移動軌跡
+                </label>
+                {(showTrajectory || showLightingTrackingPaths) && !disableTrajectoryOptions && (
+                  <div
+                    className="flex items-center gap-0.5"
+                    style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, borderRadius: 8, padding: 2 }}
+                    role="group"
+                    aria-label="移動軌跡の参照方向"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onTrajectoryModeChange("next")}
+                      style={{
+                        background: trajectoryMode === "next" ? THEME.accent : "transparent",
+                        color: trajectoryMode === "next" ? "#141318" : THEME.textDim,
+                        border: "none",
+                        borderRadius: 6,
+                      }}
+                      className="px-2 py-0.5 text-xs font-bold"
+                    >
+                      次に
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onTrajectoryModeChange("previous")}
+                      style={{
+                        background: trajectoryMode === "previous" ? THEME.accent : "transparent",
+                        color: trajectoryMode === "previous" ? "#141318" : THEME.textDim,
+                        border: "none",
+                        borderRadius: 6,
+                      }}
+                      className="px-2 py-0.5 text-xs font-bold"
+                    >
+                      前に
+                    </button>
+                  </div>
+                )}
               </div>
-            )}
+              {(showTrajectory || showLightingTrackingPaths) && !disableTrajectoryOptions && (
+                <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+                  方向設定は移動軌跡・追尾スポット軌跡に共通です
+                </span>
+              )}
+            </div>
+
+            {/* 追尾スポット軌跡Export v1・18・22〜26章：移動軌跡とは別のcheckbox。Lighting Cue
+                Export 軌跡対応 v1・27・29・30章：disable条件をdisableTrajectoryOptions
+                （performerListOnlyのみ）へ変更し、Lighting Cue Mode中も使用可能にする。 */}
+            <div className="flex flex-col" style={{ gap: 4 }}>
+              <label
+                className="flex items-center gap-2 text-sm cursor-pointer"
+                style={{ color: THEME.text, opacity: disableTrajectoryOptions ? 0.5 : 1 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={showLightingTrackingPaths}
+                  disabled={disableTrajectoryOptions}
+                  onChange={(e) => onShowLightingTrackingPathsChange(e.target.checked)}
+                />
+                追尾スポット軌跡
+              </label>
+              <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+                追尾中のスポットが次の構成までどう移動するか表示します
+              </span>
+            </div>
+
+            {/* 出演者名 v1・10章：平面図出力の場合だけ実際に反映され
+                （renderFormationExportToCanvas）、俯瞰客席ビュー出力では常に無視される
+                （14章：この設定に関わらず名前は表示されない）。 */}
+            <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
+              <input type="checkbox" checked={showPerformerNames} onChange={(e) => onShowPerformerNamesChange(e.target.checked)} />
+              出演者名（平面図のみ反映されます）
+            </label>
+
+            {/* Export音楽位置・音源内時間 v1：平面図・俯瞰客席ビューどちらの出力でも、
+                Music Position見出しの表示文字列（model.musicPosition.text）へ既に組み込まれて
+                いるため、ここではON/OFFの入力だけを担い、描画側（renderTopFormationExport／
+                renderAudienceFormationExport／drawFormationExportHeader）には一切手を
+                加えていない。 */}
+            <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
+              <input type="checkbox" checked={showMusicTime} onChange={(e) => onShowMusicTimeChange(e.target.checked)} />
+              音源内時間を表示
+            </label>
           </div>
-        </div>
-
-        {/* 出演者名 v1・10章：待機エリア・移動軌跡と同じ「表示オプション」欄に追加する。
-            平面図出力の場合だけ実際に反映され（renderTopFormationExport）、俯瞰客席ビュー
-            出力では常に無視される（14章：この設定に関わらず名前は表示されない）。 */}
-        <div className="flex flex-col gap-2">
-          <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
-            <input type="checkbox" checked={showPerformerNames} onChange={(e) => onShowPerformerNamesChange(e.target.checked)} />
-            出演者名（平面図のみ反映されます）
-          </label>
-        </div>
-
-        {/* Export音楽位置・音源内時間 v1：他の表示オプション（待機エリア・出演者名）と同じ並びに
-            配置する。平面図・俯瞰客席ビューどちらの出力でも、Music Position見出しの表示文字列
-            （model.musicPosition.text）へ既に組み込まれているため、ここではON/OFFの入力だけを
-            担い、描画側（renderTopFormationExport／renderAudienceFormationExport／
-            drawFormationExportHeader）には一切手を加えていない。 */}
-        <div className="flex flex-col gap-2">
-          <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
-            <input type="checkbox" checked={showMusicTime} onChange={(e) => onShowMusicTimeChange(e.target.checked)} />
-            音源内時間を表示
-          </label>
         </div>
 
         {/* Export表示倍率 v1・PART C・O：auto-fit（100%）を基準にした構図倍率。
@@ -17080,7 +26448,7 @@ function ExportCenterModal({
             90%〜110%を5%刻みでクランプし、UIには常に整数%で表示する（内部値は0.9〜1.1の
             小数だが、表示は105%のように丸める）。 */}
         <div className="flex flex-col gap-2">
-          <span className="text-xs" style={sectionTitleStyle}>
+          <span style={sectionTitleStyle}>
             出力表示倍率
           </span>
           <div className="flex items-center gap-2">
@@ -17131,21 +26499,46 @@ function ExportCenterModal({
         </div>
 
         {/* ビュー：現在のビュー / 平面図 / 俯瞰客席（14章：既存top/audienceの描画ロジックを
-            そのまま再利用。ここでは選択だけを行う） */}
+            そのまま再利用。ここでは選択だけを行う）。
+            出演者一覧単体Export v1・9章：出演者一覧には平面図/俯瞰客席の区別が無いため、
+            performerListOnly中だけdisableする（lightingCueModeではView選択が引き続き
+            意味を持つため対象外＝Lighting Cue Exportは従来通りTop/Audience切替可能）。 */}
         <div className="flex flex-col gap-2">
-          <span className="text-xs" style={sectionTitleStyle}>
+          <span style={sectionTitleStyle}>
             ビュー
           </span>
-          <label style={radioRowStyle} className="text-sm" title={`現在の画面のビュー（${currentViewLabel}）で出力します`}>
-            <input type="radio" name="export-view-choice" checked={viewChoice === "current"} onChange={() => onViewChoiceChange("current")} />
+          <label
+            style={{ ...radioRowStyle, opacity: performerListOnly ? 0.5 : 1 }}
+            className="text-sm"
+            title={`現在の画面のビュー（${currentViewLabel}）で出力します`}
+          >
+            <input
+              type="radio"
+              name="export-view-choice"
+              checked={viewChoice === "current"}
+              disabled={performerListOnly}
+              onChange={() => onViewChoiceChange("current")}
+            />
             <span style={{ color: THEME.text }}>現在のビュー（{currentViewLabel}）</span>
           </label>
-          <label style={radioRowStyle} className="text-sm">
-            <input type="radio" name="export-view-choice" checked={viewChoice === "top"} onChange={() => onViewChoiceChange("top")} />
+          <label style={{ ...radioRowStyle, opacity: performerListOnly ? 0.5 : 1 }} className="text-sm">
+            <input
+              type="radio"
+              name="export-view-choice"
+              checked={viewChoice === "top"}
+              disabled={performerListOnly}
+              onChange={() => onViewChoiceChange("top")}
+            />
             <span style={{ color: THEME.text }}>平面図</span>
           </label>
-          <label style={radioRowStyle} className="text-sm">
-            <input type="radio" name="export-view-choice" checked={viewChoice === "front"} onChange={() => onViewChoiceChange("front")} />
+          <label style={{ ...radioRowStyle, opacity: performerListOnly ? 0.5 : 1 }} className="text-sm">
+            <input
+              type="radio"
+              name="export-view-choice"
+              checked={viewChoice === "front"}
+              disabled={performerListOnly}
+              onChange={() => onViewChoiceChange("front")}
+            />
             <span style={{ color: THEME.text }}>俯瞰客席</span>
           </label>
         </div>
@@ -17153,17 +26546,50 @@ function ExportCenterModal({
         {/* 形式：v1.2でPDFを追加。「どの構成を出力するか」（targetMode）とは独立した設定で、
             PNG/ZIPの既存挙動には一切影響しない（PDFを選んだ時だけ別経路を通る）。 */}
         <div className="flex flex-col gap-2">
-          <span className="text-xs" style={sectionTitleStyle}>
+          <span style={sectionTitleStyle}>
             形式
           </span>
           <label style={radioRowStyle} className="text-sm">
             <input type="radio" name="export-format" checked={format === "png"} onChange={() => onFormatChange("png")} />
-            <span style={{ color: THEME.text }}>PNG（1構成なら画像、複数構成ならZIP）</span>
+            <span style={{ color: THEME.text }}>
+              {performerListOnly
+                ? "PNG（1枚）"
+                : lightingCueMode
+                ? "PNG（1カットなら画像、複数カットならZIP）"
+                : "PNG（1構成なら画像、複数構成ならZIP）"}
+            </span>
           </label>
           <label style={radioRowStyle} className="text-sm">
             <input type="radio" name="export-format" checked={format === "pdf"} onChange={() => onFormatChange("pdf")} />
-            <span style={{ color: THEME.text }}>PDF（1ファイル・複数構成は複数ページ）</span>
+            <span style={{ color: THEME.text }}>
+              {performerListOnly
+                ? "PDF（1ページ）"
+                : lightingCueMode
+                ? "PDF（1ファイル・1カット=1ページ）"
+                : "PDF（1ファイル・複数構成は複数ページ）"}
+            </span>
           </label>
+          {/* 出演者一覧 Export v1・14・15・31章：PDF選択時だけ意味を持つため、PNG選択時は
+              非表示にする（31章の2案のうちhide案。PNG/ZIPには一切影響しない設定のため、
+              PNG選択中に表示し続けると誤解を招く）。通常Export・Lighting Cue Exportの
+              どちらでも共通の設定（24章：lightingCueModeによって内容は変えない）。
+              出演者一覧単体Export v1・12章：performerListOnly自身では意味がないため、
+              このモード中は非表示にする。 */}
+          {format === "pdf" && !performerListOnly && (
+            <div className="flex flex-col" style={{ gap: 4 }}>
+              <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
+                <input
+                  type="checkbox"
+                  checked={includePerformerList}
+                  onChange={(e) => onIncludePerformerListChange(e.target.checked)}
+                />
+                出演者一覧を先頭に付ける
+              </label>
+              <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+                PDFの1ページ目に番号・名前一覧を追加します
+              </span>
+            </div>
+          )}
         </div>
 
         {error && (

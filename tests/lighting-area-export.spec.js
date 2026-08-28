@@ -36,8 +36,12 @@ function currentSceneSection(page) {
   });
 }
 
+// 旧「照明機能を使う」（Project-level lightingEnabled）checkboxは、Lighting UI整理・
+// Prototype卒業により正式UIから削除された。Lighting Scene追加UIは常に表示されるため、
+// このhelperはもう何もする必要がない（no-op）。呼び出し側のテスト本体を個別に書き換えず
+// 済むよう、関数自体は残してある。
 async function enableLighting(page) {
-  await page.getByLabel("照明機能を使う").check();
+  // no-op：Project全体の「照明機能を使う」は正式UIから削除済み。
 }
 
 async function addLightingScene(page) {
@@ -66,12 +70,15 @@ async function openExportCenter(page) {
 // Export Center内で形式を選択する（"png" | "pdf"）。
 async function selectExportFormat(page, format) {
   const label = format === "pdf" ? /^PDF/ : /^PNG/;
-  await page.getByRole("radio", { name: label, exact: true }).check();
+  await page.getByLabel(label).check();
 }
 
 // Export Center内でビューを選択する（"top" | "front"）。既定の「現在のビュー」に依存せず、
 // テストごとに明示的に平面図／俯瞰客席を選び直すことで、編集画面側の表示状態に
 // テスト結果が左右されないようにする。
+// 実機確認の結果、getByLabel("平面図")は「平面図」を含む複数要素（俯瞰客席ビューの
+// 「平面図（真上）」トグルボタン等）にstrict mode違反するため、Export Centerの
+// ラジオボタンをrole + exactで一意に指定する。
 async function selectExportView(page, view) {
   const label = view === "front" ? "俯瞰客席" : "平面図";
   await page.getByRole("radio", { name: label, exact: true }).check();
@@ -129,19 +136,12 @@ test.describe("Lighting Area Export v1", () => {
   });
 
   // ------------------------------------------------------------------
-  // 3. Lighting OFFでもExportが正常生成される
+  // 3. Lighting UI整理・Prototype卒業により、Project全体の「照明機能を使う」（Lighting OFF）
+  // という状態そのものが正式UIから廃止された。Export側も呼び出し元で常にlightingEnabled=true
+  // を渡す仕様に変更済みのため、「Lighting OFFでもExportが正常生成される」という旧テストは
+  // 意味を失った。代わりに、唯一残る関連ON/OFFである「Scene OFF」でのExport生成確認
+  // （このすぐ下のtest）が実質的に同じ回帰防止の役割を果たす。
   // ------------------------------------------------------------------
-  test("Lighting OFFでもExportが正常生成される", async ({ page }) => {
-    await setupSceneWithOneArea(page);
-    // Lighting機能自体をOFFにする（Areaデータは保持されたまま、Exportには出さない想定）
-    await page.getByLabel("照明機能を使う").uncheck();
-
-    await openExportCenter(page);
-    await selectExportFormat(page, "png");
-    const download = await confirmExportAndWaitDownload(page);
-
-    expect(download.suggestedFilename()).toMatch(/\.png$/i);
-  });
 
   // ------------------------------------------------------------------
   // 4. Scene OFFでもExportが正常生成される
@@ -149,8 +149,8 @@ test.describe("Lighting Area Export v1", () => {
   test("Scene OFFでもExportが正常生成される", async ({ page }) => {
     await setupSceneWithOneArea(page);
     const section = currentSceneSection(page);
-    // 「この構成の照明を有効にする」をOFF（Scene.enabled = false）
-    await section.getByLabel("この構成の照明を有効にする").uncheck();
+    // 「この構成で照明を使用」をOFF（Scene.enabled = false）
+    await section.getByLabel("この構成で照明を使用").uncheck();
 
     await openExportCenter(page);
     await selectExportFormat(page, "png");
@@ -188,52 +188,13 @@ test.describe("Lighting Area Export v1", () => {
   //
   // これは実機で報告された不具合（編集画面にはAreaが3件表示されるのに、
   // 出力PNGには一切描画されない）を検出できなかった既存テストの弱点を補うためのもの。
+  //
+  // 注：旧「Lighting ON vs Lighting OFF」のバイト比較テストは、Project全体の
+  // 「照明機能を使う」が正式UIから廃止され、Export側も常にlightingEnabled=trueとして
+  // 扱う仕様になったため削除した（テストしようとしていた分岐自体が存在しなくなったため）。
+  // 代わりに、下の「Scene有効／Scene無効」バイト比較テストが同じ回帰防止の役割を果たす
+  // （Scene.enabledがExport側で唯一残っているON/OFF分岐のため）。
   // ------------------------------------------------------------------
-
-  test("平面図PNG：Lighting ON（Scene有効・Areaあり）とLighting OFFで内容が異なる", async ({ page }) => {
-    await setupSceneWithOneArea(page);
-
-    await openExportCenter(page);
-    await selectExportView(page, "top");
-    await selectExportFormat(page, "png");
-    const downloadOn = await confirmExportAndWaitDownload(page);
-    const bytesOn = await downloadToBuffer(downloadOn);
-
-    // 同じFormation・同じ出演者配置のまま、Lighting機能だけをOFFにする
-    // （Areaデータ自体は削除されない。Export内容だけが変わるはず）。
-    await page.getByLabel("照明機能を使う").uncheck();
-
-    await openExportCenter(page);
-    await selectExportView(page, "top");
-    await selectExportFormat(page, "png");
-    const downloadOff = await confirmExportAndWaitDownload(page);
-    const bytesOff = await downloadToBuffer(downloadOff);
-
-    // Areaが実際に描画されていれば、PNGのバイト列は完全には一致しないはず。
-    // （床色・出演者・グリッド等は同一のままAreaの塗りだけが消えるため、
-    // 完全一致＝Areaが全く描画されていない、という強いシグナルになる）
-    expect(bytesOn.equals(bytesOff)).toBe(false);
-  });
-
-  test("俯瞰PNG：Lighting ON（Scene有効・Areaあり）とLighting OFFで内容が異なる", async ({ page }) => {
-    await setupSceneWithOneArea(page);
-
-    await openExportCenter(page);
-    await selectExportView(page, "front");
-    await selectExportFormat(page, "png");
-    const downloadOn = await confirmExportAndWaitDownload(page);
-    const bytesOn = await downloadToBuffer(downloadOn);
-
-    await page.getByLabel("照明機能を使う").uncheck();
-
-    await openExportCenter(page);
-    await selectExportView(page, "front");
-    await selectExportFormat(page, "png");
-    const downloadOff = await confirmExportAndWaitDownload(page);
-    const bytesOff = await downloadToBuffer(downloadOff);
-
-    expect(bytesOn.equals(bytesOff)).toBe(false);
-  });
 
   test("平面図PNG：Scene有効／Scene無効（Areaは同じ）でPNGの内容が異なる", async ({ page }) => {
     // このテストは「サイドバーのArea一覧はScene.enabledに関わらず表示される」という
@@ -250,9 +211,9 @@ test.describe("Lighting Area Export v1", () => {
     const downloadEnabled = await confirmExportAndWaitDownload(page);
     const bytesEnabled = await downloadToBuffer(downloadEnabled);
 
-    // Scene自体はそのまま、「この構成の照明を有効にする」だけをOFFにする
+    // Scene自体はそのまま、「この構成で照明を使用」だけをOFFにする
     // （lightingEnabledはONのまま・Areaデータもそのまま）。
-    await section.getByLabel("この構成の照明を有効にする").uncheck();
+    await section.getByLabel("この構成で照明を使用").uncheck();
 
     await openExportCenter(page);
     await selectExportView(page, "top");

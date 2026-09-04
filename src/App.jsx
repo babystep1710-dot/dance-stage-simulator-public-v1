@@ -1021,6 +1021,14 @@ const RESPONSIVE_STYLES = `
   .slsim-cb-compact-2 .slsim-nearby-card:not(.slsim-nearby-card-active) {
     display: none;
   }
+
+  /* 配置ツール視認性改善 v1・2章：閉じた状態でも「クリックできるUI」だと分かるよう、
+     トリガーボタンにだけ薄いhover背景を付ける。他の要素には一切影響しない専用class。
+     常時display:inlineの文字リンクに見えないよう、hover時だけ気持ち明るくする程度に
+     留め、強いaccent色やCTA的な派手さは付けない（2章）。 */
+  .slsim-placement-tools-trigger:hover {
+    background: ${THEME.border} !important;
+  }
 `;
 
 // ------------------------------------------------------------------
@@ -1748,6 +1756,41 @@ function resolveArea(pos, zones) {
   if (pointInZone(pos, zones.stageRight)) return "stageRight";
   if (pointInZone(pos, zones.upstageBackstage)) return "upstageBackstage";
   return null;
+}
+
+// 円形配置の幾何学的安定化 v1・1〜2章：円形関連処理（生成・サイズ調整・回転）の中心には、
+// bounding-box center（(minX+maxX)/2, (minY+maxY)/2）ではなく、選択出演者座標の重心
+// （centroid＝sum(x)/n, sum(y)/n）を使う。奇数人数の正多角形はbounding boxが回転角度に
+// よって非対称になるため、bbox centerは真の多角形中心と一致しない（回転・移動を繰り返す
+// たびに中心がドリフトする原因）。正多角形をrigid transform（回転・平行移動・中心からの
+// 距離の一律拡縮）している限り、centroidは操作前後で厳密に不変であるため、このdrift問題が
+// 起きない。ids配列内でplacementsに存在するものだけを対象にする（呼び出し側で事前に
+// filterしてidsを渡す設計を想定するが、念のためここでも存在チェックする）。
+function computePlacementsCentroid(ids, placements) {
+  const list = Array.isArray(ids) ? ids.filter((id) => placements[id]) : [];
+  if (list.length === 0) return { x: 0, y: 0 };
+  let sumX = 0;
+  let sumY = 0;
+  list.forEach((id) => {
+    sumX += placements[id].x;
+    sumY += placements[id].y;
+  });
+  return { x: sumX / list.length, y: sumY / list.length };
+}
+
+// 配置生成時のanchor snap v1・PART A・1〜5章：一括配置生成（横1列・縦1列・V字・逆V字・
+// 円形）の最後に、「その形にとって意味のある基準点（anchor）」だけを既存の0.25場ミリgrid
+// （snapPlacementCoordinate）へ合わせるための共通translation量を求める。各出演者の絶対
+// 座標を個別にsnapPlacementCoordinate()すると、正多角形・V字などの内部形状（辺長・角度・
+// 対称性）が崩れてしまう。そのため「まず数学的に正しい形を生成する→その形のanchor point
+// を求める→anchorのsnap先とのdx/dyだけを全出演者へ同じ量だけ加える」という設計にする
+// （1章）。新しいsnap単位は追加せず、既存snapPlacementCoordinate()をそのまま再利用する
+// （2章）。
+function computeAnchorSnapDelta(anchorX, anchorY) {
+  return {
+    dx: snapPlacementCoordinate(anchorX) - anchorX,
+    dy: snapPlacementCoordinate(anchorY) - anchorY,
+  };
 }
 
 // ステージ本体・袖・舞台奥待機、そのどれにも属さない「さらに外側」に出た場合だけ警告する
@@ -2978,6 +3021,95 @@ function getTransitionCounts(transitionCounts, fromSlideId) {
 function getKeepCounts(slide) {
   const v = slide && slide.keepCounts;
   return typeof v === "number" && v >= MIN_KEEP_COUNTS ? v : DEFAULT_KEEP_COUNTS;
+}
+
+// ------------------------------------------------------------------
+// P-02 v0：選択出演者の分析情報（pure helpers）
+// ------------------------------------------------------------------
+// すべて表示専用のderived dataを返すpure functionであり、work・selection state・
+// Undo/Redo・localStorageには一切影響しない。既存のPlayback/trajectory drawing/waypoint/
+// path interpolationロジックは一切変更せず、既存helper（quadraticBezierPoint・getKeepCounts・
+// getTransitionCounts・getPerformerTransitionPath・countsToEighths・formatEighthsLabel）を
+// そのまま再利用する。
+
+// 二次Bezier曲線の長さの近似値。解析解ではなく、segments分割した折れ線の長さの合計で
+// 近似する（既定32分割）。Bezier数式自体はPlayback側のquadraticBezierPoint()をそのまま
+// 呼ぶだけで、ここで独自の数式を持たない。
+function computeQuadraticBezierPathLength(p0, p1, p2, segments = 32) {
+  let total = 0;
+  let prev = p0;
+  for (let i = 1; i <= segments; i += 1) {
+    const t = i / segments;
+    const point = quadraticBezierPoint(p0, p1, p2, t);
+    total += Math.hypot(point.x - prev.x, point.y - prev.y);
+    prev = point;
+  }
+  return total;
+}
+
+// 指定出演者について「舞台上count」を全Formationにわたって積算する。各Formationは、
+// その出演者のplacementが存在し、かつplacement.area === "stage"の場合だけkeepCountsを
+// 加算する。area == null（範囲外）は今回は対象外として明確に区別する（既存のLighting
+// spotlight等が area == null をstage相当として扱うのとは意図的に異なる。分析値としての
+// 意味を明確にするための今回限りの判定）。keepCountsは必ずgetKeepCounts(slide)を使い、
+// slide.keepCountsを直接読む独自fallbackは作らない。
+function computePerformerStageKeepCounts(slides, performerId) {
+  const list = Array.isArray(slides) ? slides : [];
+  let total = 0;
+  list.forEach((slide) => {
+    const pos = slide.placements && slide.placements[performerId];
+    if (pos && pos.area === "stage") {
+      total += getKeepCounts(slide);
+    }
+  });
+  return total;
+}
+
+// 指定出演者について、隣接Formation間（slides[i]→slides[i+1]）の移動count・移動距離を
+// 順番に求める。片方のFormationにしかplacementが存在しないTransitionは対象外（移動量を
+// 推測しない）。経路種別は既存のgetPerformerTransitionPath()を通じてeffective設定
+// （手動curve・自動スマート経路のどちらも含む、実際に画面へ表示されているのと同じ設定）
+// から取得し、linearは直線距離、curveはcomputeQuadraticBezierPathLength()によるBezier
+// 軌跡長を使う。移動countは必ずgetTransitionCounts(transitionCounts, fromSlide.id)を使う。
+function computePerformerTransitionDistances(slides, transitionCounts, effectiveTransitionPathConfig, performerId) {
+  const list = Array.isArray(slides) ? slides : [];
+  const result = [];
+  for (let i = 0; i < list.length - 1; i += 1) {
+    const fromSlide = list[i];
+    const toSlide = list[i + 1];
+    const fromPos = fromSlide.placements && fromSlide.placements[performerId];
+    const toPos = toSlide.placements && toSlide.placements[performerId];
+    if (!fromPos || !toPos) continue; // 片方に存在しないTransitionは移動履歴から除外
+    const cfg = getPerformerTransitionPath(effectiveTransitionPathConfig, fromSlide.id, performerId);
+    const distance =
+      cfg.type === "curve" && cfg.waypoint
+        ? computeQuadraticBezierPathLength(fromPos, cfg.waypoint, toPos, 32)
+        : Math.hypot(toPos.x - fromPos.x, toPos.y - fromPos.y);
+    result.push({
+      fromSlideId: fromSlide.id,
+      toSlideId: toSlide.id,
+      fromSlideIndex: i,
+      toSlideIndex: i + 1,
+      transitionCounts: getTransitionCounts(transitionCounts, fromSlide.id),
+      distance,
+    });
+  }
+  return result;
+}
+
+// 上記2つを合成し、選択出演者パネルの分析UIがそのまま表示できる形へまとめる。
+// 戻り値はすべて表示専用のderived dataであり、workへは一切保存しない。
+function buildPerformerAnalysis(slides, transitionCounts, effectiveTransitionPathConfig, performerId) {
+  const stageKeepCounts = computePerformerStageKeepCounts(slides, performerId);
+  const transitions = computePerformerTransitionDistances(slides, transitionCounts, effectiveTransitionPathConfig, performerId);
+  const totalMovementDistance = transitions.reduce((sum, t) => sum + t.distance, 0);
+  return {
+    performerId,
+    stageKeepCounts,
+    stageKeepEighths: countsToEighths(stageKeepCounts),
+    totalMovementDistance,
+    transitions,
+  };
 }
 
 // ------------------------------------------------------------------
@@ -6780,7 +6912,7 @@ const TopView = forwardRef(function TopView(
                       d={`M ${x1} ${y1} Q ${wx} ${wy} ${x2} ${y2}`}
                       fill="none"
                       stroke={color}
-                      strokeWidth={emphasized ? 3 : 1.5}
+                      strokeWidth={emphasized ? 4 : 1.5}
                       strokeLinecap="round"
                     />
                   ) : (
@@ -6790,7 +6922,7 @@ const TopView = forwardRef(function TopView(
                       x2={x2}
                       y2={y2}
                       stroke={color}
-                      strokeWidth={emphasized ? 3 : 1.5}
+                      strokeWidth={emphasized ? 4 : 1.5}
                       strokeLinecap="round"
                     />
                   )}
@@ -7149,6 +7281,20 @@ const EXPORT_PIXEL_RATIO = 2;
 // 移動軌跡）は完全に別実装であり、この定数はCanvas Export専用（renderTopFormationExport・
 // renderAudienceFormationExport）にしか影響しない。
 const EXPORT_TRAJECTORY_ALPHA = 0.45;
+// P-03 第一段階「選択出演者を強調して出力」・7章：強調対象出演者の軌跡だけ、通常Export軌跡
+// （EXPORT_TRAJECTORY_ALPHA=0.45・lineWidth=2.5・arrowSize=10）よりも明確に濃く・太くする。
+// 編集画面TopViewのP-01（選択0.9／非選択0.35、選択strokeWidth=4／非選択1.5）と同じ「明確な差」
+// という考え方を、Export側の既存スケール・解像度に合わせて相対的に適用する（絶対値の4を
+// そのまま持ち込まない。1章・7章の方針通り）。
+const EXPORT_TRAJECTORY_HIGHLIGHT_ALPHA = 1;
+const EXPORT_TRAJECTORY_HIGHLIGHT_LINE_WIDTH = 4.5;
+const EXPORT_TRAJECTORY_HIGHLIGHT_ARROW_SIZE = 14;
+// 出演者マーカー黄色枠 v1：編集画面TopPerformerMarkerの選択リング（radius+5, strokeWidth 3,
+// THEME.accent）と同じ意味の強調を、Export側の既存marker半径（figureRadius）に対する比率で
+// 表現する。絶対px値ではなくfigureRadiusからの相対値にすることで、Export倍率・表示サイズ設定
+// が変わってもバランスが崩れない（6章：marker半径より少し大きい、という指定を満たす）。
+const EXPORT_HIGHLIGHT_MARKER_RING_OFFSET = 6;
+const EXPORT_HIGHLIGHT_MARKER_RING_WIDTH = 3;
 // 追尾スポット軌跡Export v1・55章：追尾Beam軌跡（線・曲線・矢印・始点/終点marker）専用の
 // Canvas Export透明度。出演者trajectoryのEXPORT_TRAJECTORY_ALPHA（0.45）と同じ意味・
 // 同じ仕組み（save/restoreで閉じ込め、後続描画へ漏らさない）だが、Lighting Beam footprint等
@@ -7221,6 +7367,11 @@ function buildFormationExportModel({
   showLightingTrackingPaths, // 追尾スポット軌跡Export v1・18〜20章：Export Centerの「追尾スポット軌跡」
   // checkboxの値。UI state（App側exportShowLightingTrackingPaths）がそのまま渡ってくる想定で、
   // work/Project schemaには一切保存しない。既存fieldへは影響しない新規追加field。
+  // P-03 第一段階「選択出演者を強調して出力」・5章：強調対象出演者のid（{selectedIds[0]}）を
+  // そのままExport Modelへ表示専用fieldとして持たせるだけ。work dataへは一切保存しない。
+  // 未指定（呼び出し元が渡さない＝Lighting Cue Export等）の場合は常にnullとなり、
+  // renderer側の強調描画は自然に発火しない（10章：Lighting Cue Exportは今回対象外）。
+  highlightedPerformerId = null,
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
@@ -7287,6 +7438,10 @@ function buildFormationExportModel({
       : [],
     placements: slide.placements || {},
     transitionPaths,
+    // P-03 第一段階「選択出演者を強調して出力」・5章：表示専用field。強調対象のperformerId
+    // （またはnull）をそのまま保持するだけで、ここでは強調の可否判定（selectedIds.length===1
+    // 等）は一切行わない（判定は呼び出し元＝App側のExport実行ハンドラの責務）。
+    highlightedPerformerId,
     // Export舞台色反映 v1：未指定（呼び出し元が省略した場合）でも安全に黒へフォールバックする
     // （既存getStageAppearance()と同じdefault値。ここで新しい判定ロジックは作らない）。
     stageAppearance: stageAppearance || DEFAULT_STAGE_APPEARANCE,
@@ -7377,6 +7532,10 @@ function buildFormationExportModels({
   lightingEnabled, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
   lightingScenes, // Lighting Area Export v1：buildFormationExportModelへそのまま伝播するだけ
   showLightingTrackingPaths, // 追尾スポット軌跡Export v1・27章：buildFormationExportModelへそのまま伝播するだけ
+  // P-03 第一段階「選択出演者を強調して出力」：buildFormationExportModelへそのまま伝播するだけ。
+  // 全Formationで同じ1人のperformerId（現在編集画面で選択中の出演者）を強調する想定のため、
+  // Formationごとに異なる値を持たせる仕組みは今回作らない。
+  highlightedPerformerId,
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -7404,6 +7563,7 @@ function buildFormationExportModels({
         lightingEnabled,
         lightingScenes,
         showLightingTrackingPaths,
+        highlightedPerformerId,
       })
     )
     .filter((m) => m !== null);
@@ -8470,10 +8630,15 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   const figureRadius = baseFigureRadius * performerDisplayScale;
   const nameFontRadius = baseFigureRadius * performerNameScale;
   ctx.save();
-  ctx.globalAlpha = EXPORT_TRAJECTORY_ALPHA;
   visibleTransitionPaths.forEach((path) => {
     const performer = model.performers.find((p) => p.id === path.id);
     const color = (performer && performer.color) || THEME.textDim;
+    // P-03 第一段階「選択出演者を強調して出力」・4・7章：model.highlightedPerformerIdは
+    // buildFormationExportModel側で既にExport実行時の有効条件（selectedIds.length===1等）を
+    // 判定済みの値（またはnull）のため、ここでは単純にpath.idと一致するかだけを見ればよい。
+    // 他出演者の軌跡（strokeWidth 2.5・alpha 0.45・arrowSize 10）は一切変更しない（重要な
+    // 後方互換：model.highlightedPerformerIdがnullなら全pathが従来通りの値になる）。
+    const isHighlighted = !!model.highlightedPerformerId && path.id === model.highlightedPerformerId;
     const x1 = toX(path.from.x);
     const y1 = toY(path.from.y);
     const x2 = toX(path.to.x);
@@ -8482,8 +8647,9 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     const wx = isCurve ? toX(path.waypoint.x) : null;
     const wy = isCurve ? toY(path.waypoint.y) : null;
 
+    ctx.globalAlpha = isHighlighted ? EXPORT_TRAJECTORY_HIGHLIGHT_ALPHA : EXPORT_TRAJECTORY_ALPHA;
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = isHighlighted ? EXPORT_TRAJECTORY_HIGHLIGHT_LINE_WIDTH : 2.5;
     ctx.lineCap = "round";
     ctx.beginPath();
     ctx.moveTo(x1, y1);
@@ -8494,7 +8660,7 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     }
     ctx.stroke();
 
-    const arrowSize = 10;
+    const arrowSize = isHighlighted ? EXPORT_TRAJECTORY_HIGHLIGHT_ARROW_SIZE : 10;
     const arrowPts = isCurve
       ? trajectoryArrowPoints(wx, wy, x2, y2, arrowSize)
       : trajectoryArrowPoints(x1, y1, x2, y2, arrowSize);
@@ -8598,6 +8764,26 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   // からマーカーレイヤーを描くことで、performers配列の並び順に関係なく「丸＋番号は常に
   // 最前面」になる。fontSize・Y offsetはgetPerformerNameDisplayMetrics()（SVG側と共通）で
   // 算出し、マーカー半径figureRadiusに対する比率をSVGと一致させる（PART E・F）。
+  // 選択出演者強調・黄色リング名前重なり修正 v1：1出演者分の名前描画処理を小さなローカル
+  // helperへ切り出した（PASS 1・PASS 3の両方から同じコードを1回ずつ呼ぶだけにするため。
+  // 二重描画を避けつつ、既存のfont/color/offsetY/省略ルール等は一切変更しない＝完全に
+  // 同じ処理を再利用するだけ）。
+  const drawPerformerNameLabel = (p) => {
+    const pos = model.placements[p.id];
+    if (!pos) return;
+    const name = getPerformerName(p);
+    if (!name) return;
+    const metrics = getPerformerNameDisplayMetrics(name, nameFontRadius, figureRadius);
+    if (!metrics) return;
+    const sx = toX(pos.x);
+    const sy = toY(pos.y);
+    ctx.font = `bold ${metrics.fontSize}px sans-serif`;
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = THEME.bg;
+    ctx.strokeText(metrics.text, sx, sy + metrics.offsetY);
+    ctx.fillStyle = THEME.text;
+    ctx.fillText(metrics.text, sx, sy + metrics.offsetY);
+  };
   if (options && options.showPerformerNames) {
     ctx.textAlign = "center";
     // 出演者表示サイズ v1.3・PART E〜H：編集画面SVG側の見え方を正とする。SVG側の<text>には
@@ -8613,20 +8799,14 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     ctx.textBaseline = "alphabetic";
     ctx.lineJoin = "round";
     visiblePerformers.forEach((p) => {
-      const pos = model.placements[p.id];
-      if (!pos) return;
-      const name = getPerformerName(p);
-      if (!name) return;
-      const metrics = getPerformerNameDisplayMetrics(name, nameFontRadius, figureRadius);
-      if (!metrics) return;
-      const sx = toX(pos.x);
-      const sy = toY(pos.y);
-      ctx.font = `bold ${metrics.fontSize}px sans-serif`;
-      ctx.lineWidth = 2.5;
-      ctx.strokeStyle = THEME.bg;
-      ctx.strokeText(metrics.text, sx, sy + metrics.offsetY);
-      ctx.fillStyle = THEME.text;
-      ctx.fillText(metrics.text, sx, sy + metrics.offsetY);
+      // 選択出演者強調・黄色リング名前重なり修正 v1：強調対象出演者（model.highlightedPerformerId
+      // と一致）の名前だけは、この時点（marker／黄色リングより前）では描かず、marker／リング
+      // 描画後の専用パス（下記PASS 3）へ回す。他の出演者は従来通りこのPASS 1でそのまま描き、
+      // 「番号は名前より前面」という既存の関係（PART I）を一切変更しない。
+      // model.highlightedPerformerIdがnull（強調OFF・非選択・複数選択時）の場合はこの条件が
+      // 常にfalseになるため、通常Export時の描画順は完全に従来通りのまま変化しない。
+      if (model.highlightedPerformerId && p.id === model.highlightedPerformerId) return;
+      drawPerformerNameLabel(p);
     });
   }
 
@@ -8637,8 +8817,27 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     if (!pos) return;
     const sx = toX(pos.x);
     const sy = toY(pos.y);
-    drawTopPerformerMarker(ctx, sx, sy, p, figureRadius);
+    // P-03 第一段階「選択出演者を強調して出力」・6章：model.highlightedPerformerIdと一致する
+    // 出演者だけに黄色い強調枠を追加する。出演者本体（色・番号）は一切変更しない。
+    const isHighlighted = !!model.highlightedPerformerId && p.id === model.highlightedPerformerId;
+    drawTopPerformerMarker(ctx, sx, sy, p, figureRadius, isHighlighted);
   });
+
+  // 選択出演者強調・黄色リング名前重なり修正 v1・PASS 3：強調対象出演者の名前だけを、
+  // marker／黄色リング描画の直後に改めて描く。PASS 1側でこの出演者だけ意図的にskipしている
+  // ため、名前は合計でちょうど1回だけ描かれる（二重描画による文字の太まり・濃さの変化は
+  // 発生しない）。font/color/offsetY/省略ルール等はdrawPerformerNameLabel()を再利用するため
+  // 完全に同一。showPerformerNames===falseの場合、またはhighlightedPerformerIdが無い場合は
+  // 何も描かない（通常Export・強調OFF時の見た目は完全に従来通り）。
+  if (options && options.showPerformerNames && model.highlightedPerformerId) {
+    const hp = visiblePerformers.find((p) => p.id === model.highlightedPerformerId);
+    if (hp) {
+      ctx.textAlign = "center";
+      ctx.textBaseline = "alphabetic";
+      ctx.lineJoin = "round";
+      drawPerformerNameLabel(hp);
+    }
+  }
 
   ctx.restore();
 }
@@ -8647,8 +8846,23 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
 // SVG版（TopPerformerMarker）と全く同じデザインルール（半径・番号フォントサイズ計算・
 // 白文字・薄い外周線）を、Canvas APIで再現しただけの薄い関数。無理に1つの関数へ完全共通化は
 // せず、比率・数値だけをTOP_MARKER_*定数・topMarkerNumberFontSize()で共有する（7章）。
-function drawTopPerformerMarker(ctx, sx, sy, performer, figureRadius) {
+// P-03 第一段階「選択出演者を強調して出力」・6章：highlighted（既定false、後方互換のため
+// optional）がtrueの場合だけ、marker本体の外側に黄色いリングを追加する。編集画面SVG版
+// TopPerformerMarkerのselectedリング（radius+5, strokeWidth 3, THEME.accent, fillなし）と
+// 同じ意味・同じ配色だが、Canvas API向けに独立して描く（無理に同じcomponentを共用しない、
+// という方針に沿う）。marker本体の色・stroke・番号描画には一切触れない。
+function drawTopPerformerMarker(ctx, sx, sy, performer, figureRadius, highlighted = false) {
   const color = performer.color || THEME.textDim;
+
+  if (highlighted) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(sx, sy, figureRadius + EXPORT_HIGHLIGHT_MARKER_RING_OFFSET, 0, Math.PI * 2);
+    ctx.strokeStyle = THEME.accent;
+    ctx.lineWidth = EXPORT_HIGHLIGHT_MARKER_RING_WIDTH;
+    ctx.stroke();
+    ctx.restore();
+  }
 
   ctx.save();
   ctx.beginPath();
@@ -10600,6 +10814,10 @@ export default function App() {
   // 派生値（selectedIds.length === 1 のときだけ有効）で表現する。
   const [selectedIds, setSelectedIds] = useState([]);
   const [viewMode, setViewMode] = useState("top");
+  // 配置ツール折りたたみ v1・2章：「配置ツール」（左右反転／横・縦に等間隔）の開閉は完全に
+  // UI専用のstate。work・project・localStorage・backup・Undo/Redoには一切保存しない
+  // （開閉操作自体は履歴に残らない）。初期状態は閉じる（1章）。
+  const [placementToolsOpen, setPlacementToolsOpen] = useState(false);
 
   const selectOnly = useCallback((id) => {
     setSelectedIds(id ? [id] : []);
@@ -13991,6 +14209,13 @@ export default function App() {
   // 独立させる。実際に描画へ反映するのはrenderTopFormationExportのみで、俯瞰客席ビュー側の
   // renderAudienceFormationExportへは常に渡さない（9・14章：常に名前非表示という確定仕様）。
   const [exportShowPerformerNames, setExportShowPerformerNames] = useState(false);
+  // P-03 第一段階「選択出演者を強調して出力」・2章：Export Center専用の「選択中の出演者を
+  // 強調して出力」チェックボックス。exportShowPerformerNames等と全く同じ考え方（work/Project
+  // schema/localStorage/Backup/Undo/Redoには一切保存しないExport専用UI state）。初期値OFF。
+  // 3章：有効条件（selectedIds.length===1）はExport実行時に判定するだけで、このstate自体を
+  // 選択状態に応じて自動でOFFへ書き換えることはしない（disabled時にON状態が残っていても、
+  // 実際のExportでは強調を適用しないという安全側の判定をexport実行側で行う）。
+  const [exportHighlightSelectedPerformer, setExportHighlightSelectedPerformer] = useState(false);
   // Export表示倍率 v1・PART D：auto-fit後の構図倍率（1.0=100%）。work/Project/slide/
   // placementには一切保存せず、Undo/Redo対象にもしないUI専用state。編集画面のzoom
   // （viewState.zoom）とは完全に独立した別のstateとして持つ（PART C：絶対に共有しない）。
@@ -14474,6 +14699,10 @@ export default function App() {
         lightingEnabled: true,
         lightingScenes,
         showLightingTrackingPaths: exportShowLightingTrackingPaths,
+        // P-03 第一段階「選択出演者を強調して出力」・3章：有効条件（selectedIds.length===1）を
+        // ここで判定する。disabled状態でONが残っていても、1人選択でなければ常にnullとなり
+        // 強調は適用されない（安全側）。この判定ロジックを別の場所で二重実装しない。
+        highlightedPerformerId: exportHighlightSelectedPerformer && selectedIds.length === 1 ? selectedIds[0] : null,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");
@@ -14607,6 +14836,8 @@ export default function App() {
     activeProject.name,
     lightingScenes,
     exportShowLightingTrackingPaths,
+    exportHighlightSelectedPerformer,
+    selectedIds,
   ]);
 
 
@@ -17968,20 +18199,40 @@ export default function App() {
   // TopView から呼ばれ、ドラッグ中は常に見た目だけの更新（履歴を増やさない）。
   // pointerdown で onDragStart（beginWorkBatch）、pointerup で onDragEnd（endWorkBatch）を
   // 呼ぶことで、ドラッグ全体（単独でも複数人一括でも）を1件の履歴としてまとめる。
+  // 円形配置の幾何学的安定化 v1・6〜9章：複数出演者を同時にドラッグしてpointerupした際、
+  // 各出演者の最終座標を個別にsnapPlacementCoordinate()すると、頂点ごとに異なる方向へ
+  // 丸められてしまい、正多角形などのshapeが崩れる原因になっていた。そのため、複数選択
+  // ドラッグ（ids.length>1）でsnap=trueの場合だけ、「グループ共通の移動量dx/dyを1回だけ
+  // snapし、その同じsnappedDx/snappedDyを全員に適用する」方式へ変更する（9章：新しい
+  // 独立したsnap単位は追加せず、既存snapPlacementCoordinate()＝0.25場ミリ刻みをそのまま
+  // 再利用する）。8章：出演者1人だけのドラッグ（ids.length===1）は、従来通り各出演者
+  // （＝1人だけだが）の最終座標をそのままsnapする既存挙動を変更しない。
   const dragGroup = useCallback(
     (ids, dx, dy, initialPositions, snap) => {
       if (isTransitionActive) return; // 再生中は出演者のドラッグを無効化
+      const useGroupDeltaSnap = snap && ids.length > 1;
+      const snappedDx = useGroupDeltaSnap ? snapPlacementCoordinate(dx) : dx;
+      const snappedDy = useGroupDeltaSnap ? snapPlacementCoordinate(dy) : dy;
       updateSlidePlacementsLive((prev, prevWork) => {
         const zonesNow = computeZones(prevWork.stage);
         const next = { ...prev };
         ids.forEach((id) => {
           const init = initialPositions[id];
           if (!init) return;
-          let nx = init.x + dx;
-          let ny = init.y + dy;
-          if (snap) {
-            nx = snapPlacementCoordinate(nx);
-            ny = snapPlacementCoordinate(ny);
+          let nx;
+          let ny;
+          if (useGroupDeltaSnap) {
+            // 全員に完全に同じsnappedDx/snappedDyを適用するため、出演者同士の相対位置関係
+            // （距離・角度）が寸分違わず維持される。
+            nx = init.x + snappedDx;
+            ny = init.y + snappedDy;
+          } else {
+            nx = init.x + dx;
+            ny = init.y + dy;
+            if (snap) {
+              nx = snapPlacementCoordinate(nx);
+              ny = snapPlacementCoordinate(ny);
+            }
           }
           const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
           const area = resolved || (prev[id] && prev[id].area) || "stage";
@@ -18022,6 +18273,666 @@ export default function App() {
     [performers, updateSlidePlacementsCommit, isTransitionActive]
   );
 
+  // E-01「選択出演者の左右反転」・17章：選択中出演者を舞台センターライン x=0 を軸に左右反転
+  // する。moveIdsToArea()・setPlacementCommit()と全く同じ「updateSlidePlacementsCommitで
+  // 現在Formationのplacementsだけを対象にする→zonesNowを計算→座標変更後にresolveArea()で
+  // area再判定」というパターンをそのまま再利用するだけで、新しいarea判定式は作らない
+  // （5章）。変更するのはx（x→-x）だけで、yはそのまま維持する（1章）。performer本体データ
+  // （色・番号・名前・身長・pose）やtransitionPaths/waypoint/smart pathには一切触れない
+  // （4・7章）。全選択出演者分の反転を1回のcommitWorkへまとめるため、1クリック＝1Undoになる
+  // （10章：moveIdsToArea等と同じく、複数対象でも個別履歴にしない）。既存placements
+  // objectはmutationせず、常に新しいobjectをspreadして返す（17章）。
+  const mirrorSelectedPerformersHorizontallyCommit = useCallback(() => {
+    if (isTransitionActive) return; // 再生中は座標変更を無効化（既存の座標編集ボタンと同じ思想）
+    if (selectedIds.length === 0) return;
+    updateSlidePlacementsCommit((prev, prevWork) => {
+      const zonesNow = computeZones(prevWork.stage);
+      const next = { ...prev };
+      selectedIds.forEach((id) => {
+        const pos = next[id];
+        if (!pos) return; // 現在Formationにこの出演者のplacementが無ければ対象外（安全側）
+        const nx = -pos.x;
+        const resolved = resolveArea({ x: nx, y: pos.y }, zonesNow);
+        const area = resolved || pos.area || "stage";
+        next[id] = { ...pos, x: nx, area };
+      });
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // E-03「選択出演者の上下反転」・9章：E-01 mirrorSelectedPerformersHorizontallyCommit()の
+  // すぐ後に、全く対称な構造のhandlerを追加しただけ（大規模な共通mirror関数へは書き換えない
+  // ＝E-01自体は無変更のまま維持する）。舞台奥行き中央（stage.depth/2）を軸に
+  // y→stage.depth-yへ変換する（2章：選択グループの中心やbounding boxの中心は使わない、
+  // 舞台そのものを基準にする）。xには一切触れない（6章）。area再計算もE-01と全く同じ
+  // 「resolveArea()→resolved || pos.area || "stage"」パターンを再利用する（4章：新しい
+  // area判定式は作らない）。全選択出演者分を1回のcommitWorkへまとめる（8章）。
+  const mirrorSelectedPerformersVerticallyCommit = useCallback(() => {
+    if (isTransitionActive) return; // 再生中は座標変更を無効化（既存の座標編集ボタンと同じ思想）
+    if (selectedIds.length === 0) return;
+    updateSlidePlacementsCommit((prev, prevWork) => {
+      const zonesNow = computeZones(prevWork.stage);
+      const next = { ...prev };
+      selectedIds.forEach((id) => {
+        const pos = next[id];
+        if (!pos) return; // 現在Formationにこの出演者のplacementが無ければ対象外（安全側）
+        const ny = prevWork.stage.depth - pos.y;
+        const resolved = resolveArea({ x: pos.x, y: ny }, zonesNow);
+        const area = resolved || pos.area || "stage";
+        next[id] = { ...pos, y: ny, area };
+      });
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // 配置ツール v4・PART A・2〜6章：「横に等間隔」を「横1列」という明確なFormation作成
+  // コマンドへ変更。現在x順（stable sort）を維持し、現在のminX〜maxXの間へ等間隔配置
+  // する点はE-02と同じだが、全員のyを`centerY=(minY+maxY)/2`へ揃える点が新しい（4章：
+  // 前後中心は維持したまま横一列にする）。5章：currentWidthがほぼ0の場合は
+  // MIN_LINE_WIDTHで潰れを防ぐ（Math.max(currentWidth, MIN_LINE_WIDTH)により、
+  // currentWidthが十分大きい場合は既存のminX/maxXをそのまま使い、小さい場合だけ
+  // centerXを中心にMIN_LINE_WIDTHへ拡張する）。
+  const arrangeSelectedPerformersHorizontalLineCommit = useCallback(() => {
+    if (isTransitionActive) return;
+    if (selectedIds.length < 2) return;
+    updateSlidePlacementsCommit((prev, prevWork) => {
+      const zonesNow = computeZones(prevWork.stage);
+      const targets = selectedIds.filter((id) => prev[id]);
+      if (targets.length < 2) return prev; // 横1列・縦1列の2人対応 v1：現在Formationに実在する対象が2人未満なら何もしない
+      const sorted = [...targets].sort((a, b) => prev[a].x - prev[b].x);
+      const xs = sorted.map((id) => prev[id].x);
+      const ys = sorted.map((id) => prev[id].y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2; // 4章：現在の前後中心を維持
+      const MIN_LINE_WIDTH = 2; // 5章
+      const lineWidth = Math.max(maxX - minX, MIN_LINE_WIDTH);
+      const leftX = centerX - lineWidth / 2;
+      const n = sorted.length;
+      // 配置生成時のanchor snap v1・PART B・7・8章：横1列のanchorは列の幾何学的中心
+      // （centerX, centerY）。奇数人数なら結果的に中央出演者の位置と一致し、偶数人数
+      // なら中央2人の中間点（＝centerX, centerY自体）と一致する。個別snapは行わず、
+      // 全出演者へ同じdx/dyだけ加える（1・6章）。
+      const anchorDelta = computeAnchorSnapDelta(centerX, centerY);
+      const next = { ...prev };
+      sorted.forEach((id, index) => {
+        const pos = next[id];
+        const nx = leftX + (lineWidth * index) / (n - 1) + anchorDelta.dx;
+        const ny = centerY + anchorDelta.dy;
+        const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+        const area = resolved || pos.area || "stage";
+        next[id] = { ...pos, x: nx, y: ny, area };
+      });
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // 配置ツール v4・PART A・7〜9章：横1列のx/y対称版。現在y順を維持し、全員のxを
+  // centerXへ揃える。
+  const arrangeSelectedPerformersVerticalLineCommit = useCallback(() => {
+    if (isTransitionActive) return;
+    if (selectedIds.length < 2) return;
+    updateSlidePlacementsCommit((prev, prevWork) => {
+      const zonesNow = computeZones(prevWork.stage);
+      const targets = selectedIds.filter((id) => prev[id]);
+      if (targets.length < 2) return prev; // 横1列・縦1列の2人対応 v1：現在Formationに実在する対象が2人未満なら何もしない
+      const sorted = [...targets].sort((a, b) => prev[a].y - prev[b].y);
+      const xs = sorted.map((id) => prev[id].x);
+      const ys = sorted.map((id) => prev[id].y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const centerX = (minX + maxX) / 2; // 9章：現在の左右中心を維持
+      const centerY = (minY + maxY) / 2;
+      const MIN_LINE_DEPTH = 2; // 8章
+      const lineDepth = Math.max(maxY - minY, MIN_LINE_DEPTH);
+      const topY = centerY - lineDepth / 2;
+      const n = sorted.length;
+      // 配置生成時のanchor snap v1・PART C・9章：縦1列のanchorも列の幾何学的中心
+      // （centerX, centerY）。横1列と完全に対称。
+      const anchorDelta = computeAnchorSnapDelta(centerX, centerY);
+      const next = { ...prev };
+      sorted.forEach((id, index) => {
+        const pos = next[id];
+        const nx = centerX + anchorDelta.dx;
+        const ny = topY + (lineDepth * index) / (n - 1) + anchorDelta.dy;
+        const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+        const area = resolved || pos.area || "stage";
+        next[id] = { ...pos, x: nx, y: ny, area };
+      });
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // 配置ツール v4・PART B・C・4章：汎用の横幅・深さ調整。倍率scaleではなく場ミリ単位の
+  // 加算という思想は維持しつつ、「等間隔用」「V字用」という専用調整の区別を廃止し、
+  // 現在の選択配置そのものをX/Y方向へscaleする単一のツールへ統合する（0・12章）。
+  const ARRANGEMENT_SIZE_STEP = 0.25;
+  // 18・23章：現在形状にX（またはY）方向の広がりが実質的に存在しない場合、自然なscaleが
+  // 定義できないため何もしない（zero extent fallback）。NaN/Infinityを避けるための閾値。
+  const SHAPE_EXTENT_EPSILON = 1e-6;
+
+  // 配置ツール v4・PART B・13〜18章：汎用「横幅」調整。現在の各出演者のcenterXからの
+  // 相対x位置を維持したまま、X方向だけscaleする（14章：等間隔に並べ直さない）。
+  // 16章：centerX=(minX+maxX)/2を固定点として伸縮。17章：MIN_GENERIC_WIDTHで完全に
+  // 縦一線へcollapseしないようにする。18章：currentWidthがほぼ0（完全な縦一列等）の
+  // 場合は、自然なscaleが定義できないため何もしない。
+  const adjustSelectedPerformersShapeWidthCommit = useCallback(
+    (delta) => {
+      if (isTransitionActive) return;
+      if (selectedIds.length < 2) return;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const targets = selectedIds.filter((id) => prev[id]);
+        if (targets.length < 2) return prev; // 汎用横幅・深さ2人対応 v1：2人未満なら何もしない
+        const xs = targets.map((id) => prev[id].x);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const currentWidth = maxX - minX;
+        if (currentWidth <= SHAPE_EXTENT_EPSILON) return prev; // 18章：zero extent fallback
+        const centerX = (minX + maxX) / 2;
+        const MIN_GENERIC_WIDTH = 0.5; // 17章
+        const targetWidth = Math.max(currentWidth + delta, MIN_GENERIC_WIDTH);
+        const scaleX = targetWidth / currentWidth;
+        const next = { ...prev };
+        targets.forEach((id) => {
+          const pos = next[id];
+          const nx = centerX + (pos.x - centerX) * scaleX;
+          const resolved = resolveArea({ x: nx, y: pos.y }, zonesNow);
+          const area = resolved || pos.area || "stage";
+          next[id] = { ...pos, x: nx, area };
+        });
+        return next;
+      });
+    },
+    [selectedIds, updateSlidePlacementsCommit, isTransitionActive]
+  );
+  const expandSelectedPerformersShapeWidthCommit = useCallback(() => {
+    adjustSelectedPerformersShapeWidthCommit(ARRANGEMENT_SIZE_STEP);
+  }, [adjustSelectedPerformersShapeWidthCommit]);
+  const shrinkSelectedPerformersShapeWidthCommit = useCallback(() => {
+    adjustSelectedPerformersShapeWidthCommit(-ARRANGEMENT_SIZE_STEP);
+  }, [adjustSelectedPerformersShapeWidthCommit]);
+
+  // 配置ツール v4・PART C・19〜23章：汎用「深さ」調整。横幅の完全なx↔y対称版。
+  const adjustSelectedPerformersShapeDepthCommit = useCallback(
+    (delta) => {
+      if (isTransitionActive) return;
+      if (selectedIds.length < 2) return;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const targets = selectedIds.filter((id) => prev[id]);
+        if (targets.length < 2) return prev; // 汎用横幅・深さ2人対応 v1：2人未満なら何もしない
+        const ys = targets.map((id) => prev[id].y);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const currentDepth = maxY - minY;
+        if (currentDepth <= SHAPE_EXTENT_EPSILON) return prev; // 23章：zero extent fallback
+        const centerY = (minY + maxY) / 2;
+        const MIN_GENERIC_DEPTH = 0.5; // 22章
+        const targetDepth = Math.max(currentDepth + delta, MIN_GENERIC_DEPTH);
+        const scaleY = targetDepth / currentDepth;
+        const next = { ...prev };
+        targets.forEach((id) => {
+          const pos = next[id];
+          const ny = centerY + (pos.y - centerY) * scaleY;
+          const resolved = resolveArea({ x: pos.x, y: ny }, zonesNow);
+          const area = resolved || pos.area || "stage";
+          next[id] = { ...pos, y: ny, area };
+        });
+        return next;
+      });
+    },
+    [selectedIds, updateSlidePlacementsCommit, isTransitionActive]
+  );
+  const expandSelectedPerformersShapeDepthCommit = useCallback(() => {
+    adjustSelectedPerformersShapeDepthCommit(ARRANGEMENT_SIZE_STEP);
+  }, [adjustSelectedPerformersShapeDepthCommit]);
+  const shrinkSelectedPerformersShapeDepthCommit = useCallback(() => {
+    adjustSelectedPerformersShapeDepthCommit(-ARRANGEMENT_SIZE_STEP);
+  }, [adjustSelectedPerformersShapeDepthCommit]);
+
+  // E-04「選択出演者のV字配置 / 逆V字配置」・20章：V字・逆V字は対象抽出・x座標順sort・
+  // centerX/centerY・vWidth/vDepth・x座標の計算式がすべて共通で、y座標の式だけが異なる
+  // ため、小さなlocal helperへまとめる（既存の左右反転・上下反転・等間隔handlerはこの
+  // helperへ統合しない＝それぞれ独立したまま維持する）。invertedがfalseならV字（9章：
+  // 中央t=0がfrontY＝客席側先端、|t|=1がbackY＝舞台奥）、trueなら逆V字（10章：中央t=0が
+  // backY＝舞台奥、|t|=1がfrontY＝客席側）。
+  //   4章：中心はselectedIdsの現在placement群のbounding box中心（centerX/centerY）。
+  //     舞台センターや舞台中央奥行きへは強制移動しない。
+  //   5・6章：幅・奥行きはcurrentWidth/currentDepthを使い、選択出演者が同一x・同一yに
+  //     近い場合でもV字が潰れないよう、それぞれMIN_V_WIDTH・MIN_V_DEPTHで下限を設ける
+  //     （新しいglobal constantは増やさず、handler内のlocal constantとする＝5章）。
+  //   7章：selectedIdsの配列順ではなく、現在のx座標が小さい順（左→右）を並び順とする。
+  //   8章：t = -1 + (2*i)/(N-1)というnormalized parameterで左端t=-1・右端t=1とする
+  //     （N>=3のときだけ呼ばれるため、N-1>=2で0除算は起きない）。
+  //   14章：座標変更後はresolveArea()→resolved || pos.area || "stage"という既存
+  //     fallbackパターンをそのまま再利用し、新しいarea判定式は作らない。
+  //   15章：舞台内へ収めるclamp処理は今回追加しない。areaはresolveArea()に任せる。
+  const arrangeSelectedPerformersVLikeCommit = useCallback(
+    (inverted) => {
+      if (isTransitionActive) return;
+      if (selectedIds.length < 3) return;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const targets = selectedIds.filter((id) => prev[id]);
+        if (targets.length < 3) return prev; // 現在Formationに実在する対象が3人未満なら何もしない
+        const sorted = [...targets].sort((a, b) => prev[a].x - prev[b].x);
+        const xs = sorted.map((id) => prev[id].x);
+        const ys = sorted.map((id) => prev[id].y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        const MIN_V_WIDTH = 4; // 5章
+        const MIN_V_DEPTH = 3; // 6章
+        const vWidth = Math.max(maxX - minX, MIN_V_WIDTH);
+        const vDepth = Math.max(maxY - minY, MIN_V_DEPTH);
+        const frontY = centerY - vDepth / 2; // 9章：客席側先端
+        const backY = centerY + vDepth / 2; // 9章：舞台奥
+        const n = sorted.length;
+        // 配置生成時のanchor snap v1・PART D・E・10〜12章：V字・逆V字のanchorは
+        // 「頂点/apex」。奇数人数なら中央index（t=0）が実際の頂点performerと一致する。
+        // 偶数人数では中央1人のapexが存在しないため、中央2人（i=n/2-1, n/2）の実際の
+        // 生成位置の中間点を仮想anchorとして使う（既存のt公式・frontY/backY公式を
+        // そのまま流用するだけで、新しいgeometry計算式は追加しない＝12章：形状は
+        // 一切変えない）。
+        let apexX;
+        let apexY;
+        if (n % 2 === 1) {
+          const midIndex = (n - 1) / 2;
+          const tMid = -1 + (2 * midIndex) / (n - 1); // 常に0（中央performerのt値）
+          apexX = centerX + tMid * (vWidth / 2);
+          apexY = inverted ? backY - Math.abs(tMid) * vDepth : frontY + Math.abs(tMid) * vDepth;
+        } else {
+          const i1 = n / 2 - 1;
+          const i2 = n / 2;
+          const t1 = -1 + (2 * i1) / (n - 1);
+          const t2 = -1 + (2 * i2) / (n - 1);
+          const x1 = centerX + t1 * (vWidth / 2);
+          const x2 = centerX + t2 * (vWidth / 2);
+          const y1 = inverted ? backY - Math.abs(t1) * vDepth : frontY + Math.abs(t1) * vDepth;
+          const y2 = inverted ? backY - Math.abs(t2) * vDepth : frontY + Math.abs(t2) * vDepth;
+          apexX = (x1 + x2) / 2;
+          apexY = (y1 + y2) / 2;
+        }
+        const anchorDelta = computeAnchorSnapDelta(apexX, apexY);
+        const next = { ...prev };
+        sorted.forEach((id, i) => {
+          const pos = next[id];
+          const t = -1 + (2 * i) / (n - 1);
+          const nx = centerX + t * (vWidth / 2) + anchorDelta.dx;
+          const ny = (inverted ? backY - Math.abs(t) * vDepth : frontY + Math.abs(t) * vDepth) + anchorDelta.dy;
+          const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+          const area = resolved || pos.area || "stage";
+          next[id] = { ...pos, x: nx, y: ny, area };
+        });
+        return next;
+      });
+    },
+    [selectedIds, updateSlidePlacementsCommit, isTransitionActive]
+  );
+  const arrangeSelectedPerformersVCommit = useCallback(() => {
+    arrangeSelectedPerformersVLikeCommit(false);
+  }, [arrangeSelectedPerformersVLikeCommit]);
+  const arrangeSelectedPerformersInvertedVCommit = useCallback(() => {
+    arrangeSelectedPerformersVLikeCommit(true);
+  }, [arrangeSelectedPerformersVLikeCommit]);
+
+  // E-05「選択出演者の円形配置 v1」・18章：V字・逆V字・左右反転・上下反転・等間隔を
+  // 共通の巨大なArrangement Engineへrefactorせず、円形配置だけを独立したhandlerとして
+  // 追加する。ただしhandler内部ではcenter・radius・anglesを明確なlocal variableに分けて
+  // おき、将来の「半径調整」機能（4章：radiusを増減する／radius *= scale等）を追加しやすい
+  // 構造にする。work/project/slide/placementへ新しい永続field（circleRadius等）は追加せず、
+  // 今回は1クリックの自動配置のみ（4章）。
+  const arrangeSelectedPerformersCircleCommit = useCallback(() => {
+    if (isTransitionActive) return;
+    if (selectedIds.length < 3) return;
+    updateSlidePlacementsCommit((prev, prevWork) => {
+      const zonesNow = computeZones(prevWork.stage);
+      const targets = selectedIds.filter((id) => prev[id]);
+      if (targets.length < 3) return prev; // 現在Formationに実在する対象が3人未満なら何もしない
+
+      // 円形配置の幾何学的安定化 v1・2・12章：円の中心＝選択出演者の現在placementの重心
+      // （centroid）。以前はbounding box中心を使っていたが、奇数人数の正多角形では
+      // bounding boxが回転角度によって非対称になり、真の多角形中心と一致しないため、
+      // 回転・移動を繰り返すと中心が徐々にドリフトしていた（0章）。舞台中央
+      // （x=0, y=stage.depth/2）へは強制移動しない、という既存方針は無変更。
+      const xs = targets.map((id) => prev[id].x);
+      const ys = targets.map((id) => prev[id].y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const centroid = computePlacementsCentroid(targets, prev);
+      const centerX = centroid.x;
+      const centerY = centroid.y;
+
+      // 3章：半径＝現在の選択範囲全体をなるべく包む円。将来の「半径調整」機能を追加
+      // しやすいよう、radiusという明確な値として一度求めてから座標計算に使う（4章）。
+      const MIN_CIRCLE_RADIUS = 2; // local constant（新しいglobal constantは増やさない）
+      const currentWidth = maxX - minX;
+      const currentDepth = maxY - minY;
+      const currentDiameter = Math.max(currentWidth, currentDepth);
+      const radius = Math.max(currentDiameter / 2, MIN_CIRCLE_RADIUS);
+
+      // 5・6章：selectedIdsの配列順ではなく、現在の中心から見た角度（atan2）順で円周上の
+      // 並びを決める。これにより、すでにざっくり円形・楕円形に配置されている場合、現在の
+      // 周回順をなるべく維持したまま整った円へ整形できる（9章：performer number/name/
+      // selectedIds順によるsortはしない）。角度が同一・実質同一の場合は現在x座標を
+      // tie-breakerとして使い、それも同一ならJavaScriptのstable sortによる元の配列順
+      // （＝targets順、実質selectedIdsの並びをfallbackとして使うのと同じ結果になる）を
+      // 維持する。atan2は原点（中心と完全に同じ座標）でも常に有限値（0）を返すため、
+      // 全員が同一点にいてもクラッシュ・NaNは発生しない（10章）。
+      const anglesById = new Map();
+      targets.forEach((id) => {
+        const pos = prev[id];
+        anglesById.set(id, Math.atan2(pos.y - centerY, pos.x - centerX));
+      });
+      const sorted = [...targets].sort((a, b) => {
+        const angleA = anglesById.get(a);
+        const angleB = anglesById.get(b);
+        if (angleA !== angleB) return angleA - angleB;
+        return prev[a].x - prev[b].x;
+      });
+
+      // 円形配置・縦軸対称化 v1・5章：円形配置の基準角度（startAngle）を、客席側の
+      // 縦軸上（x=centerX, y=centerY-radius）に固定する。x=centerX+radius*cos(angle)、
+      // y=centerY+radius*sin(angle)という既存の座標式に対し、この位置になる角度は
+      // -π/2（cos(-π/2)=0, sin(-π/2)=-1）。以前の「sort後の先頭出演者の現在angleを
+      // そのままstartAngleにする」処理は廃止し、円全体が斜めに生成される問題を解消する
+      // （1・2章）。center・radius計算（上記）は無変更のまま（11章：stage centerへは
+      // 強制しない）。
+      const TARGET_FRONT_ANGLE = -Math.PI / 2;
+
+      // 7・8章：現在の周回順（sorted、無変更のまま維持）はそのままに、「どの出演者を
+      // 客席側の1番目の頂点に置くか」だけを、現在angleがTARGET_FRONT_ANGLEに最も近い
+      // （circular angular distanceが最小の）出演者として選ぶ。selectedIds[0]や
+      // performer番号順は使わない。circular distanceはMath.atan2(sin(diff),cos(diff))で
+      // ±πにwrapさせて求める（単純な角度の引き算だと-179°と181°のような境界ケースで
+      // 実際の近さを誤判定するため）。
+      let frontId = sorted[0];
+      let frontDistance = Infinity;
+      sorted.forEach((id) => {
+        const angle = anglesById.get(id);
+        const diff = angle - TARGET_FRONT_ANGLE;
+        const wrapped = Math.abs(Math.atan2(Math.sin(diff), Math.cos(diff)));
+        if (wrapped < frontDistance) {
+          frontDistance = wrapped;
+          frontId = id;
+        }
+      });
+
+      // 9章：sorted配列（現在angle順、＝現在の周回順）自体は書き換えず、front performerから
+      // 始まるようcyclic rotationするだけ。逆順にしたりperformer number順へ作り直したり
+      // しない。10章：全員同一点等でsortが一意に決まらない場合も、既存sortedのstable
+      // fallbackにより frontId は必ず何らかのtargetsの1人になり、NaN・不定にはならない。
+      const frontIndex = sorted.indexOf(frontId);
+      const rotatedOrder = [...sorted.slice(frontIndex), ...sorted.slice(0, frontIndex)];
+
+      const startAngle = TARGET_FRONT_ANGLE; // 5章：固定
+      const n = rotatedOrder.length;
+      const angleStep = (Math.PI * 2) / n; // 6章：無変更
+
+      // 配置生成時のanchor snap v1・PART F・14〜17章：円形のanchorはcentroidではなく、
+      // canonical circle生成時の「客席側の最前出演者（front performer）」。startAngleが
+      // -π/2に固定されているため、front performer（rotatedOrder[0]）の生成位置は
+      // 常に(centerX, centerY-radius)になる（cos(-π/2)=0, sin(-π/2)=-1）。これはN（奇数/
+      // 偶数）に関わらず同じ式で求まる（16章）。centroid・radius・diameterそのものは
+      // 一切丸めず、正N角形全体を平行移動するだけにする（15・17章）。
+      const frontX = centerX + Math.cos(startAngle) * radius;
+      const frontY = centerY + Math.sin(startAngle) * radius;
+      const anchorDelta = computeAnchorSnapDelta(frontX, frontY);
+
+      const next = { ...prev };
+      rotatedOrder.forEach((id, i) => {
+        const pos = next[id];
+        const newAngle = startAngle + i * angleStep;
+        const nx = centerX + Math.cos(newAngle) * radius + anchorDelta.dx;
+        const ny = centerY + Math.sin(newAngle) * radius + anchorDelta.dy;
+        const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+        const area = resolved || pos.area || "stage";
+        next[id] = { ...pos, x: nx, y: ny, area };
+      });
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // 選択2人の位置交換 v1・5〜9章：選択中の2人だけを対象に、x/y/areaだけを入れ替える
+  // 小さな独立handler（巨大なArrangement Engineへは統合しない＝5章）。座標そのものを
+  // 再計算するのではなく「どのperformerがその座標にいるか」だけを入れ替えるため、
+  // 円形・V字等の既存shape（centroid・radius・edge length・anchor・rotation geometry）は
+  // 一切変化しない（10章）。8章：placement object丸ごとの交換は禁止（pose等の
+  // performer固有metadataは本人に残す）。9章：相手の元のx/y/area組み合わせをそのまま
+  // 使うため、resolveArea()による再判定は行わない（既にどちらも有効な座標だったため）。
+  const swapSelectedPerformerPositionsCommit = useCallback(() => {
+    if (isTransitionActive) return;
+    if (selectedIds.length !== 2) return;
+    const [idA, idB] = selectedIds;
+    updateSlidePlacementsCommit((prev) => {
+      const posA = prev[idA];
+      const posB = prev[idB];
+      if (!posA || !posB) return prev; // 6章：現在Formationにどちらかが存在しない場合は何もしない
+      const next = { ...prev };
+      next[idA] = { ...posA, x: posB.x, y: posB.y, area: posB.area };
+      next[idB] = { ...posB, x: posA.x, y: posA.y, area: posA.area };
+      return next;
+    });
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
+
+  // 配置ツール v2・円形サイズ調整 v1・2章：「このFormationは円形である」という状態は
+  // 一切保存しない。circleRadius/circleCenter/arrangementType等の新しい永続fieldは追加せず、
+  // 実行のたびに現在の選択placementsから中心・各出演者の位置関係を再計算する（8章：円形
+  // 配置直後だけでなく、1人だけ手動修正した後でも同じ操作として使える）。
+  //   4章：中心は既存arrangeSelectedPerformersCircleCommit()と全く同じcentroid思想
+  //     （円形配置の幾何学的安定化 v1・2章で変更、centerX/centerY）。stage centerへは強制しない。
+  //   5〜7章：各出演者についてdx/dy/distanceを求め、単位ベクトル（unitX/unitY）はそのまま
+  //     維持し、中心からの距離（distance）だけをCIRCLE_RADIUS_STEP分だけ加算/減算する
+  //     （distance *= 倍率、ではなく「場ミリ単位の距離加算」＝6章）。
+  //   9章：縮小時にnewDistanceが0未満・反転しないよう、MIN_CIRCLE_ADJUST_RADIUSで
+  //     下限を設ける。
+  //   10章：中心と完全に同じ座標（distanceが極小）の出演者は方向ベクトルを求められない
+  //     ため、NaNを避けるためv1ではその出演者を動かさない（現在位置のまま）。
+  //   14章：座標変更後は既存配置handlerと同じresolveArea()→resolved || pos.area || "stage"
+  //     というfallbackパターンをそのまま再利用する。
+  const adjustSelectedPerformersCircleRadiusCommit = useCallback(
+    (delta) => {
+      if (isTransitionActive) return;
+      if (selectedIds.length < 3) return;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const targets = selectedIds.filter((id) => prev[id]);
+        if (targets.length < 3) return prev; // 現在Formationに実在する対象が3人未満なら何もしない
+
+        // 円形配置の幾何学的安定化 v1・2・10章：中心はcentroid（重心）を使用する。正円状態の
+        // 出演者については、全員の中心からの距離が同じ量だけ増減するため、正多角形の形が
+        // そのまま拡大縮小される。
+        const centroid = computePlacementsCentroid(targets, prev);
+        const centerX = centroid.x;
+        const centerY = centroid.y;
+
+        const MIN_CIRCLE_ADJUST_RADIUS = 0.5; // 9章：local constant
+        const DISTANCE_EPSILON = 1e-6; // 10章：中心と実質同じ座標とみなす閾値
+
+        const next = { ...prev };
+        targets.forEach((id) => {
+          const pos = next[id];
+          const dx = pos.x - centerX;
+          const dy = pos.y - centerY;
+          const distance = Math.hypot(dx, dy);
+          if (distance <= DISTANCE_EPSILON) return; // 10章：方向不定のためv1では動かさない
+          const unitX = dx / distance;
+          const unitY = dy / distance;
+          const newDistance = Math.max(distance + delta, MIN_CIRCLE_ADJUST_RADIUS);
+          const nx = centerX + unitX * newDistance;
+          const ny = centerY + unitY * newDistance;
+          const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+          const area = resolved || pos.area || "stage";
+          next[id] = { ...pos, x: nx, y: ny, area };
+        });
+        return next;
+      });
+    },
+    [selectedIds, updateSlidePlacementsCommit, isTransitionActive]
+  );
+  // 18章：CIRCLE_RADIUS_STEPをhandler側に持ち、UI側で0.5というmagic numberを直接
+  // 書かない薄いwrapperとして提供する。
+  // 円形ツール v2・0.25場ミリサイズ調整＋回転スクラバー v1・2章：1クリックの調整量を
+  // 0.5→0.25場ミリへ変更。MIN_CIRCLE_ADJUST_RADIUS（0.5）等の他の安全処理は無変更のまま
+  // adjustSelectedPerformersCircleRadiusCommit()内に残す（3章：今回変更するのは
+  // この定数の値だけ）。
+  const CIRCLE_RADIUS_STEP = 0.25;
+  const expandSelectedPerformersCircleCommit = useCallback(() => {
+    adjustSelectedPerformersCircleRadiusCommit(CIRCLE_RADIUS_STEP);
+  }, [adjustSelectedPerformersCircleRadiusCommit]);
+  const shrinkSelectedPerformersCircleCommit = useCallback(() => {
+    adjustSelectedPerformersCircleRadiusCommit(-CIRCLE_RADIUS_STEP);
+  }, [adjustSelectedPerformersCircleRadiusCommit]);
+
+  // 円形ツール v2・円回転 v1・7章：rotation UI値は完全にUI-only stateとして扱う。
+  // work/project/slide/placementへは一切保存しない（circleRotation等の永続fieldは追加
+  // しない）。配置そのものの正しい状態は、これまで通り各出演者placementのx/y/areaのみ。
+  // 6章：この値は「現在配置を基準にした相対回転量」であり、絶対角度ではない。
+  const [circleRotationDisplay, setCircleRotationDisplay] = useState(0);
+  // 14・22章：1回のスクラバードラッグ（gesture）を通じて同じ回転中心・同じ開始時
+  // placementsスナップショットを使い続けるための一時参照。work/project/slideへは保存
+  // しない（UI-only ref）。gesture中はこのスナップショット+現在rotationから毎回座標を
+  // 再計算するため、1°刻みの差分を何十回も積み重ねることによるfloating-point driftを
+  // 抑えられる（43章）。
+  const circleRotationGestureRef = useRef(null);
+
+  // 9・26・AK・AL章：rotationの基準（=現在の相対回転量が意味する対象）が外部操作で
+  // 変わったとき（Formation切替・選択変更）は、古い相対値を維持すると意味が分からなく
+  // なるため、安全側としてrotation UIを0°へresetする。既存のselection/Formation切替
+  // 処理そのものには一切手を入れず、その結果（currentSlideIndex・selectedIds）を監視
+  // する小さなuseEffectだけで対応する最小実装（9章の方針）。
+  const selectedIdsKeyForRotationReset = selectedIds.join(",");
+  useEffect(() => {
+    setCircleRotationDisplay(0);
+    circleRotationGestureRef.current = null;
+  }, [currentSlideIndex, selectedIdsKeyForRotationReset]);
+
+  // 13章：回転中心は既存円系handlerと全く同じbounding-box center思想（stage centerへは
+  // 強制しない）。21章：既存のupdateWorkLive/beginWorkBatch/endWorkBatch（このコンポーネント
+  // 内で他の複数の編集機能がすでに採用しているLive→Commitパターン。たとえば出演者drag・
+  // Lighting Area drag等がbeginWorkBatch/endWorkBatchを、applyBulkAxisLive等が
+  // updateSlidePlacementsLiveを使っている）をそのまま再利用し、rotation専用の新しい
+  // Live/Commit機構は作らない。
+  //   startCircleRotationGesture：pointerdown/focus時に、その時点のselected performer
+  //     placements・center・現在rotation値をgesture snapshotとしてrefへ保持し、
+  //     beginWorkBatch()でUndo履歴のbaselineを確定する（22章）。
+  //   updateCircleRotationLive：スクラバー操作中、gesture snapshot基準の絶対差分
+  //     （newValue - gesture.startRotation）だけをtheta換算し、毎回スナップショットから
+  //     再計算する（14章：センターを毎回取り直さない・ドリフト防止）。updateSlidePlacementsLive
+  //     はUndo履歴を増やさない（19・20章：Live Preview）。
+  //   endCircleRotationGesture：pointerup/blur時にgesture refをクリアし、endWorkBatch()で
+  //     1回分のUndo履歴として確定する（23章：1 gesture = 1 Undo）。
+  const startCircleRotationGesture = useCallback(() => {
+    if (isTransitionActive) return;
+    if (selectedIds.length < 3) return;
+    if (circleRotationGestureRef.current) return; // 二重開始防止（pointerdown+focus等の重複呼び出し対策）
+    const targets = selectedIds.filter((id) => placements[id]);
+    if (targets.length < 3) return;
+    // 円形配置の幾何学的安定化 v1・2・5章：gesture開始時の中心もcentroid（重心）を使う。
+    // 正多角形をrigid rotationしている限りcentroidは回転前後で不変のため、複数gestureに
+    // 分けて回転してもbbox center方式のような中心drift・辺長の崩れが発生しない。
+    const centroid = computePlacementsCentroid(targets, placements);
+    const centerX = centroid.x;
+    const centerY = centroid.y;
+    const basePlacements = {};
+    targets.forEach((id) => {
+      basePlacements[id] = { ...placements[id] };
+    });
+    circleRotationGestureRef.current = { targets, basePlacements, centerX, centerY, startRotation: circleRotationDisplay };
+    beginWorkBatch();
+  }, [selectedIds, placements, circleRotationDisplay, isTransitionActive, beginWorkBatch]);
+
+  const updateCircleRotationLive = useCallback(
+    (rawValue) => {
+      const gesture = circleRotationGestureRef.current;
+      if (!gesture) return;
+      const clamped = clamp(rawValue, -180, 180);
+      const thetaDeg = clamped - gesture.startRotation; // 6章：gesture開始時点からの絶対差分
+      const theta = (thetaDeg * Math.PI) / 180;
+      updateSlidePlacementsLive((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const next = { ...prev };
+        gesture.targets.forEach((id) => {
+          const basePos = gesture.basePlacements[id];
+          if (!basePos) return;
+          // 15章：標準的な回転行列。16・17章：中心からのdistance・出演者同士のdistanceは
+          // 自動的に維持され、sortもしない（gesture.targetsの並び順のまま処理するだけ）。
+          const dx = basePos.x - gesture.centerX;
+          const dy = basePos.y - gesture.centerY;
+          const nx = gesture.centerX + dx * Math.cos(theta) - dy * Math.sin(theta);
+          const ny = gesture.centerY + dx * Math.sin(theta) + dy * Math.cos(theta);
+          const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+          const area = resolved || basePos.area || "stage";
+          const existing = next[id] || basePos;
+          next[id] = { ...existing, x: nx, y: ny, area };
+        });
+        return next;
+      });
+      setCircleRotationDisplay(clamped);
+    },
+    [updateSlidePlacementsLive]
+  );
+
+  const endCircleRotationGesture = useCallback(() => {
+    if (!circleRotationGestureRef.current) return;
+    circleRotationGestureRef.current = null;
+    endWorkBatch();
+  }, [endWorkBatch]);
+
+  // 数値直接入力側：ドラッグではなく単発の値確定のため、専用gesture refは使わず、
+  // commit時点の現在placementsから中心を求め、1回のupdateSlidePlacementsCommitで
+  // 確定する（6章の「successive delta」思想をそのまま踏襲：次にスライダーgestureが
+  // 始まるときも、その時点の最新committed placementsから中心を再計算する設計と対称）。
+  // 24・25章：DraftNumberField（既存のIME対応・draft編集・blur/Enter確定という設計を
+  // 持つ既存コンポーネント）をそのまま再利用し、1回の確定＝1回のcommitWorkにする。
+  const commitCircleRotationValue = useCallback(
+    (rawValue) => {
+      if (isTransitionActive) return;
+      if (selectedIds.length < 3) return;
+      const clamped = clamp(Math.round(rawValue), -180, 180); // 11章：入力可能範囲-180〜180、範囲外はclamp
+      const deltaDeg = clamped - circleRotationDisplay;
+      if (deltaDeg === 0) {
+        setCircleRotationDisplay(clamped);
+        return;
+      }
+      const theta = (deltaDeg * Math.PI) / 180;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const zonesNow = computeZones(prevWork.stage);
+        const targets = selectedIds.filter((id) => prev[id]);
+        if (targets.length < 3) return prev;
+        // 円形配置の幾何学的安定化 v1・2・6章：中心はcentroidを使用する。
+        const centroid = computePlacementsCentroid(targets, prev);
+        const centerX = centroid.x;
+        const centerY = centroid.y;
+        const next = { ...prev };
+        targets.forEach((id) => {
+          const pos = next[id];
+          const dx = pos.x - centerX;
+          const dy = pos.y - centerY;
+          const nx = centerX + dx * Math.cos(theta) - dy * Math.sin(theta);
+          const ny = centerY + dx * Math.sin(theta) + dy * Math.cos(theta);
+          const resolved = resolveArea({ x: nx, y: ny }, zonesNow);
+          const area = resolved || pos.area || "stage";
+          next[id] = { ...pos, x: nx, y: ny, area };
+        });
+        return next;
+      });
+      setCircleRotationDisplay(clamped);
+    },
+    [selectedIds, updateSlidePlacementsCommit, isTransitionActive, circleRotationDisplay]
+  );
+
   // 複数選択時の座標一括入力（横位置／縦位置）。指定した軸だけを全員に反映し、
   // もう一方の軸は各自の値を維持する。入力中はlive更新のみ、確定時（blur/Enter）に
   // beginEdit〜endEditで1件の履歴としてまとめる。
@@ -18050,6 +18961,22 @@ export default function App() {
   const selectedPerformer = selectedIds.length === 1 ? performers.find((p) => p.id === selectedIds[0]) || null : null;
   const selectedPos = selectedPerformer ? placements[selectedPerformer.id] : null;
   const isMultiSelect = selectedIds.length > 1;
+
+  // P-02 v0「選択出演者の分析情報」・15章：分析パネルの開閉は完全にUI専用のstate。
+  // work・Project schema・localStorage・Backup・Undo/Redoには一切保存しない。出演者を
+  // 切り替えても開閉状態はそのまま維持する（15章：開いていたら、別出演者の分析へ
+  // そのまま切り替わる）。
+  const [performerAnalysisOpen, setPerformerAnalysisOpen] = useState(false);
+
+  // P-02 v0・13章：selectedPerformerが1人存在するときだけ分析値をderiveする。複数選択・
+  // 非選択時はnull（分析計算自体を行わない）。既存のgetKeepCounts・getTransitionCounts・
+  // getPerformerTransitionPath・quadraticBezierPointをそのまま再利用するbuildPerformerAnalysis()
+  // を呼ぶだけで、ここに計算ロジックを直接書かない。戻り値は表示専用のderived dataであり、
+  // workへは一切保存しない。
+  const selectedPerformerAnalysis = useMemo(() => {
+    if (!selectedPerformer) return null;
+    return buildPerformerAnalysis(slides, transitionCounts, effectiveTransitionPathConfig, selectedPerformer.id);
+  }, [selectedPerformer, slides, transitionCounts, effectiveTransitionPathConfig]);
 
   const halfW = stage.width / 2;
 
@@ -19997,6 +20924,477 @@ export default function App() {
               <p style={{ color: THEME.textDim }} className="text-xs mt-2">
                 ステージ上の出演者、または上のリストから選択してください（Shift＋クリックで複数選択）。
               </p>
+            )}
+
+            {/* 配置ツール折りたたみ v1・1〜4章：当初E-01「左右反転」・E-02「横/縦に等間隔」の
+                3ボタンを、常時表示の「配置操作」ブロックから折りたたみ式の「配置ツール」へ
+                整理した。目的は、今後「上下反転」「横一列」「V字」「円」等を追加しても選択中
+                出演者パネルが縦に長くなりすぎない構造にすること（9章）。配置ツール v4：
+                「横/縦に等間隔」は「横1列/縦1列」
+                （arrangeSelectedPerformersHorizontalLineCommit・
+                arrangeSelectedPerformersVerticalLineCommit）へ意味を変更したが、
+                mirrorSelectedPerformersHorizontallyCommit等・折りたたみ構造・disabled条件
+                は変更していない。6章：selectedIds.length===0の場合は「配置ツール」自体を表示
+                しない（既存の案内文だけを優先する）。 */}
+            {selectedIds.length > 0 && (
+              <div className="flex flex-col gap-1 mt-2" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                {/* 配置ツール視認性改善 v1・2〜4章：折りたたみ構造・ロジックは一切変更せず、
+                    トリガー部分の見た目だけを「文字リンク」から「小さなツールボタン／
+                    ヘッダー」へ調整した。薄い背景（THEME.panelBg2）・1px border・角丸・
+                    適度なpadding・hover時の背景変化（.slsim-placement-tools-triggerクラス、
+                    RESPONSIVE_STYLES参照）で「クリックできるUI」であることを示しつつ、
+                    強いaccent色や大きなCTAにはしない（2章）。3章：paddingは最小限に留め、
+                    閉じた状態は従来とほぼ同じ1行分の高さのまま。7章：矢印だけでなく行全体を
+                    クリックして開閉できる<button>構造は維持。 */}
+                <button
+                  type="button"
+                  onClick={() => setPlacementToolsOpen((v) => !v)}
+                  className="slsim-placement-tools-trigger flex items-center gap-1.5 text-xs font-bold text-left w-full"
+                  style={{
+                    color: THEME.text,
+                    background: THEME.panelBg2,
+                    border: `1px solid ${THEME.border}`,
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                  }}
+                >
+                  {/* 折りたたみパネル三角アイコン色統一 v1・1・8章：この三角だけ、既存
+                      「分析を見る」（CollapsibleGroup内のarrow span、THEME.accent）と同じ色へ
+                      合わせる。新しい色定数は作らずTHEME.accentをそのまま再利用する。
+                      ▶/▼の切り替えロジック・placementToolsOpen state・他のstyleには
+                      一切触れない（6章）。 */}
+                  <span style={{ color: THEME.accent }}>{placementToolsOpen ? "▼" : "▶"}</span>
+                  <span>配置ツール</span>
+                  {/* 4章：補足テキストは本体ラベルより弱いTHEME.textDimで、fontWeightも
+                      通常へ落とす（「配置ツール」本体より視覚的に控えめにする）。 */}
+                  <span style={{ color: THEME.textDim, fontWeight: "normal" }}>反転・間隔・整列</span>
+                </button>
+                {/* 3章：1機能1行にせず、CSS gridで2列のコンパクトな配置にする。E-03「上下
+                    反転」追加により4ボタンになったため、2列gridが自然に2×2（左右反転／
+                    上下反転・横1列／縦1列）で並ぶ（10章）。今後ボタンが増えても、
+                    このgrid-cols-2へ追加するだけで自然に並ぶ（9章：将来追加しやすい構造。
+                    ただし今回は空ボタン・新handlerは作らない）。 */}
+                {placementToolsOpen && (
+                  <>
+                  <div className="grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      onClick={mirrorSelectedPerformersHorizontallyCommit}
+                      disabled={isTransitionActive}
+                      title="舞台センターライン（x=0）を軸に、選択中の出演者を左右反転します"
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive ? 0.5 : 1,
+                        cursor: isTransitionActive ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      ↔ 左右反転
+                    </button>
+                    {/* E-03「選択出演者の上下反転」・10・11章：既存の2列gridへそのまま追加
+                        するだけ。disabled条件はE-01左右反転と全く同じ
+                        （selectedIds.length>0 && !isTransitionActive）。 */}
+                    <button
+                      type="button"
+                      onClick={mirrorSelectedPerformersVerticallyCommit}
+                      disabled={isTransitionActive}
+                      title="舞台奥行き中央線を軸に、選択中の出演者を上下反転します"
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive ? 0.5 : 1,
+                        cursor: isTransitionActive ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      ↕ 上下反転
+                    </button>
+                    <button
+                      type="button"
+                      onClick={arrangeSelectedPerformersHorizontalLineCommit}
+                      disabled={isTransitionActive || selectedIds.length < 2}
+                      title={
+                        selectedIds.length < 2
+                          ? "2人以上選択すると使用できます"
+                          : "選択中の出演者を、現在のx座標順を維持したまま横一列に並べます"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      ↔ 横1列
+                    </button>
+                    <button
+                      type="button"
+                      onClick={arrangeSelectedPerformersVerticalLineCommit}
+                      disabled={isTransitionActive || selectedIds.length < 2}
+                      title={
+                        selectedIds.length < 2
+                          ? "2人以上選択すると使用できます"
+                          : "選択中の出演者を、現在のy座標順を維持したまま縦一列に並べます"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      ↕ 縦1列
+                    </button>
+                    {/* E-04「選択出演者のV字配置 / 逆V字配置」・21・23章：既存の2列gridへ
+                        そのまま追加するだけ。結果として6ボタンが2列×3行になる。disabled条件は
+                        既存の横/縦等間隔と同じ（selectedIds.length>=3 && !isTransitionActive）。
+                        22章：表記はシンプルに「V字」「逆V字」のみ、絵文字は付けない。 */}
+                    <button
+                      type="button"
+                      onClick={arrangeSelectedPerformersVCommit}
+                      disabled={isTransitionActive || selectedIds.length < 3}
+                      title={
+                        selectedIds.length < 3
+                          ? "3人以上選択すると使用できます"
+                          : "選択中の出演者を、先端が客席側のV字に配置します"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length < 3 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      V字
+                    </button>
+                    <button
+                      type="button"
+                      onClick={arrangeSelectedPerformersInvertedVCommit}
+                      disabled={isTransitionActive || selectedIds.length < 3}
+                      title={
+                        selectedIds.length < 3
+                          ? "3人以上選択すると使用できます"
+                          : "選択中の出演者を、先端が舞台奥の逆V字に配置します"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length < 3 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      逆V字
+                    </button>
+                    {/* E-05「選択出演者の円形配置 v1」・19・21章：既存の2列gridへそのまま
+                        追加するだけ。円形は1個だけなので、gridの最後の行に単独で入り、
+                        隣のセルは自然に空くだけで構わない（無理に2個目のダミーボタンは
+                        置かない）。半円ボタンは今回まだ追加しない（19章）。disabled条件は
+                        既存V字・逆V字・横/縦等間隔と同じ
+                        （selectedIds.length>=3 && !isTransitionActive）。 */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        arrangeSelectedPerformersCircleCommit();
+                        // 円形ツール v2・円回転 v1・9・F章：円を新しく配置し直したときは、
+                        // rotation UIの基準配置も新しくなるため0°へresetする。
+                        // arrangeSelectedPerformersCircleCommit()自体は変更しない（32章）。
+                        setCircleRotationDisplay(0);
+                      }}
+                      disabled={isTransitionActive || selectedIds.length < 3}
+                      title={
+                        selectedIds.length < 3
+                          ? "3人以上選択すると使用できます"
+                          : "選択中の出演者を円周上に均等配置します"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length < 3 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      円形
+                    </button>
+                    {/* 選択2人の位置交換 v1・1・20章：既存2列gridの「円形」の右隣（同じ行）へ
+                        追加する。新しい行・新しいsectionは作らない。disabled条件は
+                        selectedIds.length===2のときだけ有効（3章）、既存ボタンと同じ
+                        style・opacity・cursor思想を使う（20章）。 */}
+                    <button
+                      type="button"
+                      onClick={swapSelectedPerformerPositionsCommit}
+                      disabled={isTransitionActive || selectedIds.length !== 2}
+                      title={
+                        selectedIds.length !== 2
+                          ? "2人選択すると使用できます"
+                          : "選択中の2人の位置を交換します"
+                      }
+                      style={{
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.text,
+                        opacity: isTransitionActive || selectedIds.length !== 2 ? 0.5 : 1,
+                        cursor: isTransitionActive || selectedIds.length !== 2 ? "not-allowed" : "pointer",
+                      }}
+                      className="py-1.5 rounded-lg text-sm font-bold"
+                    >
+                      位置交換
+                    </button>
+                  </div>
+
+                  {/* 配置ツール v4・PART E・34〜38章：旧「等間隔」section・「V字・逆V字」
+                      sectionを廃止し、1つの「形を調整」sectionへ統合した。横幅・深さは
+                      特定Formation名（等間隔／V字等）と結びつけず、「今選択している形を
+                      X/Y方向へ広げる/狭める」という汎用操作として位置づける（36章）。
+                      その直下へ既存「円の大きさ」「円を回転」を続けて配置し（37章）、
+                      新しい大きなsection titleは作らない。ラベル幅（w-16 shrink-0）は
+                      既存compact circle UIと揃える（38章）。 */}
+                  <div className="flex flex-col gap-1" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8 }}>
+                    <span style={{ color: THEME.textDim }} className="text-xs font-bold">形を調整</span>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">横幅</span>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          onClick={shrinkSelectedPerformersShapeWidthCommit}
+                          disabled={isTransitionActive || selectedIds.length < 2}
+                          title={
+                            selectedIds.length < 2
+                              ? "2人以上選択すると使用できます"
+                              : "選択中の出演者の現在の配置を、横方向に少し狭めます"
+                          }
+                          style={{
+                            border: `1px solid ${THEME.border}`,
+                            color: THEME.text,
+                            opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                            cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                          }}
+                          className="w-8 py-1 rounded-lg text-sm font-bold"
+                        >
+                          −
+                        </button>
+                        <button
+                          type="button"
+                          onClick={expandSelectedPerformersShapeWidthCommit}
+                          disabled={isTransitionActive || selectedIds.length < 2}
+                          title={
+                            selectedIds.length < 2
+                              ? "2人以上選択すると使用できます"
+                              : "選択中の出演者の現在の配置を、横方向に少し広げます"
+                          }
+                          style={{
+                            border: `1px solid ${THEME.border}`,
+                            color: THEME.text,
+                            opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                            cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                          }}
+                          className="w-8 py-1 rounded-lg text-sm font-bold"
+                        >
+                          ＋
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">深さ</span>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          onClick={shrinkSelectedPerformersShapeDepthCommit}
+                          disabled={isTransitionActive || selectedIds.length < 2}
+                          title={
+                            selectedIds.length < 2
+                              ? "2人以上選択すると使用できます"
+                              : "選択中の出演者の現在の配置を、前後方向に少し狭めます"
+                          }
+                          style={{
+                            border: `1px solid ${THEME.border}`,
+                            color: THEME.text,
+                            opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                            cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                          }}
+                          className="w-8 py-1 rounded-lg text-sm font-bold"
+                        >
+                          −
+                        </button>
+                        <button
+                          type="button"
+                          onClick={expandSelectedPerformersShapeDepthCommit}
+                          disabled={isTransitionActive || selectedIds.length < 2}
+                          title={
+                            selectedIds.length < 2
+                              ? "2人以上選択すると使用できます"
+                              : "選択中の出演者の現在の配置を、前後方向に少し広げます"
+                          }
+                          style={{
+                            border: `1px solid ${THEME.border}`,
+                            color: THEME.text,
+                            opacity: isTransitionActive || selectedIds.length < 2 ? 0.5 : 1,
+                            cursor: isTransitionActive || selectedIds.length < 2 ? "not-allowed" : "pointer",
+                          }}
+                          className="w-8 py-1 rounded-lg text-sm font-bold"
+                        >
+                          ＋
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 配置ツール v2・円形サイズ調整 v1・19・20・21章：既存「円形」ボタンの
+                      すぐ下へ、視覚的に関連する小さな補助操作として追加する。専用の巨大な
+                      panel・accordion・modalは作らず、配置ツール内の小さな補助操作として
+                      収める。ラベル「円の大きさ」はTHEME.textDimの小さめ表示、[−][＋]は
+                      コンパクトな正方形に近いボタン。黄色accentは使わず既存THEMEのborder/
+                      textだけで構成する（20章）。配置ツール v4・37章：新しく大きな「円形」
+                      section titleは作らず、「形を調整」の直下へ小さなborderTopの区切り
+                      だけを挟んで続ける。disabled条件は既存円形ボタンと同じ
+                      （selectedIds.length>=3 && !isTransitionActive、22章）。 */}
+                  <div className="flex items-center gap-2" style={{ borderTop: `1px solid ${THEME.borderSoft}`, paddingTop: 8, marginTop: 4 }}>
+                    <span style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">円の大きさ</span>
+                    <div className="flex gap-1">
+                      <button
+                        type="button"
+                        onClick={shrinkSelectedPerformersCircleCommit}
+                        disabled={isTransitionActive || selectedIds.length < 3}
+                        title={
+                          selectedIds.length < 3
+                            ? "3人以上選択すると使用できます"
+                            : "選択中の出演者を、現在の中心から少し内側へ寄せます"
+                        }
+                        style={{
+                          border: `1px solid ${THEME.border}`,
+                          color: THEME.text,
+                          opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1,
+                          cursor: isTransitionActive || selectedIds.length < 3 ? "not-allowed" : "pointer",
+                        }}
+                        className="w-8 py-1 rounded-lg text-sm font-bold"
+                      >
+                        −
+                      </button>
+                      <button
+                        type="button"
+                        onClick={expandSelectedPerformersCircleCommit}
+                        disabled={isTransitionActive || selectedIds.length < 3}
+                        title={
+                          selectedIds.length < 3
+                            ? "3人以上選択すると使用できます"
+                            : "選択中の出演者を、現在の中心から少し外側へ広げます"
+                        }
+                        style={{
+                          border: `1px solid ${THEME.border}`,
+                          color: THEME.text,
+                          opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1,
+                          cursor: isTransitionActive || selectedIds.length < 3 ? "not-allowed" : "pointer",
+                        }}
+                        className="w-8 py-1 rounded-lg text-sm font-bold"
+                      >
+                        ＋
+                      </button>
+                    </div>
+                  </div>
+                  {/* 円形ツールUI微調整 v1：「円を回転」を「円の大きさ」と同じ1行レイアウト
+                      （ラベル列＋操作列）へ揃えた。ラベル幅（w-16）・行のgap/paddingを
+                      「円の大きさ」の行と揃えるための純粋な見た目調整のみで、rotation関連の
+                      state・handler・イベント（onPointerDown/onFocus/onChange/onPointerUp/
+                      onPointerCancel/onBlur・commitCircleRotationValue等）・
+                      min/max/step・disabled条件は一切変更していない。 */}
+                  <div className="flex items-center gap-2 mt-1">
+                    <span style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">円を回転</span>
+                    <input
+                      type="range"
+                      min={-180}
+                      max={180}
+                      step={1}
+                      value={circleRotationDisplay}
+                      disabled={isTransitionActive || selectedIds.length < 3}
+                      onPointerDown={startCircleRotationGesture}
+                      onFocus={startCircleRotationGesture}
+                      onChange={(e) => updateCircleRotationLive(Number(e.target.value))}
+                      onPointerUp={endCircleRotationGesture}
+                      onPointerCancel={endCircleRotationGesture}
+                      onBlur={endCircleRotationGesture}
+                      aria-label="円の回転角度スクラバー"
+                      title={
+                        selectedIds.length < 3
+                          ? "3人以上選択すると使用できます"
+                          : "選択中の出演者を、現在の中心を軸にまとめて回転します"
+                      }
+                      style={{ accentColor: THEME.textDim, opacity: isTransitionActive || selectedIds.length < 3 ? 0.5 : 1 }}
+                      className="flex-1 min-w-0"
+                    />
+                    <div className="flex items-center gap-1 shrink-0">
+                      <DraftNumberField
+                        ariaLabel="円の回転角度"
+                        value={circleRotationDisplay}
+                        min={-180}
+                        max={180}
+                        step={1}
+                        allowDecimal={false}
+                        disabled={isTransitionActive || selectedIds.length < 3}
+                        onCommit={commitCircleRotationValue}
+                        inputClassName="w-14 text-center rounded-lg py-1 text-sm font-bold"
+                      />
+                      <span style={{ color: THEME.textDim }} className="text-xs">°</span>
+                    </div>
+                  </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* P-02 v0「選択出演者の分析情報」・1・14章：既存のCollapsibleGroup（nested＝
+                panelBg2の小さいaccordion）をそのまま再利用し、新しいデザインは作らない。
+                タイトル文言自体を開閉状態で切り替える（▶ 分析を見る／▼ 分析を閉じる、
+                矢印はCollapsibleGroup側が自動で出す）。selectedPerformerAnalysisは
+                selectedPerformerが1人のときだけ非nullになるため、この節自体が複数選択・
+                非選択時には表示されない（条件D・E）。 */}
+            {selectedPerformerAnalysis && (
+              <CollapsibleGroup
+                title={performerAnalysisOpen ? "分析を閉じる" : "分析を見る"}
+                open={performerAnalysisOpen}
+                onToggle={() => setPerformerAnalysisOpen((v) => !v)}
+                nested
+              >
+                <div className="flex flex-col gap-1">
+                  <div style={{ color: THEME.textDim }} className="text-xs">舞台上</div>
+                  <div style={{ color: THEME.text }} className="text-sm font-bold">
+                    {selectedPerformerAnalysis.stageKeepCounts} count（
+                    {formatEighthsLabel(selectedPerformerAnalysis.stageKeepCounts)}）
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <div style={{ color: THEME.textDim }} className="text-xs">総移動量</div>
+                  <div style={{ color: THEME.text }} className="text-sm font-bold">
+                    {selectedPerformerAnalysis.totalMovementDistance.toFixed(1)} 場ミリ
+                  </div>
+                </div>
+                {selectedPerformerAnalysis.transitions.length > 0 && (
+                  <div className="flex flex-col gap-1">
+                    <div style={{ color: THEME.textDim }} className="text-xs">移動履歴</div>
+                    {/* 11章：一覧が長くなるProjectを考慮し、max-height + overflow-yだけの
+                        シンプルなスクロール領域にする（過度に複雑にしない）。 */}
+                    <div style={{ maxHeight: 160, overflowY: "auto" }} className="flex flex-col gap-1">
+                      {selectedPerformerAnalysis.transitions.map((t) => (
+                        <div
+                          key={t.fromSlideId}
+                          style={{ background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}` }}
+                          className="rounded px-2 py-1 text-xs flex items-center justify-between gap-2"
+                        >
+                          <span style={{ color: THEME.textDim }}>
+                            構成{t.fromSlideIndex + 1} → {t.toSlideIndex + 1}
+                          </span>
+                          <span style={{ color: THEME.text }} className="font-bold">
+                            {t.transitionCounts} count / {t.distance.toFixed(1)}場ミリ
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </CollapsibleGroup>
             )}
 
             {isMultiSelect && (() => {
@@ -22592,6 +23990,9 @@ export default function App() {
           onShowPerformerNamesChange={setExportShowPerformerNames}
           showMusicTime={exportShowMusicTime}
           onShowMusicTimeChange={setExportShowMusicTime}
+          highlightSelectedPerformer={exportHighlightSelectedPerformer}
+          onHighlightSelectedPerformerChange={setExportHighlightSelectedPerformer}
+          highlightSelectedPerformerAvailable={selectedIds.length === 1}
           displayScale={exportDisplayScale}
           onDisplayScaleChange={setExportDisplayScale}
           viewChoice={exportViewChoice}
@@ -26136,6 +27537,13 @@ function ExportCenterModal({
   // （showWaitingAreas等）と全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。
   showMusicTime,
   onShowMusicTimeChange,
+  // P-03 第一段階「選択出演者を強調して出力」・2章：他の表示オプション（showTrajectory等）と
+  // 全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。highlightSelectedPerformerAvailable
+  // は3章の有効条件（selectedIds.length===1）をApp側で判定した結果のbooleanで、
+  // ExportCenterModal側では新しい判定ロジックを持たない。
+  highlightSelectedPerformer,
+  onHighlightSelectedPerformerChange,
+  highlightSelectedPerformerAvailable,
   displayScale,
   onDisplayScaleChange,
   viewChoice,
@@ -26439,6 +27847,30 @@ function ExportCenterModal({
               <input type="checkbox" checked={showMusicTime} onChange={(e) => onShowMusicTimeChange(e.target.checked)} />
               音源内時間を表示
             </label>
+
+            {/* P-03 第一段階「選択出演者を強調して出力」・2・3章：現在編集画面でselectedIds.length===1の
+                ときだけ有効（enabled）。選択なし・複数選択時はdisabledにするだけで、
+                highlightSelectedPerformer自体の値は自動で書き換えない（安全側の判定は
+                Export実行側＝App側のhighlightedPerformerId derivationで行う）。 */}
+            <div className="flex flex-col" style={{ gap: 4 }}>
+              <label
+                className="flex items-center gap-2 text-sm cursor-pointer"
+                style={{ color: THEME.text, opacity: highlightSelectedPerformerAvailable ? 1 : 0.5 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={highlightSelectedPerformer}
+                  disabled={!highlightSelectedPerformerAvailable}
+                  onChange={(e) => onHighlightSelectedPerformerChange(e.target.checked)}
+                />
+                選択中の出演者を強調して出力
+              </label>
+              <span style={exportHelperTextStyle} className="text-[11px] pl-6">
+                {highlightSelectedPerformerAvailable
+                  ? "編集画面で選択中の出演者に黄色い枠を付け、移動軌跡も太く出力します"
+                  : "編集画面で出演者を1人だけ選択すると使用できます"}
+              </span>
+            </div>
           </div>
         </div>
 

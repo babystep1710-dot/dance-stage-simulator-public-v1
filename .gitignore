@@ -12,3 +12,7 @@ src/App_backup*
 src/App.before*
 src/App.vite-backup*
 src/App.wrong-*
+
+# Local App backups
+src/App_before_*
+test-backups/

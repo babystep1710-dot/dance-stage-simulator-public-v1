@@ -216,6 +216,152 @@ function findLightingSceneBySlideId(lightingScenes, slideId) {
 }
 
 // ------------------------------------------------------------------
+// 高台 Phase 1A・10章：work.platforms（複数の矩形高台）
+// ------------------------------------------------------------------
+// work.platforms = [{ id, name, x, y, width, depth, height }]。既存のwork.stage（{width, depth}）
+// とは並列の追加データであり、stageを置換・変形しない（stageSurfacesのような全面抽象化はしない）。
+// 座標系はplacement / Lighting Areaと完全に同じ（x=0が中央、yは舞台前端=0から奥へ）。x/yは
+// Lighting Areaと同じく「矩形の中心点」を表す。height（高さ）は「1マス=90cm」という既存の
+// 考え方をそのまま流用するが、Beam/3D投影との単位接続はPhase 1Aでは行わない。
+// 古いProject（platformsフィールドが存在しない）は getPlatforms() で常に[]へフォールバックする
+// （getLightingScenes()と全く同じ「optional field + fallback」方針。一括migrationは行わない）。
+function getPlatforms(work) {
+  return work && Array.isArray(work.platforms) ? work.platforms : [];
+}
+
+const PLATFORM_MIN_SIZE = 0.5; // 舞台座標単位（0.5単位=45cm）。LIGHTING_AREA_MIN_SIZEと同じ考え方の下限
+const PLATFORM_MAX_SIZE = 40; // 極端に大きい値の保険上限（LIGHTING_AREA_MAX_SIZEと同じ値）
+const PLATFORM_MIN_HEIGHT = 0;
+const PLATFORM_MAX_HEIGHT = 10; // 高さ10＝9m相当。実用上十分すぎる保険上限
+const PLATFORM_HEIGHT_STEP = 0.25; // 45cmの半分（約22.5cm）刻みで調整できるようにする
+
+// 新規高台のdefault値（高台default値変更 v1：舞台奥いっぱいに横長の高台）。舞台サイズが
+// 小さい場合でも高台が舞台外へ完全にはみ出さないよう、width/depthをstageサイズに応じて
+// clampする（createDefaultLightingArea()と全く同じ考え方）。
+// width=stage.width（舞台幅いっぱい）・depth=1.5・x=0・y=stage.depth - depth/2（奥側の辺が
+// stage.depthとぴったり一致する位置）・height=5（高台default height変更 v1：2→5、
+// 1単位=90cmのため450cm相当）。この値は既存clampPlatformGeometry()を通しても位置変更
+// されない有効なgeometryになるよう設計している（4章：xMin/xMaxが両方0に、yがyMaxに
+// 一致するため）。clampPlatformGeometry()自体はここでは変更しない。
+function createDefaultPlatform(stage, index = 0) {
+  const safeStage = stage && Number.isFinite(stage.width) && Number.isFinite(stage.depth) ? stage : { width: 20, depth: 10 };
+  const width = clamp(safeStage.width, PLATFORM_MIN_SIZE, safeStage.width);
+  const depth = clamp(1.5, PLATFORM_MIN_SIZE, safeStage.depth);
+  const y = safeStage.depth - depth / 2;
+  return {
+    id: makeId("platform"),
+    name: `高台${index + 1}`,
+    x: 0,
+    y,
+    width,
+    depth,
+    height: 5,
+  };
+}
+
+// 高台1件の「舞台座標上の矩形範囲」を返す共通pure helper（10-7章：TopViewとExportで座標計算を
+// 別々に乱立させない）。x/yは中心点（Lighting Areaと同じ意味論）のため、呼び出し側
+// （TopView・renderTopFormationExport）はこの{xMin,xMax,yMin,yMax}を、それぞれ自前の
+// toScreenX/Y・toX/toYへ通すだけでよく、矩形の幾何計算自体は重複実装しない。
+function getPlatformStageRect(platform) {
+  if (!platform) return null;
+  const width = Math.max(PLATFORM_MIN_SIZE, Number(platform.width) || PLATFORM_MIN_SIZE);
+  const depth = Math.max(PLATFORM_MIN_SIZE, Number(platform.depth) || PLATFORM_MIN_SIZE);
+  const x = Number.isFinite(platform.x) ? platform.x : 0;
+  const y = Number.isFinite(platform.y) ? platform.y : 0;
+  return {
+    xMin: x - width / 2,
+    xMax: x + width / 2,
+    yMin: y - depth / 2,
+    yMax: y + depth / 2,
+  };
+}
+
+// 高台 geometry clamp v1：高台「矩形全体」が常にstage内へ収まるようにする共通pure helper。
+// x/yは中心点のため、単純に-stage.width/2〜stage.width/2・0〜stage.depthへclampするだけでは
+// width/depthの分だけ矩形の一部がstage外へはみ出せてしまう（実機投入前フィードバック対応）。
+// そのため、まずwidth/depthをstageサイズ以下（PLATFORM_MIN_SIZE以上）へclampし、その
+// width/depthから導いたx/yの許容範囲（矩形全体がstage内に収まる範囲）へx/yをclampする、
+// という2段階の計算にする。width/depthを変更した結果、現在のx/yでは矩形がstage外へ出る
+// 場合も、この関数を通すことでx/yが必要最小限だけ動かされる（Math.min/maxによる最小移動）。
+// name/height等、幾何以外のfieldには一切触れない。
+function clampPlatformGeometry(stage, platform) {
+  if (!platform) return platform;
+  const safeStage = stage && Number.isFinite(stage.width) && Number.isFinite(stage.depth) ? stage : { width: 20, depth: 10 };
+  const width = clamp(Number(platform.width) || PLATFORM_MIN_SIZE, PLATFORM_MIN_SIZE, safeStage.width);
+  const depth = clamp(Number(platform.depth) || PLATFORM_MIN_SIZE, PLATFORM_MIN_SIZE, safeStage.depth);
+  const xMin = -safeStage.width / 2 + width / 2;
+  const xMax = safeStage.width / 2 - width / 2;
+  const yMin = depth / 2;
+  const yMax = safeStage.depth - depth / 2;
+  const x = clamp(Number.isFinite(platform.x) ? platform.x : 0, xMin, xMax);
+  const y = clamp(Number.isFinite(platform.y) ? platform.y : 0, yMin, yMax);
+  return { ...platform, width, depth, x, y };
+}
+
+// ------------------------------------------------------------------
+// 高台 見た目改善 v2：TopView / Formation Exportで共有する表示色のpure helper
+// ------------------------------------------------------------------
+// 目的（実機フィードバック対応）：高台の塗りが場ミリグリッドを隠してしまう・Lighting Areaの
+// 半透明の面と紛らわしいという判断から、v1にあった塗り（fillColor）を廃止し、
+// 「塗りなし＋枠線＋客席側辺強調」という構造線だけの表現に変更する。舞台上のラベル表示も
+// 廃止したため、v1にあったhexToRgbComponents()・formatPlatformLabel()は不要になり削除した
+// （fillColorの色混ぜ計算・ラベル文字列生成はもう使われていない）。
+
+// 高台1件（というよりfloorColorKey1つ）に対する枠線色一式を返す。塗りは持たない
+// （TopView/Export側で常にfill="none"にする）。
+// strokeColor：Lighting Areaの照明色ではなく、getStageFloorContrastColors()と同じ判定
+//              （STAGE_APPEARANCE_LIGHT_FLOORS）に基づく無彩色のcontrast色（通常の実線外枠用）。
+// frontStrokeColor：客席側の辺だけに使う、strokeColorと同じ色味でopacityを上げた強調色。
+function getPlatformVisualColors(floorColorKey) {
+  const isLightFloor = STAGE_APPEARANCE_LIGHT_FLOORS.has(floorColorKey);
+  // ベースとなる無彩色は、getStageFloorContrastColors()が明るい床向けに使っているのと同じ
+  // (30,26,20)、暗い床向けはTHEME.textDim（#a79fb0）のrgb成分(167,159,176)を使う。
+  const strokeColor = isLightFloor ? "rgba(30,26,20,0.6)" : "rgba(167,159,176,0.7)";
+  const frontStrokeColor = isLightFloor ? "rgba(30,26,20,0.92)" : "rgba(167,159,176,0.95)";
+  return { strokeColor, frontStrokeColor };
+}
+
+// ------------------------------------------------------------------
+// 高台 Phase 1B：俯瞰客席ビューの天面・客席側面用の塗り色
+// ------------------------------------------------------------------
+// TopView/Formation Export（2D平面図）が使うgetPlatformVisualColors()は「塗りなし」という
+// 設計を維持したまま変更しない。俯瞰客席ビューだけは「高さのある舞台構造物」に見せるため、
+// 天面・客席側面に塗りを持たせる必要があり、そのための専用helperをここに追加する。
+// 新しい色テーマシステムは作らず、既存のstageAppearanceColorHex()・getPlatformVisualColors()
+// （境界線色）をそのまま再利用する最小実装にとどめる。
+
+// HEXカラーを黒方向へamount（0〜1）だけ暗くするだけの最小helper。客席側面を天面より
+// 一段暗く見せるためだけに使う。黒床のように既に暗い色でも完全な黒へ潰れて背景と
+// 見分けがつかなくならないよう、各チャンネルに最低10の下限を設ける。
+function darkenHexColor(hex, amount) {
+  const clean = String(hex || "").replace("#", "");
+  const bigint = parseInt(clean, 16);
+  if (clean.length !== 6 || Number.isNaN(bigint)) return hex;
+  const factor = 1 - amount;
+  const r = Math.max(10, Math.round(((bigint >> 16) & 255) * factor));
+  const g = Math.max(10, Math.round(((bigint >> 8) & 255) * factor));
+  const b = Math.max(10, Math.round((bigint & 255) * factor));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+// 客席側面を天面より暗くする度合い（20〜25%程度、の中間値）。
+const PLATFORM_AUDIENCE_FRONT_DARKEN_AMOUNT = 0.22;
+
+// 俯瞰客席ビュー用の高台色一式。
+// topFillColor：現在の舞台床色（stageAppearanceColorHex）をそのまま使い、天面が舞台床と
+//               自然につながって見えるようにする（複雑な色システムは作らない）。
+// frontFillColor：topFillColorを黒方向へ約22%暗くしただけの客席側面の色。
+// strokeColor/frontStrokeColor：既存getPlatformVisualColors()をそのまま再利用し、TopViewと
+//               同じ「客席側（前縁）を強調する」視覚言語を維持する。
+function getPlatformAudienceColors(floorColorKey) {
+  const topFillColor = stageAppearanceColorHex(floorColorKey);
+  const frontFillColor = darkenHexColor(topFillColor, PLATFORM_AUDIENCE_FRONT_DARKEN_AMOUNT);
+  const { strokeColor, frontStrokeColor } = getPlatformVisualColors(floorColorKey);
+  return { topFillColor, frontFillColor, strokeColor, frontStrokeColor };
+}
+
+// ------------------------------------------------------------------
 // Lighting Area v1・D・E章：Lighting Sceneへの areas[] 拡張
 // ------------------------------------------------------------------
 // Scene schema：{ id, slideId, enabled, note, areas?: [] }。既存Scene（v0）にはareasが
@@ -1129,12 +1275,40 @@ function roundToHalfCount(progress, totalCounts) {
 //     ※ 仕様上「終了placementがない場合 → 開始位置に固定」に対応
 //   ・終了側にしか placement がない出演者 → 開始位置に固定（＝終了位置のまま表示）
 //     ※ 仕様上「開始placementがない場合 → 終了位置に固定」に対応
+// 高台 Phase 2E.1・PART F・G：Transition中のarea（平面的zone）を、現在の（補間済みの）x/yから
+// 座標ベースで解決する共通pure helper。直線移動（interpolatePlacements）・曲線移動
+// （interpolatePlacementsWithPaths）の両方がこの1つの関数だけを使うことで、「舞台裏→袖」と
+// 「袖→舞台裏」のように同じ物理境界を逆方向に通過する場合でも、遮蔽helper（isPlacement*
+// OccludedByPlatform系）の切替タイミングが移動方向によって変わらないようにする（従来は
+// progress>=1になるまで出発側areaを保持していたため、方向によって切替地点がズレていた）。
+//   ・progress<=0 → from.area（境界値として明確にfromを使う）
+//   ・progress>=1 → to.area（到着の瞬間に切り替え、既存仕様のまま）
+//   ・途中 → 現在x/yに対して既存resolveArea()（TopViewの配置判定等と全く同じzone判定）を
+//     適用した結果。zonesが渡されていない・resolveArea()がnull（該当zoneなし）を返した
+//     場合だけ、from.area→to.areaの順で安全側にfallbackする（既存呼び出し元がzonesを
+//     まだ渡さないケースとの後方互換）。
+function resolveTransitionArea(fromPlacement, toPlacement, currentPoint, progress, zones) {
+  if (!fromPlacement && !toPlacement) return null;
+  if (!fromPlacement) return toPlacement.area || null;
+  if (!toPlacement) return fromPlacement.area || null;
+  if (progress <= 0) return fromPlacement.area;
+  if (progress >= 1) return toPlacement.area;
+  const resolved = zones && currentPoint ? resolveArea({ x: currentPoint.x, y: currentPoint.y }, zones) : null;
+  return resolved || fromPlacement.area || toPlacement.area || null;
+}
+
 //   ・どちらにも存在しない出演者は結果に含めない（呼び出し側で自然に非表示になる）
 //
 // 将来、waypoints・出演者ごとの移動時間・曲線移動などを追加する場合も、この関数の
 // シグネチャ（fromPlacements, toPlacements, progress）はそのまま維持しつつ、
 // 内部処理だけを拡張できるようにしてある。
-function interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig) {
+// 高台 Phase 2C・PART F：末尾optional引数platforms（既定[]）を追加。既存呼び出しが
+// platformsを渡さなくても壊れないようfallbackを持たせる（呼び出し元は本体内部の
+// interpolatePlacementsWithPathsと、Lighting Cue Export側の既存呼び出しのみ＝Exportは
+// 今回変更しないため、そちらは従来どおりplatforms省略のままでよい）。
+// 高台 Phase 2E.1・PART H：末尾optional引数zones（既定null）を追加。既存呼び出しが渡さない
+// 場合は、resolveTransitionArea()内のfallback（from.area→to.area）により従来と同じ挙動になる。
+function interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig, platforms = [], zones = null) {
   const from = fromPlacements || {};
   const to = toPlacements || {};
   const ids = new Set([...Object.keys(from), ...Object.keys(to)]);
@@ -1143,12 +1317,21 @@ function interpolatePlacements(fromPlacements, toPlacements, progress, transitio
     const a = from[id];
     const b = to[id];
     if (a && b) {
+      const currentX = lerp(a.x, b.x, progress);
+      const currentY = lerp(a.y, b.y, progress);
+      // 高台 Phase 2E.1・PART F・H：areaは表示上の分類だけでなく高台遮蔽判定の入力にも
+      // なるため、現在の座標から毎フレームresolveTransitionArea()で解決する（直線・曲線で
+      // 共有、二重実装しない）。
+      const currentArea = resolveTransitionArea(a, b, { x: currentX, y: currentY }, progress, zones);
       result[id] = {
-        x: lerp(a.x, b.x, progress),
-        y: lerp(a.y, b.y, progress),
-        // area は表示上の分類にのみ使うため、再生完了の瞬間にのみ切り替える
-        // （途中は開始側のエリアのまま扱う＝終了側エリアへの特殊な出入り処理はv1では行わない）。
-        area: progress >= 1 ? b.area : a.area,
+        x: currentX,
+        y: currentY,
+        area: currentArea,
+        // 高台 Phase 2C・PART C：A/B両方がsurfaceMode==="auto"の場合だけ、確定した現在x/y・
+        // areaから毎フレームsurfaceIdを自動判定する（resolveTransitionPlacementSurfaceId、
+        // PART E）。それ以外（Phase 2Aまでの既存挙動）は従来どおり「到着の瞬間にのみ
+        // 切り替え」のまま変わらない。
+        surfaceId: resolveTransitionPlacementSurfaceId(a, b, { x: currentX, y: currentY, area: currentArea }, progress, platforms),
         // 姿勢 v1.1→移動時の姿勢v1：poseの決定はresolveTransitionPose()という共通pure
         // helperへ集約した（曲線側のinterpolatePlacementsWithPathsと同じ判定を共有し、
         // 二重実装しない）。transitionPoseConfigが無い、またはそのperformerのentryが
@@ -1574,8 +1757,14 @@ function quadraticBezierPoint(p0, p1, p2, t) {
 // 出演者だけ、二次ベジェ曲線上の位置で上書きする。
 // これにより、同じ構成間で「1番→直線／2番→曲線／3番→直線」のように混在していても、
 // 直線移動する出演者の挙動はinterpolatePlacements単体を使った場合と完全に同じになる。
-function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, pathConfig, transitionPoseConfig) {
-  const base = interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig);
+// 高台 Phase 2C・PART F：末尾optional引数platforms（既定[]）を追加し、そのままbase生成の
+// interpolatePlacements()へ渡す（platforms自体は1回だけ受け取ればよく、内部で
+// getPlatforms(work)等を重複して呼び出さない）。
+// 高台 Phase 2E.1・PART I：末尾optional引数zones（既定null）を追加し、base生成へそのまま
+// 渡すとともに、曲線側のcurrentArea解決にも同じresolveTransitionArea()を使う（直線と曲線で
+// 別のareaルールを作らない）。
+function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, pathConfig, transitionPoseConfig, platforms = [], zones = null) {
+  const base = interpolatePlacements(fromPlacements, toPlacements, progress, transitionPoseConfig, platforms, zones);
   if (!pathConfig) return base;
   const from = fromPlacements || {};
   const to = toPlacements || {};
@@ -1586,12 +1775,19 @@ function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, 
     const b = to[id];
     if (!a || !b) return; // 開始・終了の両方が揃っている出演者のみ曲線を適用する
     const point = quadraticBezierPoint(a, cfg.waypoint, b, progress);
+    // 高台 Phase 2E.1・PART F・I：曲線移動でも、Bezier座標で最終確定したx/yが決まった後に
+    // 直線側と全く同じresolveTransitionArea()でcurrentAreaを解決する（二重実装しない）。
+    const currentArea = resolveTransitionArea(a, b, { x: point.x, y: point.y }, progress, zones);
     // 移動時の姿勢v1：曲線移動で座標を上書きする際も、interpolatePlacements側と全く同じ
     // resolveTransitionPose()を再利用する（直線・曲線でpose判定ロジックを二重実装しない）。
+    // 高台 Phase 2C・PART G：surface判定は必ず「Bezier座標で最終確定したx/y」が決まった
+    // 後に行う（直線側と全く同じresolveTransitionPlacementSurfaceId()を再利用し、曲線だけ
+    // 別ロジックにしない）。
     base[id] = {
       x: point.x,
       y: point.y,
-      area: progress >= 1 ? b.area : a.area,
+      area: currentArea,
+      surfaceId: resolveTransitionPlacementSurfaceId(a, b, { x: point.x, y: point.y, area: currentArea }, progress, platforms),
       pose: resolveTransitionPose(a.pose, b.pose, progress, transitionPoseConfig && transitionPoseConfig[id]),
     };
   });
@@ -1914,6 +2110,9 @@ function createInitialWork() {
   return {
     stage: { width: 20, depth: 10 },
     performers: [],
+    // 高台 Phase 1A・10-1章：新規workは常に[]から始める。古いworkはgetPlatforms()により
+    // 自動的に[]へフォールバックするため、一括migrationは不要。
+    platforms: [],
     slides: [createInitialSlide()],
     currentSlideIndex: 0,
     transitionCounts: {}, // { [移動元スライドのid]: カウント数 }。未設定時はDEFAULT_TRANSITION_COUNTSにフォールバックする
@@ -3124,6 +3323,246 @@ const POSE_STANDING = "standing";
 const POSE_KNEELING = "kneeling";
 function getPlacementPose(placement) {
   return placement && placement.pose === POSE_KNEELING ? POSE_KNEELING : POSE_STANDING;
+}
+
+// ------------------------------------------------------------------
+// 高台 Phase 2A：placement.surfaceId（出演者がどの舞台面に立っているか）
+// ------------------------------------------------------------------
+// area（x/y上のどのzoneにいるか）とは完全に別概念。surfaceId == null/undefinedは通常舞台、
+// surfaceId == platform.idはその高台の上を意味する。getPlacementPose()と全く同じ
+// 「optional field + fallback」方針で、既存Projectへの一括migrationは行わない。
+function getPlacementSurfaceId(placement) {
+  return placement && typeof placement.surfaceId === "string" ? placement.surfaceId : null;
+}
+
+// placementの「足元の舞台面の高さ」を解決する。performer.height（出演者自身の身長）とは
+// 完全に独立した値のため、名前を混同しないよう「surfaceHeight」という語を使う。
+// 安全条件（今回の要件）：
+//   ・placement.area !== "stage" の場合は、surfaceIdが残っていても必ず0
+//     （待機エリア等、高台と無関係な場所にいる扱いのplacementでsurfaceIdが誤って
+//     残っていても、高さには一切反映させない）
+//   ・surfaceIdなし → 0
+//   ・参照先platformが現在存在しない（削除済み等） → 0（migrationはしない。読み取り時に
+//     常に安全側へfallbackするだけ＝Phase 1AのgetPlatforms()と同じ考え方）
+//   ・platform.heightが不正値 → 0
+//   ・正常な参照 → platform.height
+function resolvePlacementSurfaceHeight(placement, platforms) {
+  if (!placement || placement.area !== "stage") return 0;
+  const surfaceId = getPlacementSurfaceId(placement);
+  if (!surfaceId) return 0;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const platform = list.find((pl) => pl && pl.id === surfaceId);
+  if (!platform) return 0;
+  return Number.isFinite(platform.height) ? platform.height : 0;
+}
+
+// ------------------------------------------------------------------
+// 高台 Phase 2B：舞台面の自動判定＋手動上書き（placement.surfaceMode）
+// ------------------------------------------------------------------
+// surfaceMode: "auto" | "manual" | undefined。
+//   "auto"   → x/y確定のたびにsurfaceIdを自動再判定する（下記resolveAutoPlacementSurfaceId）
+//   "manual" → ユーザーが選んだsurfaceIdをそのまま維持し、自動判定の対象にしない
+//   未定義   → 既存Project／Phase 2Aまでに保存されたplacementの互換fallbackとして
+//              必ず"manual"扱いにする（既存データの意味を勝手に変えないため、一括
+//              migrationはしない。getPlacementPose()・getPlacementSurfaceId()と全く同じ
+//              「optional field + fallback」方針）。
+function getPlacementSurfaceMode(placement) {
+  return placement && placement.surfaceMode === "auto" ? "auto" : "manual";
+}
+
+// 指定した舞台座標(x, y)を含む高台のうち、最も高いものを1つ返す（無ければnull）。
+// 矩形判定は既存getPlatformStageRect()をそのまま再利用し、独自の矩形計算は増やさない。
+// 複数platformが重なる場合は「height最大」を採用し、同heightの場合はplatforms配列の
+// 先頭側（作成順で先にあるplatform）を優先する、という決定的なtie-breakにする
+// （新しいsort key・比較用フィールドは追加しない）。
+function resolvePlatformAtPoint(x, y, platforms) {
+  const list = Array.isArray(platforms) ? platforms : [];
+  let best = null;
+  list.forEach((pl) => {
+    if (!pl) return;
+    const rect = getPlatformStageRect(pl);
+    if (!rect) return;
+    if (x < rect.xMin || x > rect.xMax || y < rect.yMin || y > rect.yMax) return;
+    const plHeight = Number.isFinite(pl.height) ? pl.height : 0;
+    const bestHeight = best && Number.isFinite(best.height) ? best.height : -Infinity;
+    if (!best || plHeight > bestHeight) best = pl;
+    // plHeight === bestHeightの場合はbestを更新しない＝先に見つかった（配列で先にある）
+    // platformが優先される。
+  });
+  return best;
+}
+
+// surfaceMode==="auto"のplacementについて、現在のx/yからsurfaceIdを自動判定する。
+// resolvePlacementSurfaceHeight()と全く同じ安全条件（area==="stage"の場合だけ有効）を
+// 踏襲し、stageLeft/stageRight/upstageBackstage/nullでは常にnull（＝通常舞台）を返す。
+function resolveAutoPlacementSurfaceId(placement, platforms) {
+  if (!placement || placement.area !== "stage") return null;
+  const platform = resolvePlatformAtPoint(placement.x, placement.y, platforms);
+  return platform ? platform.id : null;
+}
+
+// x/yの変更前後（updater実行前のplacements→実行後のplacements）を比較し、実際にx/yが
+// 変化したidだけ、surfaceMode==="auto"の場合に限ってsurfaceIdを再計算する共通pure関数。
+// これをupdateSlidePlacementsCommit/Live内の1箇所に通すだけで、配置ツール側（ドラッグ・
+// 数値入力・反転・整列・位置交換等）を個別に変更せずに済ませる。
+//   ・surfaceIdだけを変更した場合（x/y不変）→ 対象外（manual選択・自動選択直後の即時判定を
+//     上書きしない）
+//   ・surfaceMode==="manual"（または未定義）→ 対象外（ユーザー指定を維持）
+//   ・Playback/scrub（interpolatePlacements系）・copy/paste・Undo・出演者追加はそもそも
+//     この関数の呼び出し元（updateSlidePlacementsCommit/Live）を経由しないため、対象外
+//     （調査報告A・I章の通り）。
+function applyAutoSurfaceAfterPlacementEdit(prevPlacements, nextPlacements, platforms) {
+  const prev = prevPlacements || {};
+  const next = nextPlacements || {};
+  let result = next;
+  Object.keys(next).forEach((id) => {
+    const before = prev[id];
+    const after = next[id];
+    if (!after) return;
+    const moved = !before || before.x !== after.x || before.y !== after.y;
+    if (!moved) return;
+    if (getPlacementSurfaceMode(after) !== "auto") return;
+    const nextSurfaceId = resolveAutoPlacementSurfaceId(after, platforms);
+    if (nextSurfaceId === getPlacementSurfaceId(after)) return; // 変化なしなら新しいobjectを作らない
+    if (result === next) result = { ...next };
+    result[id] = { ...after, surfaceId: nextSurfaceId };
+  });
+  return result;
+}
+
+// ------------------------------------------------------------------
+// 高台 Phase 2C・PART C・D・E：Transition中のauto surface判定
+// ------------------------------------------------------------------
+// 出発Formation（fromPlacement）・到着Formation（toPlacement）の両方がsurfaceMode==="auto"の
+// 場合だけ、Transition中の「現在の（補間済みの）x/y」からsurfaceIdを毎フレーム自動判定する。
+// それ以外（片方だけauto／両方manual／surfaceMode未定義を含む）は、Phase 2Aのまま
+// 「progress>=1で到着側、それ未満は出発側のsurfaceId」という既存のタイミング切替を維持する
+// （PART D：安全側の暫定仕様。実機確認後に別Phaseで拡張検討）。
+// currentPlacementは呼び出し側が「最終的に確定したx/y・area」を渡す想定（直線移動・曲線移動の
+// どちらでも、x/yが確定した後にこの関数を呼ぶ＝二重実装しない・PART G）。
+function resolveTransitionPlacementSurfaceId(fromPlacement, toPlacement, currentPlacement, progress, platforms) {
+  const bothAuto = getPlacementSurfaceMode(fromPlacement) === "auto" && getPlacementSurfaceMode(toPlacement) === "auto";
+  if (bothAuto) {
+    return resolveAutoPlacementSurfaceId(currentPlacement, platforms);
+  }
+  return progress >= 1 ? getPlacementSurfaceId(toPlacement) : getPlacementSurfaceId(fromPlacement);
+}
+
+// 高台 Phase 2C・PART H・I：「通常舞台として高台の下にいる」判定。
+// 既存resolvePlatformAtPoint()（矩形内判定）をそのまま再利用し、独自の矩形計算は増やさない。
+// 主判定は「最終的なsurfaceIdがnullかどうか」（surfaceModeそのものではない）にする理由：
+//   ・autoで高台外にいる場合 → surfaceIdはnull → resolvePlatformAtPoint()もnull → 非表示にならない
+//   ・manual通常舞台＋高台内 → surfaceIdはnull → resolvePlatformAtPoint()はplatform → 高台下として非表示
+// area!=="stage"の場合は常にfalse（resolvePlacementSurfaceHeight等と同じ安全条件）。
+function isPlacementUnderPlatform(placement, platforms) {
+  if (!placement || placement.area !== "stage") return false;
+  if (getPlacementSurfaceId(placement) != null) return false;
+  return !!resolvePlatformAtPoint(placement.x, placement.y, platforms);
+}
+
+// 高台 Phase 2D・PART H・I・J・K：「舞台奥待機の出演者が、高台の後ろに隠れて見える」判定。
+// ray castingやpolygon depth bufferのような本格的な3D遮蔽engineは作らず、現在の矩形高台と
+// stage座標だけを使った最小限のderived判定にする（保存fieldは持たない・完全に毎回導出）。
+// 矩形は必ず既存getPlatformStageRect()を再利用し、独自のplatform.x±width/2計算は行わない。
+// 条件（いずれか1つのplatformで満たせばtrue）：
+//   1. placement.area === "upstageBackstage"（下手袖・上手袖は対象外＝isWingPlacementOccludedByPlatform()の責務）
+//   2. 高台のheightが0より大きい（高さの無い高台は遮蔽しない）
+// 高台 Phase 2D.1f：横方向の判定を「高台真正面（coreX）」と「左右の補助遮蔽領域
+// （extendedX）」の2つに分岐し、奥行きの遮蔽開始位置をそれぞれ別に扱う。
+//   3a. 真正面（rect.xMin〜rect.xMaxの内側）にいる場合：
+//       placement.yがrect.yMax以上（高台奥端を越えた瞬間から遮蔽）。高台が1台だけの
+//       構成でも、真正面の裏側がPLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN分だけ透けて
+//       見えてしまう実機フィードバックに基づく修正。
+//   3b. 真正面の外側で、左右へPLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGINだけ広げた
+//       補助領域にいる場合：placement.yがrect.yMax + PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN
+//       以上（高台 Phase 2D.1c/1dで調整した「奥端からさらに奥へ入ってから遮蔽」を維持）。
+//       これは、内部areaがupstageBackstageになっている袖後方出演者を
+//       isWingPlacementOccludedByPlatform()（stageLeft/stageRight専用）が拾えない隙間を
+//       Backstage側から補うための領域（高台 Phase 2D.1b由来）。
+//   4. 上記いずれにも該当しなければfalse。
+// 高台 Phase 2D.1b：横方向の遮蔽帯を高台の横端から左右へ広げるための表示判定専用定数
+// （保存schemaではない）。isWingPlacementOccludedByPlatform()のPLATFORM_WING_OCCLUSION_*
+// とは別の定数として持つ（役割分担：upstageBackstage用はこちら、stageLeft/stageRight用は
+// あちら、を維持するため）。
+const PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN = 2.0; // 高台の横端から外側へ広げる帯の幅（180cm）
+// 高台 Phase 2D.1c：奥行き方向の遮蔽開始位置を高台の奥端からさらに奥へずらすための
+// 表示判定専用定数（保存schemaではない）。横方向のSIDE_MARGINとは別軸のmarginのため、
+// 別の定数として持つ。Phase 2D.1fでは、この定数は「左右の補助遮蔽領域（extendedX）」
+// だけに適用し、真正面（coreX）には適用しない。
+const PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN = 1.5; // 高台奥端からさらに奥へずらす距離（135cm）
+function isBackstagePlacementOccludedByPlatform(placement, platforms) {
+  if (!placement || placement.area !== "upstageBackstage") return false;
+  const list = Array.isArray(platforms) ? platforms : [];
+  return list.some((platform) => {
+    if (!platform) return false;
+    const height = Number.isFinite(platform.height) ? platform.height : 0;
+    if (height <= 0) return false;
+    const rect = getPlatformStageRect(platform);
+    if (!rect) return false;
+    const insideCoreX = placement.x >= rect.xMin && placement.x <= rect.xMax;
+    if (insideCoreX) {
+      return placement.y >= rect.yMax;
+    }
+    const insideExtendedX =
+      placement.x >= rect.xMin - PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN &&
+      placement.x <= rect.xMax + PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN;
+    if (insideExtendedX) {
+      return placement.y >= rect.yMax + PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN;
+    }
+    return false;
+  });
+}
+
+// 高台 Phase 2D.1・PART E：袖（stageLeft/stageRight）の高台横遮蔽判定で使うmargin定数。
+// 保存schemaではなく、表示判定専用のmodule scope定数（1単位=90cm）。実機調整しやすいよう
+// 小さな値から開始する。
+const PLATFORM_WING_OCCLUSION_SIDE_MARGIN = 2.0; // 高台の横端から外側へ広げる帯の幅（180cm）
+const PLATFORM_WING_OCCLUSION_Y_MARGIN = 1.5; // 高台の奥端からどこまで手前を「奥側扱い」にするか（135cm）
+
+// 高台 Phase 2D.1・PART B・C・D・F・G：「舞台袖（下手・上手）の奥側で、高台の横端すぐ外に
+// いる出演者が、俯瞰投影上で高台の前後関係と紛らわしく見える」ケースだけを遮蔽する判定。
+// isBackstagePlacementOccludedByPlatform()（upstageBackstage専用）とは完全に別の対象・別の
+// 条件のため、そちらは変更せずこの専用helperを新設する。矩形は必ず既存
+// getPlatformStageRect()を再利用し、独自のplatform.x±width/2等の再計算は行わない。
+// 条件（いずれか1つのplatformで満たせばtrue）：
+//   1. placement.areaが"stageLeft"または"stageRight"（それ以外は常にfalse）
+//   2. 高台のheightが0より大きい
+//   3. placement.yが高台の奥端付近（rect.yMax - Y_MARGIN以上）
+//   4. placement.xが、高台の横幅そのものではなく「横端からSIDE_MARGINだけ外側へ広げた帯」の中
+//      （stageLeftならrect.xMinのすぐ外側、stageRightならrect.xMaxのすぐ外側）
+// 袖出演者を一律に隠すものではなく、実機で前後関係が紛らわしくなる狭い範囲だけを対象にする
+// （PART C：袖の外側に十分離れている出演者は従来通り表示する）。
+function isWingPlacementOccludedByPlatform(placement, platforms) {
+  if (!placement) return false;
+  const isLeft = placement.area === "stageLeft";
+  const isRight = placement.area === "stageRight";
+  if (!isLeft && !isRight) return false;
+  const list = Array.isArray(platforms) ? platforms : [];
+  return list.some((platform) => {
+    if (!platform) return false;
+    const height = Number.isFinite(platform.height) ? platform.height : 0;
+    if (height <= 0) return false;
+    const rect = getPlatformStageRect(platform);
+    if (!rect) return false;
+    const nearBack = placement.y >= rect.yMax - PLATFORM_WING_OCCLUSION_Y_MARGIN;
+    if (!nearBack) return false;
+    if (isLeft) {
+      return placement.x < rect.xMin && placement.x >= rect.xMin - PLATFORM_WING_OCCLUSION_SIDE_MARGIN;
+    }
+    return placement.x > rect.xMax && placement.x <= rect.xMax + PLATFORM_WING_OCCLUSION_SIDE_MARGIN;
+  });
+}
+
+// 高台 Phase 2E・PART A：3つの既存遮蔽判定helper（isPlacementUnderPlatform・
+// isBackstagePlacementOccludedByPlatform・isWingPlacementOccludedByPlatform）を
+// まとめるだけの表示判定専用pure helper。新しい遮蔽判定ロジックは一切作らず、
+// 「どの理由で高台に隠れているか」は区別しない。保存fieldは追加しない。
+function isPlacementOccludedByPlatform(placement, platforms) {
+  return (
+    isPlacementUnderPlatform(placement, platforms) ||
+    isBackstagePlacementOccludedByPlatform(placement, platforms) ||
+    isWingPlacementOccludedByPlatform(placement, platforms)
+  );
 }
 
 // ------------------------------------------------------------------
@@ -4489,6 +4928,10 @@ function createDefaultLightingBeam3D(stage) {
     logicalBeamId: makeId("logical-beam"),
     source: { x: sourceX, y: sourceY, z: clamp(20, LIGHTING_BEAM_3D_MIN_Z, LIGHTING_BEAM_3D_MAX_Z) },
     target: { x: targetX, y: targetY, z: 0 }, // C章：STEP1ではtarget.zは常に0（舞台床）
+    // 高台 Phase 3A・PART A・U：新規Beamのtargetは常に「通常舞台」から始める。
+    // targetSurfaceIdが高台矩形内へ入ったからといって自動で高台へ切り替える仕様
+    // （auto surfaceに相当するもの）は今回実装しない（PART Y：明示選択のみ）。
+    targetSurfaceId: null,
     color: "white",
     intensity: DEFAULT_LIGHTING_BEAM_3D_INTENSITY,
     sourceWidth: DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH,
@@ -4523,13 +4966,60 @@ function resolveLightingBeam3DTarget(beam, displayPlacements) {
   return beam.target;
 }
 
-// Beam配列全体に対してresolveLightingBeam3DTarget()を適用し、「表示用に解決済みの
-// target」を持つ新しい配列を作る薄いラッパー。追尾していないBeam（大多数のケース）は
-// 元のobject referenceをそのまま返すため、無駄な再生成をしない。
-function resolveLightingBeams3DForDisplay(beams3D, displayPlacements) {
+// 高台 Phase 3A・PART A・B：正式Lighting Beam 3Dへのoptional field targetSurfaceIdの
+// safe getter。既存Projectにはこのfieldが存在しないため、undefinedは必ずnull（＝通常舞台）
+// として扱う（一括migrationはしない）。getPlacementSurfaceId()と全く同じ「optional field +
+// fallback」方針。
+function getLightingBeam3DTargetSurfaceId(beam) {
+  return beam && typeof beam.targetSurfaceId === "string" ? beam.targetSurfaceId : null;
+}
+
+// 高台 Phase 3A・PART C：Beamのtargetが実際に照らす高さ（z）を、targetSurfaceIdから解決する。
+// ・targetSurfaceIdなし → 既存beam.target.zをそのまま使う（後方互換・通常舞台）
+// ・有効なplatform（height>0）が見つかる → platform.height
+// ・参照先platformが存在しない（削除済み等）・height<=0 → 既存beam.target.zへ安全fallback
+//   （workデータのmigrationはしない。読み取り時にだけ安全側へ倒す＝高台Phase 1Aの
+//   getPlatforms()と同じ考え方）
+// target.z自体は削除・上書きしない（呼び出し側が別途effective targetを組み立てる）。
+function resolveLightingBeam3DTargetSurfaceHeight(beam, platforms) {
+  const surfaceId = getLightingBeam3DTargetSurfaceId(beam);
+  const fallbackZ = beam && beam.target && Number.isFinite(Number(beam.target.z)) ? Number(beam.target.z) : 0;
+  if (!surfaceId) return fallbackZ;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const platform = list.find((pl) => pl && pl.id === surfaceId && Number(pl.height) > 0);
+  if (!platform) return fallbackZ;
+  return Number(platform.height) || 0;
+}
+
+// 高台 Phase 3A・PART D：表示用のeffective target（x/yは既存の追尾解決、zだけ
+// targetSurfaceIdから解決した高さに差し替える）を1箇所で作る共通pure helper。
+// 今回はfollowPerformer時の「出演者自身のsurface heightへの自動追従」は実装しない
+// （PART T：x/yはperformer位置、zはtargetSurfaceIdで選んだ照射面高さという、互いに独立した
+// 値のまま）。TopView・OverheadAudienceView・Export・Thumbnailのいずれもこの1つの関数を
+// 通し、target解決ロジックを二重実装しない。
+function resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms) {
+  const followedTarget = resolveLightingBeam3DTarget(beam, displayPlacements);
+  if (!followedTarget) return followedTarget;
+  const surfaceZ = resolveLightingBeam3DTargetSurfaceHeight(beam, platforms);
+  // targetSurfaceIdが無い（＝通常舞台）Beamでは、resolveLightingBeam3DTargetSurfaceHeight()が
+  // 常にfollowedTarget.zと同じ値を返す（フォールバック先が同じzのため）。その場合は新しい
+  // objectを作らずfollowedTargetをそのまま返し、追尾していないBeamの「無駄な再生成をしない」
+  // という既存の最適化をtargetSurfaceId未使用時は維持する。
+  if (surfaceZ === followedTarget.z) return followedTarget;
+  return { ...followedTarget, z: surfaceZ };
+}
+
+// Beam配列全体に対してresolveLightingBeam3DEffectiveTarget()を適用し、「表示用に解決済みの
+// target（x/yの追尾解決＋targetSurfaceIdによるz解決）」を持つ新しい配列を作る薄いラッパー。
+// 高台 Phase 3A・PART E：platforms引数（既定[]）を追加し、内部の判定を
+// resolveLightingBeam3DTarget()から本helperへ差し替えた。target解決自体が変わらない
+// 追尾していないBeam・targetSurfaceIdなしのBeーム（大多数の既存Projectのケース）は、
+// resolveLightingBeam3DEffectiveTarget()が返すオブジェクトが既存target.zと同じ値になる
+// ため、実質的に旧resolveLightingBeams3DForDisplay()と完全に同じ結果になる（後方互換）。
+function resolveLightingBeams3DForDisplay(beams3D, displayPlacements, platforms = []) {
   const list = Array.isArray(beams3D) ? beams3D : [];
   return list.map((beam) => {
-    const resolvedTarget = resolveLightingBeam3DTarget(beam, displayPlacements);
+    const resolvedTarget = resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms);
     return resolvedTarget === beam.target ? beam : { ...beam, target: resolvedTarget };
   });
 }
@@ -4602,6 +5092,20 @@ function getLightingBeamFootprintStagePoints(beam) {
     points.push({ x: cx + ex * cosA - ey * sinA, y: cy + ex * sinA + ey * cosA });
   }
   return points;
+}
+
+// 高台 Phase 3A・PART N：footprintの「床側」に相当する高さ（z）を返す共通pure helper。
+// getLightingBeamFootprintStagePoints()内部の「zがより低い方をfootprint側として扱う」
+// （sourceIsFloor = sourceZ <= targetZ）という既存の考え方をそのまま踏襲し、x/y専用の
+// getLightingBeamFootprintStagePoints()自体は変更しない（新しい物理交差計算は行わない）。
+// 呼び出し時点のbeam.target.zは、既にresolveLightingBeams3DForDisplay()／
+// resolveLightingBeam3DEffectiveTarget()を通ってtargetSurfaceIdによる高台高さへ解決済みの
+// 前提のため、この関数自体はtargetSurfaceIdを直接見ない（二重解決しない）。
+function getLightingBeamFootprintZ(beam) {
+  if (!beam || !beam.source || !beam.target) return 0;
+  const sourceZ = Number(beam.source.z) || 0;
+  const targetZ = Number(beam.target.z) || 0;
+  return Math.min(sourceZ, targetZ);
 }
 
 // M章：footprintの色はbeam.colorをそのまま使い（lightingAreaColorHex()を再利用）、透明度は
@@ -5638,6 +6142,47 @@ function FrontFigureKneeling({ color, selected, warn, heightPx, refHeightPx }) {
   );
 }
 
+// 高台 Phase 2E・PART G・H：高台裏ゴースト専用の描画（SVG、俯瞰客席ビュー画面用）。
+// 実体のFrontFigure/FrontFigureKneelingとは完全に別コンポーネントとし、既存の身体描画を
+// 分岐だらけにしない（PART G）。ジオメトリ計算だけはFrontFigure/computeKneelingFigureGeometry()
+// と同じ比率・数式を再利用し、pose・身長差をghostでも同じに見せる（standingとkneelingの
+// 見分けがつくようにする）。塗りは持たず、輪郭はすべて点線・低opacityの単色にすることで、
+// 「情報表示レイヤー」であり実体の出演者と見間違えないようにする（PART H：選択強調・警告枠・
+// 黒縁取り・塗りつぶしは一切持たない）。
+function GhostFigure({ color, heightPx, pose, refHeightPx }) {
+  if (pose === POSE_KNEELING) {
+    const { headR, headCy, shoulderY, hipY, torsoW, hipXLong, hipXShort, shortLegEndY, diagEndX, diagEndY } = computeKneelingFigureGeometry(
+      heightPx,
+      refHeightPx
+    );
+    return (
+      <g stroke={color} fill="none" strokeDasharray="4 3" strokeWidth={1.6} strokeLinecap="round" opacity={0.32}>
+        <line x1={hipXLong} y1={hipY} x2={hipXLong} y2={0} />
+        <line x1={hipXShort} y1={hipY} x2={hipXShort} y2={shortLegEndY} />
+        <line x1={hipXShort} y1={shortLegEndY} x2={diagEndX} y2={diagEndY} />
+        <path d={`M ${-torsoW} ${shoulderY} L ${torsoW} ${shoulderY} L ${torsoW * 0.8} ${hipY} L ${-torsoW * 0.8} ${hipY} Z`} />
+        <circle cx={0} cy={headCy} r={headR} />
+      </g>
+    );
+  }
+  const H = heightPx;
+  const R = refHeightPx != null ? refHeightPx : heightPx;
+  const headR = R * FIGURE_HEAD_R_RATIO;
+  const headCy = -H + headR;
+  const shoulderY = -H * 0.84;
+  const hipY = -H * 0.46;
+  const torsoW = R * FIGURE_TORSO_W_RATIO;
+  const legGap = R * FIGURE_LEG_GAP_RATIO;
+  return (
+    <g stroke={color} fill="none" strokeDasharray="4 3" strokeWidth={1.6} strokeLinecap="round" opacity={0.32}>
+      <line x1={-legGap} y1={hipY} x2={-legGap} y2={0} />
+      <line x1={legGap} y1={hipY} x2={legGap} y2={0} />
+      <path d={`M ${-torsoW} ${shoulderY} L ${torsoW} ${shoulderY} L ${torsoW * 0.8} ${hipY} L ${-torsoW * 0.8} ${hipY} Z`} />
+      <circle cx={0} cy={headCy} r={headR} />
+    </g>
+  );
+}
+
 // 姿勢 v1：胸の番号タグ（俯瞰客席ビュー・PNG Export共通）の位置・幅を姿勢ごとに計算する
 // pure helper。standing側のchestWidthは身長 v2・PART Eにより、実際の身長（heightPx）ではなく
 // 固定の体格基準（refHeightPx）から求める（＝小・中・大で番号タグの横幅が変わらないように
@@ -5793,6 +6338,9 @@ const TopView = forwardRef(function TopView(
     zones,
     performers,
     placements,
+    // 高台 Phase 1A・10-6章：表示専用（読み取り専用）の高台一覧。未指定時は既存Projectと
+    // 同じ見た目になるよう空配列にフォールバックする。
+    platforms = [],
     selectedIds,
     onSelect,
     onToggleSelect,
@@ -6657,6 +7205,61 @@ const TopView = forwardRef(function TopView(
           })()}
         </g>
 
+        {/* 高台 Phase 1A・10-6章：高台レイヤー。舞台床/グリッドより手前、Lighting Area・
+            出演者・軌跡よりは必ず背面になる位置に描く読み取り専用の矩形表示。今回は
+            ドラッグ・リサイズ等の操作対象にしないため、pointerEvents="none"にして、
+            出演者クリックや矩形選択・背景pan等の既存操作を一切妨げないようにする。
+            矩形の幾何計算はgetPlatformStageRect()（Export側と共通のpure helper）を
+            再利用し、ここではtoScreenX/Yへ通すだけにする（座標計算の二重実装を避ける）。
+            高台 見た目改善 v2：塗り（fill）が場ミリグリッドを隠してしまう・Lighting Areaの
+            半透明の面と紛らわしいという実機フィードバックに基づき、「塗りなし＋実線の外枠＋
+            客席側辺の強調」という構造線だけの表現に変更（fill="none"）。舞台上の名前・高さ
+            ラベルも削除した（名前・高さは編集パネル側で確認する）。枠線色はgetPlatformVisualColors()
+            としてExport側（renderTopFormationExport）と共有し、デザインロジックを2箇所に
+            重複実装しない。 */}
+        {platforms.length > 0 &&
+          (() => {
+            const platformVisualColors = getPlatformVisualColors(floorColorKey);
+            return (
+              <g pointerEvents="none" aria-hidden="true">
+                {platforms.map((pl) => {
+                  const rect = getPlatformStageRect(pl);
+                  if (!rect) return null;
+                  const rectX = toScreenX(rect.xMin);
+                  const rectY = toScreenY(rect.yMax);
+                  const rectW = toScreenX(rect.xMax) - rectX;
+                  const rectH = toScreenY(rect.yMin) - rectY;
+                  // 客席側の辺＝stage座標のyMin側。toScreenYはyが大きいほど画面上で小さいpx
+                  // （舞台奥が上・客席が下）になるため、screen座標では矩形の下端（rectY+rectH）が
+                  // 客席側の辺にあたる（4章）。
+                  const frontEdgeY = rectY + rectH;
+                  return (
+                    <g key={pl.id}>
+                      <rect
+                        x={rectX}
+                        y={rectY}
+                        width={rectW}
+                        height={rectH}
+                        fill="none"
+                        stroke={platformVisualColors.strokeColor}
+                        strokeWidth={2.0}
+                      />
+                      <line
+                        x1={rectX}
+                        y1={frontEdgeY}
+                        x2={rectX + rectW}
+                        y2={frontEdgeY}
+                        stroke={platformVisualColors.frontStrokeColor}
+                        strokeWidth={3.0}
+                        strokeLinecap="square"
+                      />
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })()}
+
         {/* Lighting Area v1・M章：照明Areaレイヤー。描画順は「stage floor/grid → Lighting Area →
             transition trajectory → performers」（M章）。showLightingAreasはApp側で
             showLighting && currentLightingScene && currentLightingScene.enabled
@@ -7372,6 +7975,11 @@ function buildFormationExportModel({
   // 未指定（呼び出し元が渡さない＝Lighting Cue Export等）の場合は常にnullとなり、
   // renderer側の強調描画は自然に発火しない（10章：Lighting Cue Exportは今回対象外）。
   highlightedPerformerId = null,
+  // 高台 Phase 1A・10-7章：work.platforms（getPlatforms()で既にfallback済みの配列が
+  // 渡ってくる想定）。未指定（Lighting Cue Export等、今回platformsを渡さない呼び出し元）の
+  // 場合は常に[]となり、renderer側の高台描画は自然にスキップされる（Lighting Cue Exportは
+  // 今回必須ではないため、既存構造上自然に共有できる分だけ反映する＝10-7章の方針）。
+  platforms = [],
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
@@ -7437,6 +8045,10 @@ function buildFormationExportModel({
       ? performers.map((p) => ({ id: p.id, number: p.number, color: p.color, height: p.height, name: getPerformerName(p) }))
       : [],
     placements: slide.placements || {},
+    // 高台 Phase 1A・10-7章：表示専用field。呼び出し元がgetPlatforms(work)を渡す想定で、
+    // ここでは形式の安全確認だけ行い、Undo/Redo・work schemaには一切関与しない
+    // （Export Modelは常に「作品データのスナップショット」であり、書き込みは行わない）。
+    platforms: Array.isArray(platforms) ? platforms : [],
     transitionPaths,
     // P-03 第一段階「選択出演者を強調して出力」・5章：表示専用field。強調対象のperformerId
     // （またはnull）をそのまま保持するだけで、ここでは強調の可否判定（selectedIds.length===1
@@ -7474,7 +8086,10 @@ function buildFormationExportModel({
       // 追尾判定は作らない（14章）。対象出演者が見つからない場合は既存のbeam.targetへ
       // fallbackする（23章）。Lighting CueごとのExportは今回のスコープ外のため、
       // 従来通りbase SceneのgetLightingBeams3D()のみを対象にする。
-      return resolveLightingBeams3DForDisplay(getLightingBeams3D(scene), slide.placements || {});
+      // 高台 Phase 3A・PART Q：この関数が受け取ったplatforms（通常Formation Exportと同じ
+      // 配列）を渡し、高台照射Beamのtarget.zがExportでも正しく解決されるようにする。
+      // Export専用の別target height計算は作らない。
+      return resolveLightingBeams3DForDisplay(getLightingBeams3D(scene), slide.placements || {}, platforms);
     })(),
     // 追尾スポット軌跡Export v1・2〜3・11〜17章：selectionには一切依存せず、対象Formationの
     // Base Lighting Scene内に存在するfollowPerformerId付きBeamすべてを対象にする（固定Beamは
@@ -7536,6 +8151,10 @@ function buildFormationExportModels({
   // 全Formationで同じ1人のperformerId（現在編集画面で選択中の出演者）を強調する想定のため、
   // Formationごとに異なる値を持たせる仕組みは今回作らない。
   highlightedPerformerId,
+  // 高台 Phase 1A・10-7章：buildFormationExportModelへそのまま伝播するだけ。全Formationで
+  // 同じ高台一覧（work.platforms）を使う想定のため、Formationごとに異なる値を持たせる
+  // 仕組みは作らない。
+  platforms,
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -7564,6 +8183,7 @@ function buildFormationExportModels({
         lightingScenes,
         showLightingTrackingPaths,
         highlightedPerformerId,
+        platforms,
       })
     )
     .filter((m) => m !== null);
@@ -7600,6 +8220,10 @@ function buildLightingCueExportModels({
   showTrajectory, // Lighting Cue Export 軌跡対応 v1・35章：Export Centerの「移動軌跡」checkboxの値
   trajectoryMode, // 同・35章：「次に」/「前に」。既存exportTrajectoryModeをそのまま共有する
   showLightingTrackingPaths, // 同・35章：Export Centerの「追尾スポット軌跡」checkboxの値
+  // 高台 Phase 2E.2・PART A：通常Formation Exportと同じ表示用引数。保存schemaではなく、
+  // 現在Projectのwork.platforms（getPlatforms(work)で既に[]へfallback済みの配列）を
+  // そのまま受け取るだけ。未指定時は既存互換のため[]にfallbackする。
+  platforms = [],
 }) {
   if (!slide || !Array.isArray(slides)) return [];
   const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
@@ -7609,6 +8233,8 @@ function buildLightingCueExportModels({
 
   // 開始時カットのベースとなるModel（軌跡・追尾は下で個別に上書きするため、ここでは常に
   // showTrajectory:falseで生成する＝baseModel自体は「軌跡なしの土台」のまま維持）。
+  // 高台 Phase 2E.2・PART B：通常Formation Exportと同じplatformsを渡すことで、
+  // baseModel.platformsが空配列fallbackにならず、既存rendererが自然に高台を描く。
   const baseModel = buildFormationExportModel({
     slide,
     slideIndex,
@@ -7626,6 +8252,7 @@ function buildLightingCueExportModels({
     stageAppearance,
     lightingEnabled: true,
     lightingScenes,
+    platforms,
   });
   if (!baseModel) return [];
 
@@ -7710,7 +8337,9 @@ function buildLightingCueExportModels({
       placements: slide.placements || {},
       // 19・20章：追尾BeamはこのカットのplacementsでresolveLightingBeams3DForDisplay()を通す。
       lightingAreas: resolved.areas,
-      lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, slide.placements || {}),
+      // 高台 Phase 3A・PART R：この関数が受け取ったplatformsをそのまま渡し、開始時・keep・
+      // transitionすべてのCueで高台照射target.zが反映されるようにする。
+      lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, slide.placements || {}, platforms),
       transitionPaths: trajectoryForStartOrKeep,
       // 18章：keep Cue時点でresolveされた生のbeams3D（resolved.beams3D）をfollow判定に使う
       // （resolveLightingBeams3DForDisplay適用後のtarget解決済みリストではなく、生のリスト）。
@@ -7739,12 +8368,19 @@ function buildLightingCueExportModels({
       // 65章：既存のlocal transition cue.countとmoveから算出しているprogressをそのまま使う
       // （displayCountから逆算しない）。
       const progress = move > 0 ? clamp(cue.count / move, 0, 1) : 0;
+      // 高台 Phase 2E.2・PART F：この関数が受け取ったplatforms（通常Formation Exportと同じ
+      // 配列）をそのまま渡す。zonesは既存のこの関数の引数（buildLightingCueExportModels自体が
+      // 受け取っている）をそのまま渡し、Transition途中のareaが座標ベースになる仕様
+      // （Phase 2E.1）を維持しつつ、auto surface判定・高台下/裏ghost判定の元になる
+      // platformsも通常Playbackと同じものを使うようにする。
       const cutPlacements = interpolatePlacementsWithPaths(
         slide.placements,
         nextSlide.placements,
         progress,
         pathConfig,
-        transitionPoseConfig
+        transitionPoseConfig,
+        platforms,
+        zones
       );
       // 13〜15章：transition Cueの移動軌跡は、Cueごとに再計算しない同一のfullTransitionPaths
       // をprogress地点でsliceTransitionPathsAtProgress()により分割するだけ（2章：curveの
@@ -7778,7 +8414,8 @@ function buildLightingCueExportModels({
         lightingCueFadeCounts: Number.isFinite(Number(cue.fadeCounts)) ? Math.max(0, Number(cue.fadeCounts)) : 0,
         placements: cutPlacements,
         lightingAreas: resolved.areas,
-        lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, cutPlacements),
+        // 高台 Phase 3A・PART R：keep Cueと同じくplatformsを渡す。
+        lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, cutPlacements, platforms),
         transitionPaths: slicedTransitionPaths,
         lightingBeamTrackingPaths: slicedTrackingPaths,
       });
@@ -7825,6 +8462,9 @@ function buildLightingCueExportModelsForSlides({
   showTrajectory,
   trajectoryMode,
   showLightingTrackingPaths,
+  // 高台 Phase 2E.2・PART C：buildLightingCueExportModels()と同じ表示用引数。通常
+  // Formation Exportと同じplatformsをそのまま束ねて渡すだけで、加工・clone・再計算はしない。
+  platforms = [],
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -7855,6 +8495,8 @@ function buildLightingCueExportModelsForSlides({
       showTrajectory,
       trajectoryMode,
       showLightingTrackingPaths,
+      // 高台 Phase 2E.2・PART D：内部builderへそのまま渡すだけ。
+      platforms,
     });
     result.push(...models);
   });
@@ -8254,6 +8896,9 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   // Export表示倍率 v1・PART G・H：auto-fit後の構図倍率（1.0＝100%）。平面図・俯瞰客席ビュー
   // どちらのrendererにも同じ値を渡す（それぞれのauto-fit計算・bounds計算自体は無変更）。
   const displayScale = renderOptions && typeof renderOptions.displayScale === "number" ? renderOptions.displayScale : 1;
+  // 高台 Phase 2E・PART O：俯瞰客席ビュー（audience）出力の場合だけ渡す。平面図（top）側の
+  // renderTopFormationExport()へは渡さない（PART S：平面図は今回一切変更しない）。
+  const showOccludedPerformerGhosts = !!(renderOptions && renderOptions.showOccludedPerformerGhosts);
 
   const PADDING = 40;
   // Lighting Cue Export v1・26章：Cue Export時（model.lightingCueLabelがある場合）だけ、
@@ -8282,7 +8927,7 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   };
 
   if (viewMode === "audience") {
-    renderAudienceFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, displayScale });
+    renderAudienceFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, displayScale, showOccludedPerformerGhosts });
   } else {
     renderTopFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, showPerformerNames, displayScale });
   }
@@ -8545,6 +9190,37 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
     ctx.lineTo(centerX, centerY + crossHalf);
     ctx.stroke();
     ctx.globalAlpha = 1;
+  }
+
+  // 高台 Phase 1A・10-7章：高台レイヤー。出演者・Lighting Areaより先（＝背面）に、矩形の
+  // 枠線だけを描く読み取り専用の表示。TopViewのgetPlatformStageRect()と全く同じ矩形計算を
+  // 再利用し、座標変換だけをExport用のtoX/toYへ差し替える（座標計算の二重実装を避ける＝
+  // 10-7章の方針）。model.platformsはbuildFormationExportModel側で既に[]へfallback済みの配列。
+  // 高台 見た目改善 v2：塗り・舞台上ラベルを廃止し、TopViewと同じ「塗りなし＋実線の外枠＋
+  // 客席側辺の強調」にする。枠線色（getPlatformVisualColors）はTopViewと完全に共有し、
+  // Export側で別のデザインロジックを作らない。
+  if (model.platforms && model.platforms.length > 0) {
+    const platformVisualColors = getPlatformVisualColors(exportFloorColorKey);
+    model.platforms.forEach((pl) => {
+      const rect = getPlatformStageRect(pl);
+      if (!rect) return;
+      const rectX = toX(rect.xMin);
+      const rectY = toY(rect.yMax);
+      const rectW = toX(rect.xMax) - rectX;
+      const rectH = toY(rect.yMin) - rectY;
+      // 客席側の辺＝stage座標のyMin側＝TopViewと同じ考え方で、Export座標系でも矩形の下端
+      // （rectY+rectH）が客席側の辺にあたる（4章）。
+      const frontEdgeY = rectY + rectH;
+      ctx.strokeStyle = platformVisualColors.strokeColor;
+      ctx.lineWidth = 2.0;
+      ctx.strokeRect(rectX, rectY, rectW, rectH);
+      ctx.strokeStyle = platformVisualColors.frontStrokeColor;
+      ctx.lineWidth = 3.0;
+      ctx.beginPath();
+      ctx.moveTo(rectX, frontEdgeY);
+      ctx.lineTo(rectX + rectW, frontEdgeY);
+      ctx.stroke();
+    });
   }
 
   // Lighting Area Export v1・I・J・K章：出演者・軌跡より先（＝出演者より下のレイヤー）に描く。
@@ -8903,6 +9579,9 @@ function drawTopPerformerMarker(ctx, sx, sy, performer, figureRadius, highlighte
 // 一本化し、画面側のOverheadAudienceViewと全く同じ関数を呼ぶ（二重実装しない）。
 function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   const showWaitingAreas = !!(options && options.showWaitingAreas);
+  // 高台 Phase 2E・PART P・Q：画面側と同じ「高台裏を表示」optionをExport側でも受け取る。
+  // 未指定時はfalse（従来通りghostなし、完全非表示のまま）にfallbackする。
+  const showOccludedPerformerGhosts = !!(options && options.showOccludedPerformerGhosts);
   const { x: stageAreaX, y: stageAreaY, w: stageAreaW, h: stageAreaH } = stageAreaRect;
 
   // 18章：OverheadAudienceViewと同じcomputeAudienceViewBounds()で「舞台空間そのもの」の
@@ -8922,6 +9601,19 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   // 掛け合わせる薄いラッパー。疑似遠近法の計算式そのものは一切変更していない。
   const project = (xUnits, yUnits) => {
     const p = projectAudiencePoint(bounds, model.stage.depth, xUnits, yUnits);
+    return {
+      sx: stageAreaX + fit.offsetX + fit.scale * p.sx,
+      sy: stageAreaY + fit.offsetY + fit.scale * p.sy,
+      scale: p.scale,
+      opacity: p.opacity,
+    };
+  };
+
+  // 高台 Phase 2A・11章：画面側のOverheadAudienceViewと同じgetPlacementSurfaceHeight()を
+  // 使って出演者を持ち上げるための3D版project。project()と全く同じCanvas fit変換を
+  // 追加で掛け合わせるだけで、新しい投影式・新しいExport model fieldは作らない。
+  const project3D = (xUnits, yUnits, zUnits) => {
+    const p = projectAudiencePoint3D(bounds, model.stage.depth, xUnits, yUnits, zUnits);
     return {
       sx: stageAreaX + fit.offsetX + fit.scale * p.sx,
       sy: stageAreaY + fit.offsetY + fit.scale * p.sy,
@@ -9090,6 +9782,67 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
     ctx.globalAlpha = 1;
   }
 
+  // 高台 Phase 1B：俯瞰客席ビューでの高さ表現（Export対応）。画面側のOverheadAudienceViewと
+  // 全く同じgetPlatformAudienceFaces()（getPlatformStageRect()＋projectAudiencePoint3Dだけを
+  // 使う共通pure helper）を再利用し、Export専用の別geometryは作らない。model.platformsは
+  // buildFormationExportModel側で既に[]へfallback済みの配列（Phase 1Aから追加済みのfieldを
+  // そのまま使うだけで、新しいExport model fieldは追加しない）。Lighting Areaより先
+  // （＝背面）に描くことで、画面側と同じ「高台は舞台構造物、Lightingは光」という重なり方を
+  // 維持する。複数高台はplatform.yの降順（奥から先）で描画する。
+  // 高台 Phase 2D・PART A・B：枠色・線幅は現在の画面側（OverheadAudienceView）に完全に
+  // 追従させる。getPlatformAudienceColors()のfrontStrokeColor/strokeColorはもう枠には
+  // 使わず（fillのfrontFillColor/topFillColorは維持）、舞台本体polygonと同じTHEME.gridLineを
+  // 直接使う（新しい色helperは作らない）。
+  if (model.platforms && model.platforms.length > 0) {
+    const platformAudienceColors = getPlatformAudienceColors(exportFloorColorKey);
+    const sortedPlatforms = [...model.platforms].sort((a, b) => (b.y || 0) - (a.y || 0));
+    sortedPlatforms.forEach((pl) => {
+      const faces = getPlatformAudienceFaces(pl, bounds, model.stage.depth);
+      if (!faces) return;
+      const drawFace = (facePoints, fillColor, strokeColor, lineWidth) => {
+        ctx.beginPath();
+        facePoints.forEach((pt, i) => {
+          const sp = { sx: stageAreaX + fit.offsetX + fit.scale * pt.sx, sy: stageAreaY + fit.offsetY + fit.scale * pt.sy };
+          if (i === 0) ctx.moveTo(sp.sx, sp.sy);
+          else ctx.lineTo(sp.sx, sp.sy);
+        });
+        ctx.closePath();
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = lineWidth;
+        ctx.stroke();
+      };
+      drawFace(faces.front, platformAudienceColors.frontFillColor, THEME.gridLine, 1.2);
+      drawFace(faces.top, platformAudienceColors.topFillColor, THEME.gridLine, 1.0);
+
+      // 高台 Phase 2D・PART C・D・E・F：高台天面グリッド（Export対応）。画面側と全く同じ
+      // getPlatformTopGridSegments()（高台専用の別grid生成ロジックは作らない）で通常舞台
+      // stageGuideから該当部分を切り出し、projectAudiencePoint3D()でz=platform.heightへ
+      // 持ち上げてから、既存のCanvas fit transformを適用する（新しい遠近投影式は作らない）。
+      // 見た目は画面側（THEME.gridLineHalf, opacity 0.5, width 0.6）と同じ値を使う。
+      // 描画順は「高台front/top（すぐ上）→高台天面grid（ここ）→Lighting（このブロックの
+      // 次）」を維持し、Lighting Area/Beamの既存描画順には触れない。
+      const gridSegs = getPlatformTopGridSegments(pl, stageGuide);
+      const drawTopGridLine = (seg) => {
+        const a = projectAudiencePoint3D(bounds, model.stage.depth, seg.x1, seg.y1, pl.height);
+        const b = projectAudiencePoint3D(bounds, model.stage.depth, seg.x2, seg.y2, pl.height);
+        const sa = { sx: stageAreaX + fit.offsetX + fit.scale * a.sx, sy: stageAreaY + fit.offsetY + fit.scale * a.sy };
+        const sb = { sx: stageAreaX + fit.offsetX + fit.scale * b.sx, sy: stageAreaY + fit.offsetY + fit.scale * b.sy };
+        ctx.beginPath();
+        ctx.moveTo(sa.sx, sa.sy);
+        ctx.lineTo(sb.sx, sb.sy);
+        ctx.stroke();
+      };
+      ctx.strokeStyle = THEME.gridLineHalf;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 0.6;
+      gridSegs.vertical.forEach(drawTopGridLine);
+      gridSegs.horizontal.forEach(drawTopGridLine);
+      ctx.globalAlpha = 1;
+    });
+  }
+
   // Lighting Area Export v1・L・M章：出演者・軌跡より先（＝出演者より下のレイヤー）に描く。
   // model.lightingAreasは平面図Exportと全く同じ既にLighting ON/OFF・Scene enabled判定済みの
   // 配列（buildFormationExportModel側で共通に算出）なので、ここでも条件判定は一切行わない。
@@ -9120,19 +9873,22 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
 
   // 照明ビームExport対応・STEP②：俯瞰客席ExportへBeam footprintを追加する。geometryは
   // 平面図Export（STEP①）と全く同じ既存のgetLightingBeamFootprintStagePoints()を再利用し、
-  // 新しいfootprint計算式は作らない。footprintはstage座標を返すpure helperのため、Areaと
-  // 全く同じくこのrenderer既存のproject()（projectAudiencePoint＋Canvas fit変換）へそのまま
-  // 通す。色はlightingAreaColorHex()、opacityはlightingBeamFootprintFillOpacity()を再利用する
-  // （編集画面のfootprint描画・平面図Exportのfootprint描画と同一）。Lighting Areaと同じく
-  // Performerより後ろの固定レイヤーとし、depth sortには参加させない。
+  // 新しいfootprint計算式は作らない（x/y専用のまま変更しない＝高台 Phase 3A・PART N）。
+  // 高台 Phase 3A・PART P：画面（OverheadAudienceView）と同じgetLightingBeamFootprintZ()を
+  // 使い、project3D()（projectAudiencePoint3D＋Canvas fit変換）へ通すことで、高台照射Beamの
+  // footprintもExportで同じ高さへ持ち上がるようにする。Export専用の別surface判定・別target
+  // height計算は作らない。色はlightingAreaColorHex()、opacityはlightingBeamFootprintFillOpacity()
+  // を再利用する（編集画面のfootprint描画・平面図Exportのfootprint描画と同一）。Lighting Areaと
+  // 同じくPerformerより後ろの固定レイヤーとし、depth sortには参加させない。
   if (model.lightingBeams3D && model.lightingBeams3D.length > 0) {
     ctx.save();
     model.lightingBeams3D.forEach((beam) => {
       const footprintPoints = getLightingBeamFootprintStagePoints(beam);
       if (footprintPoints.length === 0) return;
+      const footprintZ = getLightingBeamFootprintZ(beam);
       ctx.beginPath();
       footprintPoints.forEach((p, i) => {
-        const sp = project(p.x, p.y);
+        const sp = project3D(p.x, p.y, footprintZ);
         if (i === 0) ctx.moveTo(sp.sx, sp.sy);
         else ctx.lineTo(sp.sx, sp.sy);
       });
@@ -9299,10 +10055,25 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   }
 
   // Performer item化：STEP②.5のsorted生成をそのまま使い、単独sortはせずitem化だけ行う。
-  const performerItems = visiblePerformers
-    .map((p) => ({ p, pos: model.placements[p.id] }))
-    .filter((v) => !!v.pos)
+  // 高台 Phase 2D・PART G・O：画面側のOverheadAudienceViewと全く同じ意味論で、「通常舞台として
+  // 高台の下にいる」出演者（isPlacementUnderPlatform）と、「待機表示ON時に高台の後ろへ隠れる
+  // 舞台奥待機の出演者」（isBackstagePlacementOccludedByPlatform）を、depth統合の対象へ入れる
+  // 前のこの1箇所で除外する。新しい高台下判定・別の遮蔽ロジックは作らず、画面側のPhase 2C/2Dと
+  // 完全に同じ2つのpure helperをそのまま再利用する。beamItems側・depthMergedItemsのsort/
+  // tie-break（すぐ下）には一切手を加えない。showWaitingAreas===falseの場合はそもそも
+  // isPerformerVisibleForExport()により舞台奥出演者がvisiblePerformersへ入らないため、
+  // 既存挙動は変わらない（PART M）。
+  // 高台 Phase 2D.1・PART I：袖（stageLeft/stageRight）で高台横に紛らわしく見える出演者
+  // （isWingPlacementOccludedByPlatform）も、画面側と全く同じpure helperをそのまま使って
+  // 同じ位置で除外する（Export専用の別ロジックは作らない）。
+  // 高台 Phase 2E・PART P：画面側と同じくisPlacementOccludedByPlatform()（3helperをまとめた
+  // だけの判定）を唯一の判定元として、通常出演者（performerItems→depth統合）と遮蔽出演者
+  // （occludedPerformerEntries→ghost専用）を分離する。
+  const audiencePerformerEntries = visiblePerformers.map((p) => ({ p, pos: model.placements[p.id] })).filter((v) => !!v.pos);
+  const performerItems = audiencePerformerEntries
+    .filter((v) => !isPlacementOccludedByPlatform(v.pos, model.platforms))
     .map((v) => ({ kind: "performer", key: v.p.id, depthY: v.pos.y, p: v.p, pos: v.pos }));
+  const occludedPerformerEntries = audiencePerformerEntries.filter((v) => isPlacementOccludedByPlatform(v.pos, model.platforms));
 
   // 編集画面のdepthMergedItemsと全く同じ比較関数（同ファイル7162〜7169行目）。
   // 奥（depthYが大きい）ほど先に描画し、同depth（差がTIE_BREAK_EPSILON以下）の場合は
@@ -9341,8 +10112,12 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
     // Performer：本体＋番号はdrawExportPerformerAudience()内部で連続して描画される
     // （既存構造。STEP②.5のstyleは一切変更していない）。番号だけを後でまとめて
     // 描画する構造にはしない（9章：奥の人物の番号が手前を貫通しないようにするため）。
+    // 高台 Phase 2A・11章：画面側と全く同じresolvePlacementSurfaceHeight()を使い、
+    // 高台上出演者をplatform.height分だけ持ち上げる。model.placements内のsurfaceIdを
+    // そのまま使うだけで、新しいExport model fieldは追加しない。
     const { p, pos } = item;
-    const { sx, sy, scale } = project(pos.x, pos.y);
+    const surfaceHeight = resolvePlacementSurfaceHeight(pos, model.platforms);
+    const { sx, sy, scale } = project3D(pos.x, pos.y, surfaceHeight);
     const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
     const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
     ctx.globalAlpha = 1;
@@ -9352,6 +10127,21 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   ctx.restore();
 
   ctx.restore();
+
+  // 高台 Phase 2E・PART I・Q：高台裏ゴースト表示レイヤー。showOccludedPerformerGhosts
+  // （defaultはfalse＝完全非表示、従来のPhase 2D.1fと完全に同じ見え方を維持）がtrueの時だけ、
+  // occludedPerformerEntries（isPlacementOccludedByPlatform()で判定した遮蔽対象）を薄い
+  // 点線シルエット＋番号で描画する。通常出演者（depthMergedItems・Beam depth統合）より後に
+  // 描画するだけの単純な追加レイヤーとし、Beamのdepth統合には一切加えない。
+  if (showOccludedPerformerGhosts && occludedPerformerEntries.length > 0) {
+    occludedPerformerEntries.forEach(({ p, pos }) => {
+      const surfaceHeight = resolvePlacementSurfaceHeight(pos, model.platforms);
+      const { sx, sy, scale } = project3D(pos.x, pos.y, surfaceHeight);
+      const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
+      const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
+      drawExportPerformerGhost(ctx, sx, sy, heightPx, p, getPlacementPose(pos), refHeightPx);
+    });
+  }
 }
 
 // 俯瞰客席PNG用、出演者1人分の人型シルエット＋胸の番号をCanvasへ描く。FrontFigure（SVG版）と
@@ -9388,6 +10178,92 @@ function drawExportPerformerAudience(ctx, sx, sy, heightPx, performer, pose, ref
   ctx.lineJoin = "round";
   ctx.strokeText(String(performer.number), sx, tagY);
   ctx.fillStyle = "#ffffff";
+  ctx.fillText(String(performer.number), sx, tagY);
+  ctx.restore();
+}
+
+// 高台 Phase 2E・PART Q・R：Audience Export用のghost描画（Canvas 2D）。画面側のGhostFigure
+// （SVG）と同じジオメトリ・比率・opacity・破線表現を、drawExportPerformerAudience()が
+// FrontFigureの数値をCanvas APIへ再現しているのと同じ考え方で対応させる（PDF専用のghost
+// 描画は作らない＝PNG/ZIP/PDFすべてがこの1つの関数だけを通る＝PART R）。塗りは持たず、
+// 輪郭はすべて点線・低opacityの単色（本人色）。ctx.save()/restore()で必ず囲み、
+// setLineDash・globalAlphaが後続描画へ漏れないようにする。
+function drawExportPerformerGhost(ctx, sx, sy, heightPx, performer, pose, refHeightPx) {
+  const H = heightPx;
+  if (!(H > 0)) return;
+  const R = refHeightPx != null ? refHeightPx : heightPx;
+  const color = performer.color || THEME.textDim;
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.globalAlpha = 0.32;
+  ctx.setLineDash([4, 3]);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  if (pose === POSE_KNEELING) {
+    const { headR, headCy, shoulderY, hipY, torsoW, hipXLong, hipXShort, shortLegEndY, diagEndX, diagEndY } = computeKneelingFigureGeometry(
+      H,
+      R
+    );
+    ctx.beginPath();
+    ctx.moveTo(hipXLong, hipY);
+    ctx.lineTo(hipXLong, 0);
+    ctx.moveTo(hipXShort, hipY);
+    ctx.lineTo(hipXShort, shortLegEndY);
+    ctx.lineTo(diagEndX, diagEndY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-torsoW, shoulderY);
+    ctx.lineTo(torsoW, shoulderY);
+    ctx.lineTo(torsoW * 0.8, hipY);
+    ctx.lineTo(-torsoW * 0.8, hipY);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, headCy, headR, 0, Math.PI * 2);
+    ctx.stroke();
+  } else {
+    const headR = R * FIGURE_HEAD_R_RATIO;
+    const headCy = -H + headR;
+    const shoulderY = -H * 0.84;
+    const hipY = -H * 0.46;
+    const torsoW = R * FIGURE_TORSO_W_RATIO;
+    const legGap = R * FIGURE_LEG_GAP_RATIO;
+    ctx.beginPath();
+    ctx.moveTo(-legGap, hipY);
+    ctx.lineTo(-legGap, 0);
+    ctx.moveTo(legGap, hipY);
+    ctx.lineTo(legGap, 0);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-torsoW, shoulderY);
+    ctx.lineTo(torsoW, shoulderY);
+    ctx.lineTo(torsoW * 0.8, hipY);
+    ctx.lineTo(-torsoW * 0.8, hipY);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, headCy, headR, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // 番号：名前は表示せず、番号だけを本人色・低opacityで表示する（PART H）。位置・幅は
+  // 通常出演者と全く同じfrontFigureChestMetrics()/performerNumberFontSizeAudience()を
+  // 再利用し、二重実装しない。
+  const { tagOffsetY, chestWidth } = frontFigureChestMetrics(H, pose, R);
+  const fontSize = performerNumberFontSizeAudience(chestWidth, performer.number);
+  const tagY = sy + tagOffsetY;
+  ctx.save();
+  ctx.globalAlpha = 0.35;
+  ctx.font = `bold ${fontSize}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
   ctx.fillText(String(performer.number), sx, tagY);
   ctx.restore();
 }
@@ -9725,6 +10601,62 @@ function projectAudiencePoint3D(bounds, stageDepth, xUnits, yUnits, zUnits) {
   return { ...base, sy: base.sy - liftPx };
 }
 
+// ------------------------------------------------------------------
+// 高台 Phase 1B：俯瞰客席ビューでの高さ表現
+// ------------------------------------------------------------------
+// 高台の天面・客席側垂直面を、既存のgetPlatformStageRect()（TopView/Exportと共通の矩形計算）と
+// projectAudiencePoint3D()（既存の3D→俯瞰画面座標の投影、新しい投影式は作らない）だけで
+// 画面座標polygonへ変換する共通pure helper。OverheadAudienceView（画面）と
+// renderAudienceFormationExport（Export）の両方がこの関数を呼ぶことで、3D geometryの
+// 計算式を2箇所に重複実装しない（getPlatformStageRect()がTopView/Exportで果たしている役割の
+// 俯瞰客席ビュー版）。
+// 左右側面・出演者のsurfaceId・Lighting/Beamとの物理遮蔽はPhase 1Bのスコープ外のため、
+// ここでは天面と客席側面（yMin側）の2面だけを返す。
+// 返り値の各pointは、既存projectAudiencePoint3D()の結果（{sx, sy, scale, opacity}）そのもの。
+function getPlatformAudienceFaces(platform, bounds, stageDepth) {
+  const rect = getPlatformStageRect(platform);
+  if (!rect || !bounds) return null;
+  const height = platform && Number.isFinite(platform.height) ? platform.height : 0;
+  const p = (x, y, z) => projectAudiencePoint3D(bounds, stageDepth, x, y, z);
+  // 天面：A(xMin,yMin,h) B(xMax,yMin,h) C(xMax,yMax,h) D(xMin,yMax,h)。
+  const top = [
+    p(rect.xMin, rect.yMin, height), // A
+    p(rect.xMax, rect.yMin, height), // B
+    p(rect.xMax, rect.yMax, height), // C
+    p(rect.xMin, rect.yMax, height), // D
+  ];
+  // 客席側垂直面：客席側＝stage座標のyMin側（4章：TopViewと同じ意味論）。
+  // E(xMin,yMin,0) → F(xMax,yMin,0) → B(xMax,yMin,h) → A(xMin,yMin,h) の順。
+  // B・Aは天面と全く同じ投影結果（top[1]・top[0]）をそのまま使い、共有する辺の座標が
+  // 二重計算によってズレないようにする。
+  const front = [
+    p(rect.xMin, rect.yMin, 0), // E
+    p(rect.xMax, rect.yMin, 0), // F
+    top[1], // B
+    top[0], // A
+  ];
+  return { top, front };
+}
+
+// 高台 Phase 2C・PART B：高台天面グリッド用のgeometry helper。新しい独立したグリッド体系は
+// 作らず、既存のbuildAudienceStageGuideGeometry()が返すstageGuide.gridVertical/
+// gridHorizontal（通常舞台面のグリッド線分）から、高台矩形（getPlatformStageRect()）に
+// 該当する部分だけを切り出すだけの純粋関数。切り出した線分は、高台の矩形の端
+// （yMin〜yMax／xMin〜xMax）で打ち切った形にする。投影（z=platform.heightへの持ち上げ）は
+// 呼び出し側（OverheadAudienceView）でprojectAudiencePoint3D()を使って行う（ここではまだ
+// stage座標のままで返す）。
+function getPlatformTopGridSegments(platform, stageGuide) {
+  const rect = getPlatformStageRect(platform);
+  if (!rect || !stageGuide) return { vertical: [], horizontal: [] };
+  const vertical = (stageGuide.gridVertical || [])
+    .filter((seg) => seg.x1 >= rect.xMin && seg.x1 <= rect.xMax)
+    .map((seg) => ({ x1: seg.x1, y1: rect.yMin, x2: seg.x1, y2: rect.yMax }));
+  const horizontal = (stageGuide.gridHorizontal || [])
+    .filter((seg) => seg.y1 >= rect.yMin && seg.y1 <= rect.yMax)
+    .map((seg) => ({ x1: rect.xMin, y1: seg.y1, x2: rect.xMax, y2: seg.y1 }));
+  return { vertical, horizontal };
+}
+
 // 旧「3Dビーム試作」（LIGHTING_BEAM_3D_PROTOTYPE・getLightingBeam3DPrototypeScreenPolygon）は
 // 正式版「3D照明ビーム」が実用化されたため、Lighting UI整理・Prototype卒業により削除した。
 // projectAudiencePoint3D()（すぐ上）は、正式版のgetLightingBeam3DScreenPolygon()が
@@ -10014,6 +10946,13 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     height,
     locked,
     transitionPaths,
+    // 高台 Phase 1B：表示専用（読み取り専用）の高台一覧。TopViewと同じく未指定時は既存
+    // Projectと同じ見た目になるよう空配列にフォールバックする。
+    platforms = [],
+    // 高台 Phase 2E・PART D：俯瞰客席ビュー専用のUI state（work/Project/localStorage/
+    // Backupには保存しない）。未指定時はfalse＝完全非表示にフォールバックし、Phase 2D.1fと
+    // 完全に同じ見え方を維持する。TopViewには渡さない。
+    showOccludedPerformerGhosts = false,
     // Lighting v0・K章：Projectごとの舞台外観（床色）。TopViewと同じフォールバック方針。
     floorColorKey = "black",
     // Lighting UI整理 v1・H章：俯瞰客席ビューの「舞台の周囲・背景」に反映する壁・背景色。
@@ -10139,16 +11078,47 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   );
 
   // 奥の人から先に描画（手前の人が上に重なる）。選択中は（複数でも）必ず最前面に描画する。
+  // 高台 Phase 2C・PART H・I・J：「通常舞台として高台の下にいる」出演者（isPlacementUnderPlatform、
+  // PART I）は、俯瞰客席ビューでは常に描画対象から除外する。ここでrestSorted/selectedSorted/
+  // depthMergedItemsへ入る前に取り除くことで、Beamのdepth統合ロジック（lightingBeam3DSlices・
+  // depthMergedItemsのsort/tie-break）には一切手を加えずに済む（PART J：本体・番号を
+  // セットで消すため、個別のrender関数側でのnullチェックではなく、この元データの時点で
+  // 取り除く）。再生中かどうか（Formation静止編集・keep・Transition・scrub・連続Playbackの
+  // いずれでも）は判定条件に入れない（PART H：客席から見える状態を表現するビューという
+  // 位置づけのため）。TopView側のvisiblePerformers/出演者filterには今回一切追加しない
+  // （PART K：TopViewは物理配置を編集するビューのため、高台下でも常に表示・編集できる）。
+  // 高台 Phase 2D・PART H・L：「待機中の出演者も表示」ON時、高台の後ろに隠れる舞台奥待機の
+  // 出演者（isBackstagePlacementOccludedByPlatform）も同じ入口で除外する。下手袖・上手袖
+  // （stageLeft/stageRight）は対象外（PART N、helper内でarea==="upstageBackstage"のみに
+  // 限定済み）。待機表示OFF時はそもそも舞台奥出演者がvisiblePerformersへ入らないため、
+  // 既存仕様（PART M）は変わらない。
+  // 高台 Phase 2D.1・PART H：袖（stageLeft/stageRight）で、高台の横端すぐ外・奥側にいる
+  // ことで前後関係が紛らわしくなる出演者（isWingPlacementOccludedByPlatform）も同じ入口で
+  // 除外する。isBackstagePlacementOccludedByPlatform()自体は変更しない（対象・条件が別）。
+  // 高台 Phase 2E・PART A・E：通常出演者と遮蔽出演者の分離元となる共通entries。
+  // isPlacementOccludedByPlatform()（3つの既存遮蔽helperをまとめただけの判定）を唯一の
+  // 判定元とし、新しい遮蔽判定ロジックは作らない。
+  const audiencePerformerEntries = useMemo(
+    () =>
+      visiblePerformers.map((p) => ({ p, pos: placements[p.id] })).filter((v) => !!v.pos),
+    [visiblePerformers, placements]
+  );
   const sorted = useMemo(() => {
-    const arr = visiblePerformers
-      .map((p) => ({ p, pos: placements[p.id] }))
-      .filter((v) => !!v.pos)
+    const arr = audiencePerformerEntries
+      .filter((v) => !isPlacementOccludedByPlatform(v.pos, platforms))
       .sort((a, b) => b.pos.y - a.pos.y);
     const rest = [];
     const selected = [];
     arr.forEach((v) => (selectedIdSet.has(v.p.id) ? selected.push(v) : rest.push(v)));
     return [...rest, ...selected];
-  }, [visiblePerformers, placements, selectedIdSet]);
+  }, [audiencePerformerEntries, selectedIdSet, platforms]);
+  // 高台 Phase 2E・PART E・I：遮蔽対象（isPlacementOccludedByPlatform()がtrueを返す出演者）を
+  // ghost表示用に別配列として保持する。通常出演者（sorted）のsort/select分離やBeam depth統合
+  // には一切混ぜない（PART F・V：ghostはdepth統合の対象外）。
+  const occludedSorted = useMemo(
+    () => audiencePerformerEntries.filter((v) => isPlacementOccludedByPlatform(v.pos, platforms)),
+    [audiencePerformerEntries, platforms]
+  );
 
   // 俯瞰客席ビュー・Beam-Performer depth統合 v1・I章：選択中Performerは既存仕様どおり
   // 常に最前面へ描画する（＝depth比較の対象に含めない）ため、`sorted`（既に「非選択→選択」の
@@ -10221,7 +11191,12 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   // Beamが人物の前に出る）がより明確に見えるかどうかを比較検証する（G章：Beam側のdepth
   // sort・tie-breakロジック自体には触れていない）。
   const renderPerformerBody = (p, pos) => {
-    const { sx, sy, scale } = project(pos.x, pos.y);
+    // 高台 Phase 2A・9章：出演者の足元の舞台面の高さ（resolvePlacementSurfaceHeight）を
+    // 既存projectAudiencePoint3D()のz引数へそのまま渡すだけで、高台上の出演者を
+    // platform.height分だけ持ち上げて表示する。新しい投影式は作らない。performer.height
+    // （出演者自身の身長）とは完全に別の値のため、heightPx計算（下記）には一切混ぜない。
+    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
     // 出演者表示サイズ v1.1・PART E：俯瞰客席ビューは「身長 小・中・大」だけで人物サイズ・
     // 身長差を表現する設計のため、performerDisplayScale（平面図専用の表示設定）は
     // ここでは一切参照しない（v1で誤って反映していた掛け算を撤去した）。
@@ -10261,7 +11236,10 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   // 文言・stroke・pointerEvents="none"など見た目に関わる部分は一切変更していない
   // （G章：番号の見た目自体は変えない。変えるのは呼び出す場所＝描画順だけ）。
   const renderOverheadPerformerLabel = (p, pos) => {
-    const { sx, sy, scale } = project(pos.x, pos.y);
+    // 高台 Phase 2A・9章：本体（renderPerformerBody）と全く同じsurface高さ・投影方式を
+    // 使う。出演者の身体と名前表示が異なる高さにならないようにする（10章）。
+    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
     const heightPx = p.height * scale * sizeComp;
     const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
     const pose = getPlacementPose(pos);
@@ -10292,6 +11270,41 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
       >
         {p.number}
       </text>
+    );
+  };
+
+  // 高台 Phase 2E・PART G・H・J：ghost専用の描画関数。renderPerformerBody/
+  // renderOverheadPerformerLabelとは完全に別関数とし（既存の通常出演者描画は分岐を増やさず
+  // 一切変更しない＝PART F）、本体（GhostFigure）と番号を1つの<g>にまとめて返す。
+  // surface高さ・投影方式は通常出演者と全く同じprojectAudiencePoint3D()をそのまま再利用し、
+  // 新しい投影式は作らない。名前は表示せず、選択強調も行わず、pointerEvents="none"で
+  // クリック選択対象にもしない（PART J：TopViewで編集できるためAudience側からの編集は不要）。
+  const renderOccludedPerformerGhost = (p, pos) => {
+    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
+    const heightPx = p.height * scale * sizeComp;
+    const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
+    const pose = getPlacementPose(pos);
+    const { tagOffsetY, chestWidth } = frontFigureChestMetrics(heightPx, pose, refHeightPx);
+    const fontSize = performerNumberFontSizeAudience(chestWidth, p.number);
+    return (
+      <g key={`ghost-${p.id}`} transform={`translate(${sx} ${sy})`} pointerEvents="none" aria-hidden="true">
+        <GhostFigure color={p.color} heightPx={heightPx} pose={pose} refHeightPx={refHeightPx} />
+        <text
+          x={0}
+          y={tagOffsetY}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={fontSize}
+          fontWeight="bold"
+          fill={p.color}
+          opacity={0.35}
+          pointerEvents="none"
+          style={{ userSelect: "none", WebkitUserSelect: "none" }}
+        >
+          {p.number}
+        </text>
+      </g>
     );
   };
 
@@ -10507,6 +11520,102 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
           />
         </g>
 
+        {/* 高台 Phase 1B：俯瞰客席ビューでの高さ表現。高台は舞台構造物のため、Lighting Area
+            （光）より必ず背面（＝このブロックより後に描画される）になる位置に置く。天面・
+            客席側垂直面の2面だけを描く最小構成で、左右側面・出演者のsurfaceId・Beamとの
+            物理遮蔽はPhase 1Bのスコープ外（調査報告I・Jの通り）。矩形geometryは
+            getPlatformStageRect()（TopView/Exportと共通）、3D投影はgetPlatformAudienceFaces()
+            （新規・既存projectAudiencePoint3Dだけを使う）で計算し、新しい投影式は作らない。
+            複数高台は「platform.yの降順＝奥から先に描画」という、既存depthMergedItemsと
+            同じ考え方で並べる（height順・screen Y順の複雑な比較は行わない）。ドラッグ・
+            リサイズ・クリック選択の対象にはしないため、pointerEvents="none"にする。 */}
+        {platforms.length > 0 &&
+          (() => {
+            const platformAudienceColors = getPlatformAudienceColors(floorColorKey);
+            const sortedPlatforms = [...platforms].sort((a, b) => (b.y || 0) - (a.y || 0));
+            return (
+              <g pointerEvents="none" aria-hidden="true">
+                {sortedPlatforms.map((pl) => {
+                  const faces = getPlatformAudienceFaces(pl, bounds, stage.depth);
+                  if (!faces) return null;
+                  const topPoints = faces.top.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
+                  const frontPoints = faces.front.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
+                  return (
+                    <g key={pl.id}>
+                      <polygon
+                        points={frontPoints}
+                        fill={platformAudienceColors.frontFillColor}
+                        stroke={THEME.gridLine}
+                        strokeWidth={1.2}
+                      />
+                      <polygon
+                        points={topPoints}
+                        fill={platformAudienceColors.topFillColor}
+                        stroke={THEME.gridLine}
+                        strokeWidth={1.0}
+                      />
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })()}
+
+        {/* 高台 Phase 2C・PART B：高台天面グリッド。新しい独立したグリッド体系は作らず、
+            既存stageGuide（buildAudienceStageGuideGeometryの結果、すぐ上の舞台本体グリッドと
+            全く同じデータ）をgetPlatformTopGridSegments()で高台矩形内だけ切り出し、
+            z=platform.heightへ持ち上げてprojectAudiencePoint3D()で投影する（新しい投影式は
+            作らない）。描画順は「高台front/top→高台天面グリッド→Lighting」で固定し、
+            高台topの塗りに一度隠れた舞台グリッドが、持ち上げられた位置に再び現れるように
+            見せる。出演者・高台枠より目立たない細い線にするため、舞台本体グリッド
+            （THEME.gridLineHalf, opacity 0.7, width 0.8）よりさらに控えめなopacity/widthに
+            する（新しい色テーマは作らない）。 */}
+        {platforms.length > 0 && (
+          <g pointerEvents="none" aria-hidden="true">
+            {platforms.map((pl) => {
+              const gridSegs = getPlatformTopGridSegments(pl, stageGuide);
+              const toScreenSeg = (seg) => ({
+                a: projectAudiencePoint3D(bounds, stage.depth, seg.x1, seg.y1, pl.height),
+                b: projectAudiencePoint3D(bounds, stage.depth, seg.x2, seg.y2, pl.height),
+              });
+              return (
+                <g key={pl.id}>
+                  {gridSegs.vertical.map((seg, i) => {
+                    const { a, b } = toScreenSeg(seg);
+                    return (
+                      <line
+                        key={`ptgv-${pl.id}-${i}`}
+                        x1={a.sx}
+                        y1={a.sy}
+                        x2={b.sx}
+                        y2={b.sy}
+                        stroke={THEME.gridLineHalf}
+                        strokeOpacity={0.5}
+                        strokeWidth={0.6}
+                      />
+                    );
+                  })}
+                  {gridSegs.horizontal.map((seg, i) => {
+                    const { a, b } = toScreenSeg(seg);
+                    return (
+                      <line
+                        key={`ptgh-${pl.id}-${i}`}
+                        x1={a.sx}
+                        y1={a.sy}
+                        x2={b.sx}
+                        y2={b.sy}
+                        stroke={THEME.gridLineHalf}
+                        strokeOpacity={0.5}
+                        strokeWidth={0.6}
+                      />
+                    );
+                  })}
+                </g>
+              );
+            })}
+          </g>
+        )}
+
         {/* Lighting Area v1・W章：照明Areaレイヤー（表示専用。編集・ドラッグ・選択は平面図のみ
             ＝C章）。Areaの舞台座標上の頂点（getLightingAreaStagePoints、TopViewと共通のpure
             helper＝X章）を、既存のproject()（projectAudiencePoint）へそのまま通すことで、
@@ -10539,15 +11648,24 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             として、trajectory・Beam/Performerのdepth統合レイヤーより前（＝奥）に描く。これに
             より、footprintは常にPerformerより後ろに表示される（N章：人物より必ず後ろ）。
             舞台座標上のpoints（getLightingBeamFootprintStagePoints、TopViewと共通のpure
-            helper＝J章）を、既存のproject()（projectAudiencePoint）へそのまま通すだけで、
-            新しい3D投影式は作らない（L章）。Beam本体・Beam/Performerのdepth sortには一切
-            触れていない（N章）。 */}
+            helper＝J章）自体はx/y専用のまま変更しない（高台 Phase 3A・PART N：新しい物理
+            交差計算は作らない）。高台 Phase 3A・PART O：各点をprojectAudiencePoint3D()で
+            「そのBeamのfootprint高さ」（getLightingBeamFootprintZ()、通常は0、高台照射なら
+            platform.height）へ持ち上げて投影することで、「高台に光が乗っている」ように
+            見せる。beam.target.zは既にresolveLightingBeams3DForDisplay()経由でtargetSurfaceId
+            分だけ解決済みのため、ここではtargetSurfaceIdを直接見ない。Beam本体・
+            Beam/Performerのdepth sortには一切触れていない（N章）。platformによる物理遮蔽・
+            clippingは今回行わない（PART O）。 */}
         {showLightingBeams3D && (
           <g pointerEvents="none" style={{ userSelect: "none", WebkitUserSelect: "none" }}>
             {lightingBeams3D.map((beam) => {
               const footprintPoints = getLightingBeamFootprintStagePoints(beam);
               if (footprintPoints.length === 0) return null;
-              const pointsAttr = footprintPoints.map((p) => project(p.x, p.y)).map((sp) => `${sp.sx},${sp.sy}`).join(" ");
+              const footprintZ = getLightingBeamFootprintZ(beam);
+              const pointsAttr = footprintPoints
+                .map((p) => projectAudiencePoint3D(bounds, stage.depth, p.x, p.y, footprintZ))
+                .map((sp) => `${sp.sx},${sp.sy}`)
+                .join(" ");
               const fillColor = lightingAreaColorHex(beam.color);
               return (
                 <polygon
@@ -10666,6 +11784,17 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             番号専用の保存stateは不要＝既存のselectedIdSetのみで判定できる）。 */}
         {selectedSorted.map(({ p, pos }) => renderPerformerBody(p, pos))}
         {selectedSorted.map(({ p, pos }) => renderOverheadPerformerLabel(p, pos))}
+
+        {/* 高台 Phase 2E・PART I・J：高台裏ゴースト表示レイヤー。showOccludedPerformerGhosts
+            （defaultはfalse＝完全非表示、現在のPhase 2D.1fと完全に同じ見え方を維持）がtrueの
+            時だけ、occludedSorted（isPlacementOccludedByPlatform()で判定した遮蔽対象）を
+            薄い点線シルエット＋番号で描画する。通常出演者（restSorted/selectedSorted・
+            depthMergedItems・Beam depth統合）より後に描画するだけの単純な追加レイヤーとし、
+            Beamのdepth統合には一切加えない（ghostは「客席から見える実体」ではなく舞台裏
+            情報を示す補助オーバーレイのため）。pointerEvents="none"でクリック選択対象にも
+            しない（PART J：TopViewで編集できるためAudience側からの選択操作は不要）。 */}
+        {showOccludedPerformerGhosts &&
+          occludedSorted.map(({ p, pos }) => renderOccludedPerformerGhost(p, pos))}
       </g>
     </svg>
   );
@@ -10788,6 +11917,11 @@ export default function App() {
     transitionPoses,
   } = work;
 
+  // 高台 Phase 1A：work.platformsを常にgetPlatforms()経由で読み出す（旧Projectは[]へ
+  // フォールバック済み）。destructuringで直接work.platformsを取り出さないのは、
+  // 古いworkにこのfieldが存在しないケースをこの1箇所のヘルパーだけに集約するため。
+  const platforms = getPlatforms(work);
+
   // このプロジェクトの実際のBPM。work.projectが無い（BPM機能実装前の古いデータ）場合や
   // project.bpmが数値でない場合はDEFAULT_BPMへfallbackする（getProjectBpm参照）。
   // 再生計算（countsToDurationMs）には、以降このprojectBpmだけを渡し、DEFAULT_BPMを
@@ -10843,6 +11977,10 @@ export default function App() {
   const [showBackstage, setShowBackstage] = useState(true);
   // 俯瞰客席ビューで待機中の出演者も表示するかどうか
   const [showWaitingInOverhead, setShowWaitingInOverhead] = useState(false);
+  // 高台 Phase 2E・2E.1・PART A：俯瞰客席ビュー専用の「高台裏をゴースト表示」チェック。
+  // work/Project/slides/localStorage/Backupには一切保存しない、UndoRedo対象外の画面表示専用
+  // state。Phase 2E.1でdefaultをfalse→trueへ変更（実機確認の結果、常時ONの方が自然だったため）。
+  const [showOccludedPerformerGhosts, setShowOccludedPerformerGhosts] = useState(true);
   // Lighting v0・M章：「Lighting表示ON/OFF」は作品データではなく一時的なUI state。
   // Lighting機能そのもののON/OFF（work.project.lightingEnabled）とは別物で、
   // 「照明データは残すが舞台上の照明表示だけ一時的に消す」ためのもの。今回はまだArea/Beamを
@@ -10974,6 +12112,9 @@ export default function App() {
   // 残り続けるため、再度開いたときに閉じる前の開閉状態へ自然に戻る（追加のuseEffect等は不要）。
   // 初期状態は既存ユーザーの見え方を急激に変えないよう、両方openにしてある。
   const [stageSettingsOpen, setStageSettingsOpen] = useState(true);
+  // 高台 Phase 1A・10-3章：「▶ 高台・段差」の開閉状態。stageSettingsOpen等と全く同じ方針
+  // （work対象外・UI専用state）。要件通り初期状態は閉じる。
+  const [platformsSectionOpen, setPlatformsSectionOpen] = useState(false);
   const [musicSettingsOpen, setMusicSettingsOpen] = useState(true);
   // Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層の独立グループとして
   // 「照明の設定」を新設する。開閉状態の管理方法は既存2グループと完全に同じ（work対象外・
@@ -12823,7 +13964,7 @@ export default function App() {
     // （getTransitionPosesForSlideで安全に取得、未設定performerはfallbackでresolveTransitionPose
     // 側が従来通り開始側poseを使う）。再生機能自体の他の部分は変更しない。
     const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, fromSlide.id);
-    return interpolatePlacementsWithPaths(fromSlide.placements, toSlide.placements, animationState.progress, pathConfig, transitionPoseConfig);
+    return interpolatePlacementsWithPaths(fromSlide.placements, toSlide.placements, animationState.progress, pathConfig, transitionPoseConfig, platforms, zones);
   }, [
     isAnimationRunning,
     animationState.phase,
@@ -12834,6 +13975,8 @@ export default function App() {
     placements,
     effectiveTransitionPathConfig,
     transitionPoses,
+    platforms,
+    zones,
   ]);
 
   // スクラバーの対象は常に「現在の構成→次の構成」のmoveフェーズで固定する。移動軌跡の
@@ -12890,7 +14033,7 @@ export default function App() {
     // 移動時の姿勢v1：構成間移動スクラバーでも同じtransitionPosesを反映する
     // （直線・曲線どちらもresolveTransitionPose経由で同じ判定になる）。
     const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, currentSlide.id);
-    return interpolatePlacementsWithPaths(currentSlide.placements, nextSlide.placements, scrubProgress, pathConfig, transitionPoseConfig);
+    return interpolatePlacementsWithPaths(currentSlide.placements, nextSlide.placements, scrubProgress, pathConfig, transitionPoseConfig, platforms, zones);
   }, [
     isAnimationRunning,
     isKeepPhase,
@@ -12902,6 +14045,8 @@ export default function App() {
     effectiveTransitionPathConfig,
     displayPlacements,
     transitionPoses,
+    platforms,
+    zones,
   ]);
 
   // Lighting Beam 3D 追尾 v1・8・15・16章：Top View / Audience Viewへ渡す直前に、既存の
@@ -12910,7 +14055,7 @@ export default function App() {
   // 解決する。Formation A/B・transition progressから新しい補間計算は一切作らず、出演者表示に
   // 既に使われているこの値をそのまま再利用するだけ（8章）。resolveLightingBeam3DTarget()の
   // 判定を1箇所に集約するため、Top View用・Audience View用で別々に解決しない（14章）。
-  const effectiveLightingBeams3DForDisplay = resolveLightingBeams3DForDisplay(effectiveLightingBeams3D, displayPlacementsWithScrub);
+  const effectiveLightingBeams3DForDisplay = resolveLightingBeams3DForDisplay(effectiveLightingBeams3D, displayPlacementsWithScrub, platforms);
 
   // CompositionBarに渡す再生状況ラベル。単体/連続・move/keepフェーズの文字列組み立てをここに
   // 集約し、CompositionBar側は「もらった内容をそのまま表示する（nullならidle時の通常表示に
@@ -14209,6 +15354,12 @@ export default function App() {
   // 独立させる。実際に描画へ反映するのはrenderTopFormationExportのみで、俯瞰客席ビュー側の
   // renderAudienceFormationExportへは常に渡さない（9・14章：常に名前非表示という確定仕様）。
   const [exportShowPerformerNames, setExportShowPerformerNames] = useState(false);
+  // 高台 Phase 2E・2E.1・PART C・L：Export Center専用の「高台裏をゴースト表示」設定。
+  // exportShowPerformerNames等と全く同じ考え方（work/Project/slides/Backup/localStorageには
+  // 一切保存しない、Undo/Redo対象外のExport専用UI state）。default OFF（編集画面側は
+  // Phase 2E.1でdefault trueへ変更したが、Export側はfalseのまま維持）。俯瞰客席ビュー出力時
+  // だけ意味を持つ（平面図出力時はUI自体を非表示にする）。
+  const [exportShowOccludedPerformerGhosts, setExportShowOccludedPerformerGhosts] = useState(false);
   // P-03 第一段階「選択出演者を強調して出力」・2章：Export Center専用の「選択中の出演者を
   // 強調して出力」チェックボックス。exportShowPerformerNames等と全く同じ考え方（work/Project
   // schema/localStorage/Backup/Undo/Redoには一切保存しないExport専用UI state）。初期値OFF。
@@ -14525,6 +15676,9 @@ export default function App() {
           showTrajectory: exportShowTrajectory,
           trajectoryMode: exportTrajectoryMode,
           showLightingTrackingPaths: exportShowLightingTrackingPaths,
+          // 高台 Phase 2E.2・PART E：通常Formation Exportや編集画面ですでに使っている
+          // 現在Projectのplatformsをそのまま渡す（新しいgetPlatforms()呼び出しは作らない）。
+          platforms,
         });
         if (models.length === 0) {
           setPngExportError("出力対象の照明キューが見つかりませんでした。");
@@ -14540,6 +15694,9 @@ export default function App() {
           showWaitingAreas: exportShowWaitingAreas,
           showPerformerNames: exportShowPerformerNames,
           displayScale: exportDisplayScale,
+          // 高台 Phase 2E・PART N：Lighting Cue Export側でも通常Formation Export側と同じ
+          // optionを渡す（renderFormationExportToCanvas側で"audience"の時だけ使われる）。
+          showOccludedPerformerGhosts: exportShowOccludedPerformerGhosts,
         };
         if (exportFormat === "pdf") {
           // 17・30章：既存PDF出力（pdf-lib）を1Cue=1ページとしてそのまま再利用する。
@@ -14703,6 +15860,8 @@ export default function App() {
         // ここで判定する。disabled状態でONが残っていても、1人選択でなければ常にnullとなり
         // 強調は適用されない（安全側）。この判定ロジックを別の場所で二重実装しない。
         highlightedPerformerId: exportHighlightSelectedPerformer && selectedIds.length === 1 ? selectedIds[0] : null,
+        // 高台 Phase 1A・10-7章：通常Formation Exportの俯瞰図にも高台を反映する。
+        platforms,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");
@@ -14717,6 +15876,9 @@ export default function App() {
         // Export表示倍率 v1・PART G・H：viewModeがtop/audienceどちらでも同じ値を渡す
         // （renderFormationExportToCanvas側で両rendererへ共通して適用される）。
         displayScale: exportDisplayScale,
+        // 高台 Phase 2E・PART N：viewModeが"audience"の場合だけrenderFormationExportToCanvas側で
+        // 実際に使われる（"top"の場合はrenderOptionsに含めても無視される＝PART O）。
+        showOccludedPerformerGhosts: exportShowOccludedPerformerGhosts,
       };
 
       if (exportFormat === "pdf") {
@@ -14876,12 +16038,22 @@ export default function App() {
   // ---- スライド内のプレースメント更新用ヘルパー ----
   // updater は (placements, work全体) を受け取り、新しい placements を返す。
   // commit版＝即1件の履歴、live版＝履歴を増やさない見た目だけの更新（後で beginBatch/endBatch と組み合わせる）。
+  // 高台 Phase 2B：updater実行直後に、この1箇所だけでapplyAutoSurfaceAfterPlacementEdit()を
+  // 通す。ドラッグ・数値入力・反転・整列・位置交換等、個々の配置ツール（20箇所以上）を
+  // 一切変更せずに、surfaceMode==="auto"のplacementだけを対象としたsurfaceId自動再判定を
+  // 実現する（調査報告B章の方針）。Playback/scrub（interpolatePlacements系）・copy/paste・
+  // Undo・出演者追加はこの2関数を経由しないため、ここでの処理の影響は受けない（調査報告
+  // A・I章）。platformsはcommitWork/updateWorkLiveのupdater内で確定するprev（＝commit時点の
+  // 最新work）からgetPlatforms()で取得し、コンポーネント外側のplatforms変数には依存しない。
   const updateSlidePlacementsCommit = useCallback(
     (updater) => {
       commitWork((prev) => {
-        const nextSlides = prev.slides.map((s, i) =>
-          i === prev.currentSlideIndex ? { ...s, placements: updater(s.placements, prev) } : s
-        );
+        const nextSlides = prev.slides.map((s, i) => {
+          if (i !== prev.currentSlideIndex) return s;
+          const updated = updater(s.placements, prev);
+          const reconciled = applyAutoSurfaceAfterPlacementEdit(s.placements, updated, getPlatforms(prev));
+          return { ...s, placements: reconciled };
+        });
         return { ...prev, slides: nextSlides };
       });
     },
@@ -14890,9 +16062,12 @@ export default function App() {
   const updateSlidePlacementsLive = useCallback(
     (updater) => {
       updateWorkLive((prev) => {
-        const nextSlides = prev.slides.map((s, i) =>
-          i === prev.currentSlideIndex ? { ...s, placements: updater(s.placements, prev) } : s
-        );
+        const nextSlides = prev.slides.map((s, i) => {
+          if (i !== prev.currentSlideIndex) return s;
+          const updated = updater(s.placements, prev);
+          const reconciled = applyAutoSurfaceAfterPlacementEdit(s.placements, updated, getPlatforms(prev));
+          return { ...s, placements: reconciled };
+        });
         return { ...prev, slides: nextSlides };
       });
     },
@@ -16236,6 +17411,26 @@ export default function App() {
         if (!targetSlideId) return prev;
         return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, {
           followPerformerId: normalized,
+        });
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
+  // 高台 Phase 3A・PART I：Beamの「照射面」（targetSurfaceId）を手動で切り替えるcommit。
+  // 既存のcommitWork→applyActiveLightingUpdate経路をそのまま再利用し、新しいUndo機構は
+  // 作らない。selectedValue===""（＝UIの「通常舞台」選択）の場合はtargetSurfaceIdをnullへ
+  // 戻す。target.x/y/z・source・width・color・intensity・followPerformerId・logicalBeamId等の
+  // 他フィールドには一切触れない（PART I：targetSurfaceIdだけを更新）。auto surfaceのような
+  // モード概念（targetSurfaceMode）は追加しない（PART Y：常に明示選択のみ）。
+  const setLightingBeam3DTargetSurfaceCommit = useCallback(
+    (beamId, selectedValue) => {
+      const normalized = selectedValue ? selectedValue : null;
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, {
+          targetSurfaceId: normalized,
         });
       });
     },
@@ -17776,12 +18971,17 @@ export default function App() {
       const zonesNow = computeZones(prev.stage);
       const currentPlacements = prev.slides[prev.currentSlideIndex].placements;
       const pos = findInitialStagePlacement(Object.values(currentPlacements), zonesNow);
+      // 高台 Phase 2B：新規出演者のplacementはsurfaceMode="auto"をdefaultにする（既存
+      // placement・既存Projectには一切影響しない。新規生成分だけの明示的な設定）。
+      // 生成時点のx/y・platformsから、初期surfaceIdもその場で1回だけ確定させておく
+      // （以降はupdateSlidePlacementsCommit/Live側の中央フックが自動で追従する）。
+      const initialSurfaceId = resolveAutoPlacementSurfaceId({ x: pos.x, y: pos.y, area: "stage" }, getPlatforms(prev));
       return {
         ...prev,
         performers: [...prev.performers, { id, number: nextNumber, color, height: DEFAULT_PERFORMER_HEIGHT, name: "" }],
         slides: prev.slides.map((s) => ({
           ...s,
-          placements: { ...s.placements, [id]: { x: pos.x, y: pos.y, area: "stage" } },
+          placements: { ...s.placements, [id]: { x: pos.x, y: pos.y, area: "stage", surfaceMode: "auto", surfaceId: initialSurfaceId } },
         })),
       };
     });
@@ -17812,13 +19012,20 @@ export default function App() {
 
       commitWork((prev) => {
         const zonesNow = computeZones(prev.stage);
+        // 高台 Phase 2B：一括追加分もaddPerformer()と同じく新規placementはsurfaceMode="auto"、
+        // 初期surfaceIdもその場で確定させる。
+        const platformsNow = getPlatforms(prev);
         // addPerformer()と同じく「現在slideのplacements」を起点に空き位置を探索する。
         // 1人追加するたびにその人のplacementをここへ足し込み、次の人の探索に反映することで、
         // 一括追加した人同士が同じ座標へ重ならないようにする。
         let placementsSoFar = { ...prev.slides[prev.currentSlideIndex].placements };
         const newPerformers = newIds.map((id, i) => {
           const pos = findInitialStagePlacement(Object.values(placementsSoFar), zonesNow);
-          placementsSoFar = { ...placementsSoFar, [id]: { x: pos.x, y: pos.y, area: "stage" } };
+          const initialSurfaceId = resolveAutoPlacementSurfaceId({ x: pos.x, y: pos.y, area: "stage" }, platformsNow);
+          placementsSoFar = {
+            ...placementsSoFar,
+            [id]: { x: pos.x, y: pos.y, area: "stage", surfaceMode: "auto", surfaceId: initialSurfaceId },
+          };
           return {
             id,
             number: baseNumber + i,
@@ -17913,6 +19120,56 @@ export default function App() {
     [commitWork, isTransitionActive]
   );
   const deletePerformer = useCallback((id) => deletePerformers([id]), [deletePerformers]);
+
+  // ==============================================================
+  // 高台 Phase 1A・10-5章：追加・更新・削除
+  // ==============================================================
+  // 出演者（addPerformer/updatePerformerCommit/updatePerformerLive/deletePerformer）と全く同じ
+  // commitWork/updateWorkLiveパターンをそのまま再利用する（新しいUndo機構は作らない）。
+  // commit版＝1操作1履歴（追加・削除ボタン用）、live版＝履歴を増やさない見た目だけの更新
+  // （名前・数値の直接入力欄でbeginEdit〜endEditと組み合わせ、1編集確定＝1履歴にする）。
+  const addPlatform = useCallback(() => {
+    commitWork((prev) => {
+      const existing = getPlatforms(prev);
+      const newPlatform = createDefaultPlatform(prev.stage, existing.length);
+      return { ...prev, platforms: [...existing, newPlatform] };
+    });
+  }, [commitWork]);
+
+  const updatePlatformCommit = useCallback(
+    (id, patch) => {
+      commitWork((prev) => ({
+        ...prev,
+        // 高台 geometry clamp v1：patch適用後、常にclampPlatformGeometry()を通すことで、
+        // x/y/width/depthのどれを編集しても矩形全体が必ずstage内に収まるようにする
+        // （width/depth変更で現在のx/yが範囲外になった場合も、ここで必要最小限だけ動かす）。
+        // name/height等はclampPlatformGeometry内で一切変更されないため、他の編集には影響しない。
+        platforms: getPlatforms(prev).map((pl) =>
+          pl.id === id ? clampPlatformGeometry(prev.stage, { ...pl, ...patch }) : pl
+        ),
+      }));
+    },
+    [commitWork]
+  );
+  const updatePlatformLive = useCallback(
+    (id, patch) => {
+      updateWorkLive((prev) => ({
+        ...prev,
+        platforms: getPlatforms(prev).map((pl) => (pl.id === id ? { ...pl, ...patch } : pl)),
+      }));
+    },
+    [updateWorkLive]
+  );
+
+  const deletePlatform = useCallback(
+    (id) => {
+      commitWork((prev) => ({
+        ...prev,
+        platforms: getPlatforms(prev).filter((pl) => pl.id !== id),
+      }));
+    },
+    [commitWork]
+  );
 
   // ==============================================================
   // Keyboard Editing v1 PART B：Delete / Backspaceによる削除（優先順位付きディスパッチ）
@@ -18165,6 +19422,28 @@ export default function App() {
       });
     },
     [updateSlidePlacementsLive, isTransitionActive]
+  );
+
+  // 高台 Phase 2B：単一選択出演者の「舞台面」select用。mode="auto"の場合は、その場の
+  // 現在x/y（＝prev[id]）からresolveAutoPlacementSurfaceId()で即時に1回だけ判定し、
+  // surfaceMode="auto"として保存する（以降の再判定はupdateSlidePlacementsCommit/Live側の
+  // 中央フックが自動で担当する）。mode="manual"の場合はsurfaceIdをそのまま指定値に固定し、
+  // 中央フックの自動再判定対象から外れる。x/y/areaには一切触れない。既存のcommitパターンを
+  // そのまま使い、1変更＝1Undoにする（新しいUndo機構は作らない）。
+  const setPlacementSurfaceCommit = useCallback(
+    (id, mode, surfaceId) => {
+      if (isTransitionActive) return;
+      updateSlidePlacementsCommit((prev, prevWork) => {
+        const pos = prev[id];
+        if (!pos) return prev;
+        if (mode === "auto") {
+          const resolvedSurfaceId = resolveAutoPlacementSurfaceId(pos, getPlatforms(prevWork));
+          return { ...prev, [id]: { ...pos, surfaceMode: "auto", surfaceId: resolvedSurfaceId } };
+        }
+        return { ...prev, [id]: { ...pos, surfaceMode: "manual", surfaceId: surfaceId || null } };
+      });
+    },
+    [updateSlidePlacementsCommit, isTransitionActive]
   );
 
   const returnToStage = (id) => {
@@ -18711,6 +19990,10 @@ export default function App() {
   // 一切変化しない（10章）。8章：placement object丸ごとの交換は禁止（pose等の
   // performer固有metadataは本人に残す）。9章：相手の元のx/y/area組み合わせをそのまま
   // 使うため、resolveArea()による再判定は行わない（既にどちらも有効な座標だったため）。
+  // 高台 Phase 2A：surfaceId（どの舞台面に立っているか）は、pose等の出演者固有metadataでは
+  // なく、areaと同じ「その場所（x/y）の属性」であるため、areaと一緒に交換対象へ含める。
+  // これにより、Aが高台の上から平舞台のBの位置へ移動した場合、Aのsurface状態も
+  // Bの元の状態（通常舞台）へ正しく切り替わる。
   const swapSelectedPerformerPositionsCommit = useCallback(() => {
     if (isTransitionActive) return;
     if (selectedIds.length !== 2) return;
@@ -18720,8 +20003,8 @@ export default function App() {
       const posB = prev[idB];
       if (!posA || !posB) return prev; // 6章：現在Formationにどちらかが存在しない場合は何もしない
       const next = { ...prev };
-      next[idA] = { ...posA, x: posB.x, y: posB.y, area: posB.area };
-      next[idB] = { ...posB, x: posA.x, y: posA.y, area: posA.area };
+      next[idA] = { ...posA, x: posB.x, y: posB.y, area: posB.area, surfaceId: getPlacementSurfaceId(posB) };
+      next[idB] = { ...posB, x: posA.x, y: posA.y, area: posA.area, surfaceId: getPlacementSurfaceId(posA) };
       return next;
     });
   }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
@@ -19508,6 +20791,16 @@ export default function App() {
                 待機中の出演者もこのビューに表示する
               </label>
             )}
+            {viewMode === "front" && (
+              <label className="flex items-center gap-1.5 cursor-pointer select-none" title="高台の下・後ろ・横に隠れている出演者を、薄い点線のゴーストとして確認します">
+                <input
+                  type="checkbox"
+                  checked={showOccludedPerformerGhosts}
+                  onChange={(e) => setShowOccludedPerformerGhosts(e.target.checked)}
+                />
+                高台裏をゴースト表示
+              </label>
+            )}
             <label className="flex items-center gap-1.5 cursor-pointer select-none" title="現在の構成を基準にした移動軌跡を表示します">
               <input
                 type="checkbox"
@@ -19737,6 +21030,7 @@ export default function App() {
                 zones={zones}
                 performers={performers}
                 placements={displayPlacementsWithScrub}
+                platforms={platforms}
                 selectedIds={selectedIds}
                 onSelect={selectOnly}
                 onToggleSelect={toggleSelect}
@@ -19793,12 +21087,14 @@ export default function App() {
                 onToggleSelect={toggleSelect}
                 overlapIds={overlapIds}
                 showWaiting={showWaitingInOverhead}
+                showOccludedPerformerGhosts={showOccludedPerformerGhosts}
                 viewState={activeViewState}
                 onViewStateChange={handleViewStateChange}
                 width={containerSize.width}
                 height={containerSize.height}
                 locked={isTransitionActive || presentationMode}
                 transitionPaths={transitionPaths}
+                platforms={platforms}
                 floorColorKey={stageAppearance.floorColor}
                 backdropColorKey={stageAppearance.backdropColor}
                 lightingAreas={effectiveLightingAreas}
@@ -20324,6 +21620,113 @@ export default function App() {
               <p style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed mt-1">
                 床の色は平面図・俯瞰客席ビューの舞台床に、壁・背景の色は俯瞰客席ビューの舞台周囲の背景に反映されます。
               </p>
+            </div>
+          </section>
+          </CollapsibleGroup>
+
+          {/* 高台 Phase 1A・10-3章：舞台設定付近に「▶ 高台・段差」を追加する。既存の
+              「ステージ設定」「音楽設定」と全く同じnested CollapsibleGroupを再利用し、
+              新しいaccordionコンポーネントは作らない。初期状態は閉じる（要件通り）。 */}
+          <CollapsibleGroup
+            title="高台・段差"
+            icon="🧱"
+            open={platformsSectionOpen}
+            onToggle={() => setPlatformsSectionOpen((v) => !v)}
+            nested
+          >
+          <section>
+            <SectionTitle>高台・段差</SectionTitle>
+            <div className="flex flex-col gap-2 mt-2">
+              {platforms.length === 0 && (
+                <p style={{ color: THEME.textDim }} className="text-xs">高台はまだありません</p>
+              )}
+              {platforms.map((pl, idx) => (
+                <div
+                  key={pl.id}
+                  style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}` }}
+                  className="rounded-lg p-2 flex flex-col gap-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={pl.name || ""}
+                      placeholder={`高台${idx + 1}`}
+                      onFocus={beginEdit}
+                      onChange={(e) => updatePlatformLive(pl.id, { name: e.target.value })}
+                      onBlur={endEdit}
+                      onKeyDown={commitOnEnter}
+                      style={inputStyle}
+                      className="flex-1 rounded px-2 py-1 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => deletePlatform(pl.id)}
+                      style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                      className="rounded-lg px-2 py-1 text-xs font-bold shrink-0"
+                    >
+                      削除
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <DraftNumberField
+                      label="X"
+                      value={pl.x}
+                      min={-stage.width / 2 + pl.width / 2}
+                      max={stage.width / 2 - pl.width / 2}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updatePlatformCommit(pl.id, { x: v })}
+                    />
+                    <DraftNumberField
+                      label="Y"
+                      value={pl.y}
+                      min={pl.depth / 2}
+                      max={stage.depth - pl.depth / 2}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updatePlatformCommit(pl.id, { y: v })}
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <DraftNumberField
+                      label="横幅"
+                      value={pl.width}
+                      min={PLATFORM_MIN_SIZE}
+                      max={stage.width}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updatePlatformCommit(pl.id, { width: v })}
+                    />
+                    <DraftNumberField
+                      label="奥行"
+                      value={pl.depth}
+                      min={PLATFORM_MIN_SIZE}
+                      max={stage.depth}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updatePlatformCommit(pl.id, { depth: v })}
+                    />
+                  </div>
+                  <DraftNumberField
+                    label={`高さ / ${PLATFORM_MIN_HEIGHT}〜${PLATFORM_MAX_HEIGHT}`}
+                    value={pl.height}
+                    min={PLATFORM_MIN_HEIGHT}
+                    max={PLATFORM_MAX_HEIGHT}
+                    step={PLATFORM_HEIGHT_STEP}
+                    allowDecimal
+                    suffix={`= ${pl.height * UNIT_CM}cm`}
+                    onCommit={(v) => updatePlatformCommit(pl.id, { height: v })}
+                  />
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addPlatform}
+                style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                className="w-full rounded-lg py-1.5 text-xs font-bold"
+              >
+                ＋ 高台を追加
+              </button>
             </div>
           </section>
           </CollapsibleGroup>
@@ -21907,6 +23310,49 @@ export default function App() {
                     {AREA_ORDER.map((key) => (
                       <option key={key} value={key}>
                         {AREA_LABELS[key]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* 高台 Phase 2B：単一選択出演者専用の「舞台面」select。areaとは別概念
+                    （どの高さの舞台面に立っているか）のため、専用のselectとしてエリアの直後に
+                    配置する。「自動」を選ぶとsurfaceMode="auto"になり、選んだ瞬間の現在x/yから
+                    即時に1回だけsurfaceIdを判定する（以降はドラッグ・数値入力等で位置が
+                    変わるたびに中央フックが自動追従する）。「通常舞台」「高台N」を選ぶと
+                    surfaceMode="manual"になり、以降は位置を変えても自動判定の対象から外れる。
+                    selectのvalueは、surfaceMode==="auto"なら常に「自動」、そうでなければ
+                    「現在のplatforms内に実在するsurfaceIdだけ」を有効値として解決する
+                    （削除済みplatformを指したままのsurfaceIdが残っていても、UI上は安全に
+                    「通常舞台」として表示するだけで、データそのものは書き換えない＝
+                    migrationはしない）。 */}
+                <div className="flex items-center gap-2">
+                  <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">舞台面</label>
+                  <select
+                    value={
+                      getPlacementSurfaceMode(selectedPos) === "auto"
+                        ? "__auto__"
+                        : platforms.some((pl) => pl.id === selectedPos.surfaceId)
+                        ? selectedPos.surfaceId
+                        : ""
+                    }
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v === "__auto__") {
+                        setPlacementSurfaceCommit(selectedPerformer.id, "auto", null);
+                        return;
+                      }
+                      setPlacementSurfaceCommit(selectedPerformer.id, "manual", v || null);
+                    }}
+                    disabled={isTransitionActive}
+                    style={inputStyle}
+                    className="w-full rounded px-2 py-1 text-sm"
+                  >
+                    <option value="__auto__">自動</option>
+                    <option value="">通常舞台</option>
+                    {platforms.map((pl) => (
+                      <option key={pl.id} value={pl.id}>
+                        {pl.name || "高台"}
                       </option>
                     ))}
                   </select>
@@ -23568,6 +25014,37 @@ export default function App() {
                                 onCommit={(v) => setLightingBeam3DTargetPositionCommit(selectedLightingBeam3D.id, "y", v)}
                               />
                             </div>
+                            {/* 高台 Phase 3A・PART H・J：Beamの照射面（通常舞台／高台）を明示的に
+                                選ぶselect。選択肢はplatforms配列順に「高台1」「高台2」…と表示し
+                                （platform.nameが空の場合の安全fallback＝高台設定パネルの
+                                「舞台面」selectと同じ考え方）、保存値は必ずplatform.id。
+                                targetSurfaceIdが現在のplatforms内に存在しない場合（削除済み等）
+                                は、データを書き換えずUI上だけ「通常舞台」へ安全にfallbackする
+                                （PART J：migrationはしない）。target x/yを高台外へドラッグしても
+                                この選択は自動で変わらない（PART Y：auto surfaceは実装しない）。 */}
+                            <div className="flex items-center gap-2">
+                              <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">
+                                照射面
+                              </label>
+                              <select
+                                value={
+                                  platforms.some((pl) => pl.id === getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D))
+                                    ? selectedLightingBeam3D.targetSurfaceId
+                                    : ""
+                                }
+                                onChange={(e) => setLightingBeam3DTargetSurfaceCommit(selectedLightingBeam3D.id, e.target.value)}
+                                aria-label="照明ビームの照射面"
+                                style={inputStyle}
+                                className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                              >
+                                <option value="">通常舞台</option>
+                                {platforms.map((pl, idx) => (
+                                  <option key={pl.id} value={pl.id}>
+                                    {pl.name || `高台${idx + 1}`}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
                           </div>
 
                           <div>
@@ -23837,14 +25314,20 @@ export default function App() {
                           {/* Lighting Beam 反転 v1・STEP5・6：発光元/照射先・幅設定のすぐ下へ、
                               独立したボタン1つとして配置する（新しいカード／
                               CollapsibleGroupは作らない）。STEP4：追尾中はボタンをdisabledに
-                              し、短い説明文で理由を伝える（勝手に追尾解除しない）。 */}
+                              し、短い説明文で理由を伝える（勝手に追尾解除しない）。
+                              高台 Phase 3A・PART V：targetSurfaceIdが設定されている（高台照射
+                              中）Beamも同じ考え方でdisabledにする。反転するとsource/targetの
+                              役割が入れ替わり、targetSurfaceIdの意味（照射先の高さ）が曖昧に
+                              なるため。targetSurfaceIdをsourceSurfaceIdへ変換するような新しい
+                              schemaは作らず、安全側で「通常舞台へ戻してから」入れ替えてもらう
+                              方式にする。 */}
                           <div className="flex flex-col gap-1.5">
                             <button
                               type="button"
                               onClick={() => flipLightingBeam3DDirectionCommit(selectedLightingBeam3D.id)}
-                              disabled={!!selectedLightingBeam3D.followPerformerId}
+                              disabled={!!selectedLightingBeam3D.followPerformerId || !!getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D)}
                               style={
-                                selectedLightingBeam3D.followPerformerId
+                                selectedLightingBeam3D.followPerformerId || getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D)
                                   ? { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
                                   : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
                               }
@@ -23855,6 +25338,11 @@ export default function App() {
                             {selectedLightingBeam3D.followPerformerId && (
                               <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
                                 追尾を解除すると入れ替えられます
+                              </div>
+                            )}
+                            {!selectedLightingBeam3D.followPerformerId && getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D) && (
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                高台照射を通常舞台に戻すと入れ替えられます
                               </div>
                             )}
                           </div>
@@ -23988,6 +25476,9 @@ export default function App() {
           onShowLightingTrackingPathsChange={setExportShowLightingTrackingPaths}
           showPerformerNames={exportShowPerformerNames}
           onShowPerformerNamesChange={setExportShowPerformerNames}
+          showOccludedPerformerGhosts={exportShowOccludedPerformerGhosts}
+          onShowOccludedPerformerGhostsChange={setExportShowOccludedPerformerGhosts}
+          showOccludedPerformerGhostsVisible={resolveExportRenderViewMode() === "audience"}
           showMusicTime={exportShowMusicTime}
           onShowMusicTimeChange={setExportShowMusicTime}
           highlightSelectedPerformer={exportHighlightSelectedPerformer}
@@ -27099,7 +28590,9 @@ function SlideListModal({
               const thumbnailScene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
               if (thumbnailScene && thumbnailScene.enabled) {
                 thumbnailLightingAreas = getLightingAreas(thumbnailScene);
-                thumbnailLightingBeams3D = resolveLightingBeams3DForDisplay(getLightingBeams3D(thumbnailScene), slide.placements || {});
+                // 高台 Phase 3A・PART S：Top View/Audience/Exportと同じplatformsを渡すだけ。
+                // Thumbnail自体の見た目（2D表示）は変更しない。
+                thumbnailLightingBeams3D = resolveLightingBeams3DForDisplay(getLightingBeams3D(thumbnailScene), slide.placements || {}, platforms);
               }
               return (
                 <React.Fragment key={slide.id}>
@@ -27533,6 +29026,14 @@ function ExportCenterModal({
   onShowLightingTrackingPathsChange,
   showPerformerNames,
   onShowPerformerNamesChange,
+  // 高台 Phase 2E・2E.1・PART D：「高台裏をゴースト表示」チェックボックス用。他の表示オプション
+  // （showPerformerNames等）と全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。
+  // visibleがfalseの間（平面図出力時）はUI自体を非表示にする（新しいモーダル・サブメニューは
+  // 作らず、既存の表示オプションセクション内に条件付きレンダリングとして追加するだけ）。
+  // Phase 2E.1で表示位置を「待機エリア」の直後へ移動したが、独立したbooleanのまま統合はしない。
+  showOccludedPerformerGhosts,
+  onShowOccludedPerformerGhostsChange,
+  showOccludedPerformerGhostsVisible,
   // Export音楽位置・音源内時間 v1：「音源内時間を表示」チェックボックス用。他の表示オプション
   // （showWaitingAreas等）と全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。
   showMusicTime,
@@ -27751,6 +29252,22 @@ function ExportCenterModal({
               <input type="checkbox" checked={showWaitingAreas} onChange={(e) => onShowWaitingAreasChange(e.target.checked)} />
               待機エリア
             </label>
+
+            {/* 高台 Phase 2E.1・PART D：待機エリア（袖・舞台裏の表示領域そのもの）とは意味が
+                異なる別state（exportShowOccludedPerformerGhosts）のまま、UI上だけ待機エリアの
+                直後へ配置する。待機エリアON/OFFとは連動させない。俯瞰客席ビュー出力時だけ
+                表示する（showOccludedPerformerGhostsVisibleで判定、平面図出力時は項目自体を
+                非表示のまま）。 */}
+            {showOccludedPerformerGhostsVisible && (
+              <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
+                <input
+                  type="checkbox"
+                  checked={showOccludedPerformerGhosts}
+                  onChange={(e) => onShowOccludedPerformerGhostsChange(e.target.checked)}
+                />
+                高台裏をゴースト表示
+              </label>
+            )}
 
             <div className="flex flex-col" style={{ gap: 4 }}>
               <div className="flex items-center gap-2 flex-wrap">

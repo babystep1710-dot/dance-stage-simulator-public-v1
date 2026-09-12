@@ -7,7 +7,7 @@
 //   - Project全体の「照明機能を使う」「3Dビーム試作を表示」「＋ 照明ビームを追加」（Beam v1）
 //     が正式UIから消えていること
 //   - 新しい主要ON/OFF「照明を表示」「この構成で照明を使用」が存在すること
-//   - 照明エリア／3D照明ビームセクションの折りたたみ動作
+//   - 照明エリア／照明ビームセクションの折りたたみ動作
 //   - sourceWidth初期値0.1・sourceWidth=0の入力と保持・0でのpolygon描画
 //   - 旧Beam v1 polygon・3D Prototype polygonが俯瞰ビューに一切描画されないこと
 //   - source/target dragの両方（target dragは前回未追加だったため今回追加）
@@ -17,6 +17,7 @@
 // tests/lighting-area-export.spec.js で既にカバーされているため、ここでは重複させない。
 
 import { test, expect } from "@playwright/test";
+import { audienceBeamSlices, BEAM_DEPTH_SLICE_COUNT } from "./helpers/lighting-rendering.js";
 
 async function openFreshApp(page) {
   await page.addInitScript(() => {
@@ -48,9 +49,9 @@ async function addLightingArea(page) {
 
 async function addLightingBeam3D(page) {
   const section = currentSceneSection(page);
-  const existingCount = await section.getByRole("button", { name: /^3D照明ビーム \d+$/ }).count();
-  await section.getByRole("button", { name: "3D照明ビームを追加" }).click();
-  await section.getByRole("button", { name: `3D照明ビーム ${existingCount + 1}` }).click();
+  const existingCount = await section.getByRole("button", { name: /^照明ビーム \d+$/ }).count();
+  await section.getByRole("button", { name: "照明ビームを追加" }).click();
+  await section.getByRole("button", { name: `照明ビーム ${existingCount + 1}` }).click();
 }
 
 async function setupSceneWithOneArea(page) {
@@ -132,7 +133,7 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
     const section = currentSceneSection(page);
 
     // 見出し（件数付き）が見えていること
-    const header = section.getByRole("button", { name: /^照明エリア（\d+）/ });
+    const header = section.getByRole("button", { name: /照明エリア（\d+）/ });
     await expect(header).toBeVisible();
     await expect(section.getByRole("button", { name: "照明エリア 1" })).toBeVisible();
 
@@ -147,27 +148,27 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
   });
 
   // ------------------------------------------------------------------
-  // 16〜18. 3D照明ビームセクションの折りたたみ
+  // 16〜18. 照明ビームセクションの折りたたみ
   // ------------------------------------------------------------------
-  test("3D照明ビームセクションを閉じてもデータは保持され、再展開できる", async ({ page }) => {
+  test("照明ビームセクションを閉じてもデータは保持され、再展開できる", async ({ page }) => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
-    const zInput = section.getByLabel("3Dビーム発光元高さ");
+    const zInput = section.getByLabel("照明ビーム発光元高さ");
     await zInput.fill("11");
     await zInput.blur();
 
-    const header = section.getByRole("button", { name: /^3D照明ビーム（\d+）/ });
+    const header = section.getByRole("button", { name: /照明ビーム（\d+）/ });
     await expect(header).toBeVisible();
 
     // 閉じる
     await header.click();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toHaveCount(0);
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toHaveCount(0);
 
     // 再展開
     await header.click();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
-    await section.getByRole("button", { name: "3D照明ビーム 1" }).click();
-    await expect(section.getByLabel("3Dビーム発光元高さ")).toHaveValue(/11/);
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
+    await section.getByRole("button", { name: "照明ビーム 1" }).click();
+    await expect(section.getByLabel("照明ビーム発光元高さ")).toHaveValue(/11/);
   });
 
   // ------------------------------------------------------------------
@@ -176,7 +177,7 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
   test("新規Beam v2のsourceWidth初期値は0.1", async ({ page }) => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
-    await expect(section.getByLabel("3Dビーム根元幅")).toHaveValue(/0\.1/);
+    await expect(section.getByLabel("照明ビーム根元幅")).toHaveValue(/0\.1/);
   });
 
   // ------------------------------------------------------------------
@@ -187,16 +188,16 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
     await addLightingBeam3D(page);
     const section = currentSceneSection(page);
 
-    await section.getByRole("button", { name: "3D照明ビーム 1" }).click();
-    const rootInput = section.getByLabel("3Dビーム根元幅");
+    await section.getByRole("button", { name: "照明ビーム 1" }).click();
+    const rootInput = section.getByLabel("照明ビーム根元幅");
     await rootInput.fill("0");
     await rootInput.blur();
     await expect(rootInput).toHaveValue("0");
 
     // 別Beamへ切り替えて戻っても0のまま
-    await section.getByRole("button", { name: "3D照明ビーム 2" }).click();
-    await section.getByRole("button", { name: "3D照明ビーム 1" }).click();
-    await expect(section.getByLabel("3Dビーム根元幅")).toHaveValue("0");
+    await section.getByRole("button", { name: "照明ビーム 2" }).click();
+    await section.getByRole("button", { name: "照明ビーム 1" }).click();
+    await expect(section.getByLabel("照明ビーム根元幅")).toHaveValue("0");
   });
 
   // ------------------------------------------------------------------
@@ -205,15 +206,15 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
   test("俯瞰ビューでsourceWidth=0のBeam v2が正常表示される", async ({ page }) => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
-    const rootInput = section.getByLabel("3Dビーム根元幅");
+    const rootInput = section.getByLabel("照明ビーム根元幅");
     await rootInput.fill("0");
     await rootInput.blur();
 
     await switchToAudienceView(page);
-    const layer = page.locator('g[aria-label="3D照明ビーム"]');
-    await expect(layer).toBeVisible();
+    const slices = audienceBeamSlices(page);
+    await expect(slices).toHaveCount(BEAM_DEPTH_SLICE_COUNT);
     // sourceWidth=0でもpolygonが描画される（三角形相当。0除算やNaNでSVGが壊れていないこと）。
-    const polygon = layer.locator("polygon").first();
+    const polygon = slices.first();
     await expect(polygon).toBeVisible();
     const points = await polygon.getAttribute("points");
     expect(points).toBeTruthy();
@@ -230,10 +231,10 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
     // 旧3D Prototypeのレイヤー（aria-label="3D照明ビーム試作"）が存在しないこと。
     await expect(page.locator('g[aria-label="3D照明ビーム試作"]')).toHaveCount(0);
 
-    // 正式Beam v2のレイヤー（aria-label="3D照明ビーム"）は1本分のpolygonのみで、
+    // 正式Beam v2は1本分のdepth slicesのみで、
     // 旧Beam v1由来の余分なpolygonが混ざっていないこと。
-    const layer = page.locator('g[aria-label="3D照明ビーム"]');
-    await expect(layer.locator("polygon")).toHaveCount(1);
+    const slices = audienceBeamSlices(page);
+    await expect(slices).toHaveCount(BEAM_DEPTH_SLICE_COUNT);
   });
 
   // ------------------------------------------------------------------
@@ -243,7 +244,7 @@ test.describe("Lighting UI整理・Prototype卒業", () => {
     await setupSceneWithOneBeam3D(page);
     await switchToTopView(page);
     const section = currentSceneSection(page);
-    const xInput = section.getByLabel("3Dビーム照射先X");
+    const xInput = section.getByLabel("照明ビーム照射先X");
     const before = await xInput.inputValue();
 
     // target markerは外枠circle（塗りなし相当）。source marker（塗りつぶし）に続く

@@ -265,7 +265,7 @@ test.describe("Lighting Area v1", () => {
     const section = currentSceneSection(page);
 
     await selectArea(page, 2);
-    await section.getByRole("button", { name: "この照明エリアを削除" }).click();
+    await section.getByRole("button", { name: "選択中の照明を削除", exact: true }).first().click();
 
     // 削除後は2件になり、UIがクラッシュしないこと
     await expect(section.getByRole("button", { name: "照明エリア 1" })).toBeVisible();

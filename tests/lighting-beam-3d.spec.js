@@ -3,12 +3,13 @@
 // tests/lighting-area.spec.js / tests/lighting-beam.spec.js / tests/lighting-beam-3d-prototype.spec.js
 // と同じスタイル・同じスコープ手法（currentSceneSection）を踏襲しています。
 //
-// 注意：「現在の構成の照明」パネルには、Area編集UI・Beam v1編集UI・Beam v2（3D照明ビーム）
+// 注意：「現在の構成の照明」パネルには、Area編集UI・Beam v1編集UI・Beam v2（照明ビーム）
 // 編集UIが独立した選択状態で共存できます。Beam v2のX/Yラベルは重複を避けるため
-// aria-label="3Dビーム発光元X"等の専用ラベルを使っており（App.jsx側でDraftNumberFieldへ
+// aria-label="照明ビーム発光元X"等の専用ラベルを使っており（App.jsx側でDraftNumberFieldへ
 // ariaLabelプロパティを渡している）、getByLabel()での取得時はこれらの専用ラベルを使います。
 
 import { test, expect } from "@playwright/test";
+import { audienceBeamSlices, BEAM_DEPTH_SLICE_COUNT } from "./helpers/lighting-rendering.js";
 
 async function openFreshApp(page) {
   await page.addInitScript(() => {
@@ -44,9 +45,9 @@ async function addLightingScene(page) {
 // 明示的にクリックする）。
 async function addLightingBeam3D(page) {
   const section = currentSceneSection(page);
-  const existingCount = await section.getByRole("button", { name: /^3D照明ビーム \d+$/ }).count();
-  await section.getByRole("button", { name: "3D照明ビームを追加" }).click();
-  await section.getByRole("button", { name: `3D照明ビーム ${existingCount + 1}` }).click();
+  const existingCount = await section.getByRole("button", { name: /^照明ビーム \d+$/ }).count();
+  await section.getByRole("button", { name: "照明ビームを追加" }).click();
+  await section.getByRole("button", { name: `照明ビーム ${existingCount + 1}` }).click();
 }
 
 async function setupSceneWithOneBeam3D(page) {
@@ -57,7 +58,7 @@ async function setupSceneWithOneBeam3D(page) {
 }
 
 async function selectBeam3D(page, index) {
-  await currentSceneSection(page).getByRole("button", { name: `3D照明ビーム ${index}` }).click();
+  await currentSceneSection(page).getByRole("button", { name: `照明ビーム ${index}` }).click();
 }
 
 async function switchToTopView(page) {
@@ -65,13 +66,6 @@ async function switchToTopView(page) {
 }
 async function switchToAudienceView(page) {
   await page.getByRole("button", { name: "俯瞰客席ビュー" }).click();
-}
-
-// 俯瞰ビューSVG内の正式3D Beamレイヤー（aria-label="3D照明ビーム"）を返す。
-// 3D Prototypeレイヤー（aria-label="3D照明ビーム試作"）とは別物なので、CSS属性セレクタで
-// 完全一致させ、部分一致による誤取得を避ける。
-function beam3DLayer(page) {
-  return page.locator('g[aria-label="3D照明ビーム"]');
 }
 
 test.describe("Lighting Beam v2・正式実装 STEP1", () => {
@@ -83,15 +77,15 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
 
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
-    await expect(section.getByLabel("3Dビーム発光元X")).toHaveValue(/-4/);
-    await expect(section.getByLabel("3Dビーム発光元Y")).toHaveValue(/8/);
-    await expect(section.getByLabel("3Dビーム発光元高さ")).toHaveValue(/6/);
-    await expect(section.getByLabel("3Dビーム照射先X")).toHaveValue(/0/);
-    await expect(section.getByLabel("3Dビーム照射先Y")).toHaveValue(/5/);
-    await expect(section.getByRole("button", { name: "3D照明ビームの色を白にする" })).toBeVisible();
-    await expect(section.getByLabel("3Dビーム根元幅")).toBeVisible();
-    await expect(section.getByLabel("3Dビーム先端幅")).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
+    await expect(section.getByLabel("照明ビーム発光元X")).toHaveValue(/-4/);
+    await expect(section.getByLabel("照明ビーム発光元Y")).toHaveValue(/8/);
+    await expect(section.getByLabel("照明ビーム発光元高さ")).toHaveValue("20");
+    await expect(section.getByLabel("照明ビーム照射先X")).toHaveValue(/0/);
+    await expect(section.getByLabel("照明ビーム照射先Y")).toHaveValue(/5/);
+    await expect(section.getByRole("button", { name: "照明ビームの色を白にする" })).toBeVisible();
+    await expect(section.getByLabel("照明ビーム根元幅")).toBeVisible();
+    await expect(section.getByLabel("照明ビーム先端幅")).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -103,14 +97,14 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await addLightingBeam3D(page); // 3本目
     const section = currentSceneSection(page);
 
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 2" })).toBeVisible();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 3" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 2" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 3" })).toBeVisible();
 
     await selectBeam3D(page, 2);
-    await expect(section.getByLabel("3Dビーム発光元X")).toBeVisible();
+    await expect(section.getByLabel("照明ビーム発光元X")).toBeVisible();
     await selectBeam3D(page, 3);
-    await expect(section.getByLabel("3Dビーム発光元X")).toBeVisible();
+    await expect(section.getByLabel("照明ビーム発光元X")).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -122,8 +116,8 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     const section = currentSceneSection(page);
 
     await selectBeam3D(page, 1);
-    const sx = section.getByLabel("3Dビーム発光元X");
-    const sy = section.getByLabel("3Dビーム発光元Y");
+    const sx = section.getByLabel("照明ビーム発光元X");
+    const sy = section.getByLabel("照明ビーム発光元Y");
     await sx.fill("-6");
     await sx.blur();
     await sy.fill("7");
@@ -134,8 +128,8 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
 
     await selectBeam3D(page, 2);
     await selectBeam3D(page, 1);
-    await expect(section.getByLabel("3Dビーム発光元X")).toHaveValue(/-6/);
-    await expect(section.getByLabel("3Dビーム発光元Y")).toHaveValue(/7/);
+    await expect(section.getByLabel("照明ビーム発光元X")).toHaveValue(/-6/);
+    await expect(section.getByLabel("照明ビーム発光元Y")).toHaveValue(/7/);
   });
 
   // ------------------------------------------------------------------
@@ -145,7 +139,7 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
 
-    const sz = section.getByLabel("3Dビーム発光元高さ");
+    const sz = section.getByLabel("照明ビーム発光元高さ");
     await sz.fill("10");
     await sz.blur();
     await expect(sz).toHaveValue(/10/);
@@ -158,8 +152,8 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
 
-    const tx = section.getByLabel("3Dビーム照射先X");
-    const ty = section.getByLabel("3Dビーム照射先Y");
+    const tx = section.getByLabel("照明ビーム照射先X");
+    const ty = section.getByLabel("照明ビーム照射先Y");
     await tx.fill("2");
     await tx.blur();
     await ty.fill("3");
@@ -176,8 +170,8 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
 
-    const rootWidth = section.getByLabel("3Dビーム根元幅");
-    const tipWidth = section.getByLabel("3Dビーム先端幅");
+    const rootWidth = section.getByLabel("照明ビーム根元幅");
+    const tipWidth = section.getByLabel("照明ビーム先端幅");
     await rootWidth.fill("0.8");
     await rootWidth.blur();
     await tipWidth.fill("2");
@@ -196,11 +190,11 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     const section = currentSceneSection(page);
 
     await selectBeam3D(page, 1);
-    await section.getByRole("button", { name: "3D照明ビームの色を青にする" }).click();
+    await section.getByRole("button", { name: "照明ビームの色を青にする" }).click();
 
     await selectBeam3D(page, 2);
     await selectBeam3D(page, 1);
-    await expect(section.getByLabel("3Dビーム発光元X")).toBeVisible();
+    await expect(section.getByLabel("照明ビーム発光元X")).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -229,11 +223,11 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     const section = currentSceneSection(page);
 
     await selectBeam3D(page, 2);
-    await section.getByRole("button", { name: "この3D照明ビームを削除" }).click();
+    await section.getByRole("button", { name: "選択中の照明を削除", exact: true }).first().click();
 
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 2" })).toBeVisible();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 3" })).toHaveCount(0);
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 2" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 3" })).toHaveCount(0);
   });
 
   // ------------------------------------------------------------------
@@ -244,16 +238,16 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
   test("この構成で照明を使用OFF→ONでもBeam v2の設定値が保持される", async ({ page }) => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
-    const sz = section.getByLabel("3Dビーム発光元高さ");
+    const sz = section.getByLabel("照明ビーム発光元高さ");
     await sz.fill("9");
     await sz.blur();
 
     await section.getByLabel("この構成で照明を使用").uncheck();
-    await expect(section.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(section.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
 
     await section.getByLabel("この構成で照明を使用").check();
     await selectBeam3D(page, 1);
-    await expect(section.getByLabel("3Dビーム発光元高さ")).toHaveValue(/9/);
+    await expect(section.getByLabel("照明ビーム発光元高さ")).toHaveValue(/9/);
   });
 
   // ------------------------------------------------------------------
@@ -263,10 +257,10 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
 
     await page.getByLabel("照明を表示").uncheck();
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
 
     await page.getByLabel("照明を表示").check();
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -278,10 +272,10 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
 
     await section.getByLabel("この構成で照明を使用").uncheck();
     // Scene無効時もBeam一覧UI自体は表示され続ける（Area/Beam v1と同じ仕様）
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
 
     await section.getByLabel("この構成で照明を使用").check();
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -291,7 +285,7 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
   test("同一Project内でFormationを複製するとBeam v2も引き継がれ、source/targetが独立している", async ({ page }) => {
     await setupSceneWithOneBeam3D(page);
     const section = currentSceneSection(page);
-    const sx = section.getByLabel("3Dビーム発光元X");
+    const sx = section.getByLabel("照明ビーム発光元X");
     await sx.fill("-3");
     await sx.blur();
 
@@ -304,22 +298,22 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await page.keyboard.press("Meta+v");
 
     const copiedSection = currentSceneSection(page);
-    await expect(copiedSection.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(copiedSection.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
     await selectBeam3D(page, 1);
-    await expect(copiedSection.getByLabel("3Dビーム発光元X")).toHaveValue(/-3/);
+    await expect(copiedSection.getByLabel("照明ビーム発光元X")).toHaveValue(/-3/);
 
     // コピー先のsourceXを変更しても、コピー元（1番目の構成）が影響を受けないこと
     // （nested source/targetオブジェクトが参照共有されていない証跡）。
     // 構成間の移動自体（SlideCardの直接クリック）は「⋯」メニューとは別の安定した経路のため
     // そのまま使う。
-    const copiedSx = copiedSection.getByLabel("3Dビーム発光元X");
+    const copiedSx = copiedSection.getByLabel("照明ビーム発光元X");
     await copiedSx.fill("1");
     await copiedSx.blur();
 
     await page.getByRole("button", { name: /^1番目の構成/ }).click();
     const originalSection = currentSceneSection(page);
     await selectBeam3D(page, 1);
-    await expect(originalSection.getByLabel("3Dビーム発光元X")).toHaveValue(/-3/);
+    await expect(originalSection.getByLabel("照明ビーム発光元X")).toHaveValue(/-3/);
   });
 
   // ------------------------------------------------------------------
@@ -331,15 +325,15 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await addLightingScene(page);
     await addLightingBeam3D(page);
 
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
 
     const undoButton = page.getByRole("button", { name: /元に戻す/ });
     await undoButton.click();
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toHaveCount(0);
 
     const redoButton = page.getByRole("button", { name: /やり直す/ });
     await redoButton.click();
-    await expect(page.getByRole("button", { name: "3D照明ビーム 1" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "照明ビーム 1" })).toBeVisible();
   });
 
   // ------------------------------------------------------------------
@@ -351,7 +345,7 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await switchToTopView(page);
     const section = currentSceneSection(page);
 
-    const sx = section.getByLabel("3Dビーム発光元X");
+    const sx = section.getByLabel("照明ビーム発光元X");
     const before = await sx.inputValue();
 
     // sourceマーカーは塗りつぶしcircle（fill付き、strokeなしの通常状態）として描画されている。
@@ -392,20 +386,20 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     await switchToAudienceView(page);
 
-    const layer = beam3DLayer(page);
-    await expect(layer).toBeVisible();
-    await expect(layer.locator("polygon")).toHaveCount(1);
+    const slices = audienceBeamSlices(page);
+    await expect(slices.first()).toBeVisible();
+    await expect(slices).toHaveCount(BEAM_DEPTH_SLICE_COUNT);
 
     // source.zを変更（平面図へ一度戻って数値入力）しても、俯瞰Beamが表示され続けること。
     await switchToTopView(page);
     const section = currentSceneSection(page);
-    const sz = section.getByLabel("3Dビーム発光元高さ");
+    const sz = section.getByLabel("照明ビーム発光元高さ");
     await sz.fill("12");
     await sz.blur();
 
     await switchToAudienceView(page);
-    await expect(beam3DLayer(page)).toBeVisible();
-    await expect(beam3DLayer(page).locator("polygon")).toHaveCount(1);
+    await expect(audienceBeamSlices(page).first()).toBeVisible();
+    await expect(audienceBeamSlices(page)).toHaveCount(BEAM_DEPTH_SLICE_COUNT);
   });
 
   // ------------------------------------------------------------------
@@ -415,9 +409,8 @@ test.describe("Lighting Beam v2・正式実装 STEP1", () => {
     await setupSceneWithOneBeam3D(page);
     await switchToTopView(page);
 
-    // aria-label="3D照明ビーム"（正式Beam v2のpolygonレイヤー）は俯瞰ビュー専用コンポーネント
-    // （OverheadAudienceView）にしか存在しないため、平面図ではDOM上に一切現れないはず。
-    await expect(beam3DLayer(page)).toHaveCount(0);
+    // Audienceのdepth slice本体は平面図に描画しない。
+    await expect(audienceBeamSlices(page)).toHaveCount(0);
 
     // source/targetのマーカー（circle）とガイド線（line）はSVG内に存在すること。
     const svg = page.locator("svg").first();

@@ -12,16 +12,12 @@ test.beforeEach(async ({ page }) => {
   await page.waitForLoadState("networkidle");
 });
 
-const lightingProjectToggle = (page) =>
-  page.getByLabel("照明機能を使う", { exact: true });
-
 const lightingDisplayToggle = (page) =>
-  page.getByLabel("舞台上に照明表示を出す", { exact: true });
+  page.getByLabel("照明を表示", { exact: true });
 
 async function enableLighting(page) {
-  const toggle = lightingProjectToggle(page);
+  const toggle = lightingDisplayToggle(page);
   await expect(toggle).toBeVisible();
-  await expect(toggle).not.toBeChecked();
   await toggle.check();
   await expect(toggle).toBeChecked();
 }
@@ -35,44 +31,31 @@ async function addCurrentLightingScene(page) {
   await addButton.click();
 
   await expect(
-    page.getByLabel("この構成の照明を有効にする")
+    page.getByLabel("この構成で照明を使用")
   ).toBeVisible();
 }
 
-test("Lightingは初期状態でOFF", async ({ page }) => {
-  const toggle = lightingProjectToggle(page);
-
-  await expect(toggle).toBeVisible();
-  await expect(toggle).not.toBeChecked();
-
-  // Lighting OFFでは構成ごとのLighting UIは表示しない。
-  await expect(
-    page.getByText("この構成の照明", { exact: true })
-  ).toHaveCount(0);
-
-  await expect(lightingDisplayToggle(page)).toHaveCount(0);
+test("新規ProjectはScene未作成で、照明表示とScene追加入口を利用できる", async ({ page }) => {
+  await expect(page.getByLabel("照明機能を使う", { exact: true })).toHaveCount(0);
+  await expect(lightingDisplayToggle(page)).toBeChecked();
+  await expect(page.getByLabel("この構成で照明を使用")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "＋ この構成に照明設定を追加" })).toBeVisible();
 });
 
-test("LightingをONにすると表示切替とScene追加入口が現れる", async ({
-  page,
-}) => {
+test("照明表示をOFF/ONにしてもScene追加入口を利用できる", async ({ page }) => {
+  await lightingDisplayToggle(page).uncheck();
+  await expect(lightingDisplayToggle(page)).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "＋ この構成に照明設定を追加" })).toBeVisible();
   await enableLighting(page);
-
-  await expect(lightingDisplayToggle(page)).toBeVisible();
   await expect(lightingDisplayToggle(page)).toBeChecked();
-
-  await expect(
-    page.getByRole("button", {
-      name: "＋ この構成に照明設定を追加",
-    })
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "＋ この構成に照明設定を追加" })).toBeVisible();
 });
 
 test("Lighting Sceneを追加してON/OFFできる", async ({ page }) => {
   await enableLighting(page);
   await addCurrentLightingScene(page);
 
-  const sceneToggle = page.getByLabel("この構成の照明を有効にする");
+  const sceneToggle = page.getByLabel("この構成で照明を使用");
 
   await expect(sceneToggle).toBeChecked();
 
@@ -81,42 +64,6 @@ test("Lighting Sceneを追加してON/OFFできる", async ({ page }) => {
 
   await sceneToggle.check();
   await expect(sceneToggle).toBeChecked();
-});
-
-test("Lighting Sceneメモを保存できる", async ({ page }) => {
-  await enableLighting(page);
-  await addCurrentLightingScene(page);
-
-  const memo = page.getByPlaceholder(
-    "例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
-  );
-
-  await expect(memo).toBeVisible();
-
-  await memo.fill("中央の出演者を強調。後方待機は見せない。");
-  await memo.blur();
-
-  await expect(memo).toHaveValue(
-    "中央の出演者を強調。後方待機は見せない。"
-  );
-
-  // WorkspaceのlocalStorage保存は300ms debounceなので、
-  // 保存完了を確認してからreloadする。
-  await expect(page.getByText("保存済み", { exact: true })).toBeVisible();
-
-  // 「保存済み」が初期状態から表示されている可能性もあるため、
-  // debounce時間を十分に超えるまで待って永続化完了を保証する。
-  await page.waitForTimeout(450);
-
-  // 再読み込みしても作品データとして残っていることを確認。
-  await page.reload();
-  await page.waitForLoadState("networkidle");
-
-  await expect(
-    page.getByPlaceholder(
-      "例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
-    )
-  ).toHaveValue("中央の出演者を強調。後方待機は見せない。");
 });
 
 test("Lighting Sceneを削除できる", async ({ page }) => {
@@ -146,25 +93,29 @@ test("同一Projectで構成を複製するとLighting Sceneも引き継がれ�
   await enableLighting(page);
   await addCurrentLightingScene(page);
 
-  const memo = page.getByPlaceholder(
-    "例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
-  );
+  // Phase T4: SceneメモUIは正式廃止。noteの保存互換性とは分けて、
+  // 現行UIのenabled引継ぎと、複製後の独立した編集を確認する。
+  const sceneToggle = page.getByLabel("この構成で照明を使用", { exact: true });
+  await sceneToggle.uncheck();
+  await expect(sceneToggle).not.toBeChecked();
 
-  await memo.fill("コピー確認用Lighting");
-  await memo.blur();
-
-  // 現在構成を複製。
-  // 構成一覧側に複数の「複製」系UIがある可能性を避け、
-  // キーボードコピー＆ペーストを利用する。
+  // 構成カードへフォーカスして、既存の構成コピー／貼り付けを使う。
+  await page.getByRole("button", { name: /^1番目の構成/ }).click();
   await page.keyboard.press("Meta+c");
   await page.keyboard.press("Meta+v");
+  await expect(page.getByRole("button", { name: /^2番目の構成/ })).toBeVisible();
+  await page.getByRole("button", { name: /^2番目の構成/ }).click();
+  await expect(sceneToggle).toBeVisible();
+  await expect(sceneToggle).not.toBeChecked();
 
-  // 貼り付け後は新しい構成へ移る既存仕様を利用。
-  await expect(
-    page.getByPlaceholder(
-      "例：中央を強調／後方待機は見せたくない／次の構成に向けて徐々に暗く"
-    )
-  ).toHaveValue("コピー確認用Lighting");
+  // 複製先だけをONにしても、元SceneのOFFは維持される。
+  await sceneToggle.check();
+  await expect(sceneToggle).toBeChecked();
+  await page.getByRole("button", { name: /^1番目の構成/ }).click();
+  await expect(sceneToggle).toBeVisible();
+  await expect(sceneToggle).not.toBeChecked();
+  await page.getByRole("button", { name: /^2番目の構成/ }).click();
+  await expect(sceneToggle).toBeChecked();
 });
 
 test("Formation削除後もLighting UIが正常に扱える", async ({ page }) => {
@@ -180,12 +131,10 @@ test("Formation削除後もLighting UIが正常に扱える", async ({ page }) =
     page.locator('[data-slide-index="1"]')
   ).toBeVisible();
 
-  // 新しい構成にはSceneがない。
+  // 新しい構成は元構成のSceneを引き継ぐため、追加入口ではなくSceneのUIを確認する。
   await expect(
-    page.getByRole("button", {
-      name: "＋ この構成に照明設定を追加",
-    })
-  ).toBeVisible();
+    page.getByLabel("この構成で照明を使用", { exact: true })
+  ).toBeChecked();
 
   // Undoで新しい構成を消す。
   // これによってslides変更後もLighting Scene参照が壊れないことを確認する。
@@ -198,12 +147,13 @@ test("Formation削除後もLighting UIが正常に扱える", async ({ page }) =
 
   // 元構成のSceneへ正常に戻れる。
   await expect(
-    page.getByLabel("この構成の照明を有効にする")
+    page.getByLabel("この構成で照明を使用")
   ).toBeVisible();
 });
 
-test("Lighting OFFでも従来のFormation編集を使える", async ({ page }) => {
-  await expect(lightingProjectToggle(page)).not.toBeChecked();
+test("照明表示OFFでも従来のFormation編集を使える", async ({ page }) => {
+  await lightingDisplayToggle(page).uncheck();
+  await expect(lightingDisplayToggle(page)).not.toBeChecked();
 
   await page.getByRole("button", {
     name: "＋ 出演者を追加",
@@ -222,7 +172,7 @@ test("Lighting OFFでも従来のFormation編集を使える", async ({ page }) 
   ).toBeVisible();
 
   // Lightingは依然OFF。
-  await expect(lightingProjectToggle(page)).not.toBeChecked();
+  await expect(lightingDisplayToggle(page)).not.toBeChecked();
 });
 
 test("舞台の外観設定が表示される", async ({ page }) => {

@@ -232,17 +232,22 @@ function getPlatforms(work) {
 const PLATFORM_MIN_SIZE = 0.5; // 舞台座標単位（0.5単位=45cm）。LIGHTING_AREA_MIN_SIZEと同じ考え方の下限
 const PLATFORM_MAX_SIZE = 40; // 極端に大きい値の保険上限（LIGHTING_AREA_MAX_SIZEと同じ値）
 const PLATFORM_MIN_HEIGHT = 0;
-const PLATFORM_MAX_HEIGHT = 10; // 高さ10＝9m相当。実用上十分すぎる保険上限
-const PLATFORM_HEIGHT_STEP = 0.25; // 45cmの半分（約22.5cm）刻みで調整できるようにする
+// 高台 Phase 3D・PART I・L：上限を10→20へ拡張。heightはAudience View（projectAudiencePoint3D）・
+// Lighting Beam/Area（surface height）等と共有する「舞台高さ表現用の数値」であり、XY平面の
+// 「1 stage unit = 90cm」のような物理cmとの固定縮尺は持たない（PART K：XYの90cmルールは
+// このheightには適用しない）。実用上十分な範囲へ収めるための保険上限として20とする。
+const PLATFORM_MAX_HEIGHT = 20;
+const PLATFORM_HEIGHT_STEP = 0.25; // 0.25刻みで調整できるようにする
 
 // 新規高台のdefault値（高台default値変更 v1：舞台奥いっぱいに横長の高台）。舞台サイズが
 // 小さい場合でも高台が舞台外へ完全にはみ出さないよう、width/depthをstageサイズに応じて
 // clampする（createDefaultLightingArea()と全く同じ考え方）。
 // width=stage.width（舞台幅いっぱい）・depth=1.5・x=0・y=stage.depth - depth/2（奥側の辺が
-// stage.depthとぴったり一致する位置）・height=5（高台default height変更 v1：2→5、
-// 1単位=90cmのため450cm相当）。この値は既存clampPlatformGeometry()を通しても位置変更
-// されない有効なgeometryになるよう設計している（4章：xMin/xMaxが両方0に、yがyMaxに
-// 一致するため）。clampPlatformGeometry()自体はここでは変更しない。
+// stage.depthとぴったり一致する位置）・height=5（高台default height変更 v1：2→5。heightは
+// Audience View等と共有する舞台高さ表現用の数値で、XYの「1 stage unit=90cm」のような
+// 固定cm換算は持たない＝高台 Phase 3D・PART K・L）。この値は既存clampPlatformGeometry()を
+// 通しても位置変更されない有効なgeometryになるよう設計している（4章：xMin/xMaxが両方0に、
+// yがyMaxに一致するため）。clampPlatformGeometry()自体はここでは変更しない。
 function createDefaultPlatform(stage, index = 0) {
   const safeStage = stage && Number.isFinite(stage.width) && Number.isFinite(stage.depth) ? stage : { width: 20, depth: 10 };
   const width = clamp(safeStage.width, PLATFORM_MIN_SIZE, safeStage.width);
@@ -297,6 +302,206 @@ function clampPlatformGeometry(stage, platform) {
   const x = clamp(Number.isFinite(platform.x) ? platform.x : 0, xMin, xMax);
   const y = clamp(Number.isFinite(platform.y) ? platform.y : 0, yMin, yMax);
   return { ...platform, width, depth, x, y };
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1A：work.stageConnectors（階段）
+// ------------------------------------------------------------------
+// work.platformsとは別の並列データ。platformの「点があれば矩形と高さが1つ決まる」という
+// 意味論と、connectorの「fromSurfaceからtoSurfaceへの接続構造」という意味論を混ぜないため、
+// スキーマ・pure helperとも意図的にplatform用と共用しない（PART F・Q）。
+// schema： { id, type: "stairs", name, x, y, width, depth, facing, fromSurfaceId, toSurfaceId }
+//   type            … 現在は"stairs"固定（他のtype値は現状扱わない）。
+//   x / y           … 占有矩形の中心点。platform/Lighting Areaと全く同じ舞台座標系・意味論。
+//   width / depth   … TopView上の占有矩形サイズ（1 stage unit = 90cm、platformと同じ単位）。
+//   facing          … 昇る方向。"upstage" | "downstage" | "stageLeft" | "stageRight"。
+//   fromSurfaceId   … 今回はnull固定運用（=通常舞台）。将来platform.idにも対応できるよう
+//                      文字列IDとして保持できる形にしておくだけで、今回は編集UI上「通常舞台」
+//                      以外を選ばせない、という制限はしない（PART D通りselect自体は用意する）。
+//   toSurfaceId     … null（接続先未設定/通常舞台扱い）またはplatform.id。
+// 古いProject（stageConnectorsフィールドが存在しない）はgetStageConnectors()で常に[]へ
+// フォールバックする（getPlatforms()と全く同じ「optional field + fallback」方針。一括
+// migrationは行わない＝PART O）。
+// 今回のスコープ（Phase 1A）：schema・CRUD・side panel編集・TopView表示専用。
+// resolvePlatformAtPoint()・resolvePlacementSurfaceHeight()・遮蔽・Lighting auto・
+// Audience Viewには一切接続しない（PART K・L・M・Q）。
+function getStageConnectors(work) {
+  return work && Array.isArray(work.stageConnectors) ? work.stageConnectors : [];
+}
+
+const STAGE_CONNECTOR_TYPES = ["stairs"];
+const STAGE_CONNECTOR_FACINGS = ["upstage", "downstage", "stageLeft", "stageRight"];
+
+// platformのPLATFORM_MIN_SIZE/PLATFORM_MAX_SIZEと同じ考え方の下限・上限だが、connector用に
+// 独立した定数として持つ（LIGHTING_AREA_MIN_SIZE等、既存コードが概念ごとに定数を分けている
+// パターンを踏襲＝PART F）。
+const STAGE_CONNECTOR_MIN_SIZE = 0.5;
+const STAGE_CONNECTOR_MAX_SIZE = 40;
+
+// facingの安全なfallback。不正値・未定義は常に"upstage"（PART Eのデフォルトと一致）。
+function getStageConnectorFacing(connector) {
+  return connector && STAGE_CONNECTOR_FACINGS.includes(connector.facing) ? connector.facing : "upstage";
+}
+
+// fromSurfaceId/toSurfaceIdの安全なgetter。getPlacementSurfaceId()と全く同じ
+// 「文字列でなければnull」というfallback方針。
+function getStageConnectorFromSurfaceId(connector) {
+  return connector && typeof connector.fromSurfaceId === "string" ? connector.fromSurfaceId : null;
+}
+function getStageConnectorToSurfaceId(connector) {
+  return connector && typeof connector.toSurfaceId === "string" ? connector.toSurfaceId : null;
+}
+
+// UI表示用ラベル（PART E）。保存値はupstage/downstage/stageLeft/stageRightの英語enumのまま、
+// 表示だけ日本語化する。既存AREA_LABELS等と同じ「保存値と表示文字列を分離する」パターン。
+const STAGE_CONNECTOR_FACING_LABELS = {
+  upstage: "奥へ上る",
+  downstage: "手前へ上る",
+  stageLeft: "舞台左へ上る",
+  stageRight: "舞台右へ上る",
+};
+
+// 新規stairs生成helper（PART B）。既存createDefaultPlatform()と同じ考え方
+// （stageサイズが小さくても矩形全体がstage内に収まるdefault値にする）を踏襲する。
+// toSurfaceIdのdefaultは「既存platformの先頭1件があればそれ、無ければnull」という仕様
+// （PART B）で、この判定はここに閉じ込め、呼び出し側でplatforms一覧を二重に見ない。
+function createDefaultStageConnector(stage, platforms, index = 0) {
+  const safeStage = stage && Number.isFinite(stage.width) && Number.isFinite(stage.depth) ? stage : { width: 20, depth: 10 };
+  const width = clamp(2, STAGE_CONNECTOR_MIN_SIZE, safeStage.width);
+  const depth = clamp(2, STAGE_CONNECTOR_MIN_SIZE, safeStage.depth);
+  // PART B仕様のy = stage.depth - 1を、矩形全体がstage内に収まるようclampしてから使う
+  // （clampPlatformGeometryのxMin/xMax/yMin/yMax算出と同じ考え方）。
+  const y = clamp(safeStage.depth - 1, depth / 2, safeStage.depth - depth / 2);
+  const list = Array.isArray(platforms) ? platforms : [];
+  const firstPlatform = list.find((pl) => pl && typeof pl.id === "string");
+  return {
+    id: makeId("stageConnector"),
+    type: "stairs",
+    name: `階段${index + 1}`,
+    x: 0,
+    y,
+    width,
+    depth,
+    facing: "upstage",
+    fromSurfaceId: null,
+    toSurfaceId: firstPlatform ? firstPlatform.id : null,
+  };
+}
+
+// 高台のclampPlatformGeometry()と同じ「矩形全体を常にstage内へ収める」2段階clampだが、
+// platform schemaとは意図的に別関数にする（PART F：schema意味論を混ぜない）。
+// name/type/facing/fromSurfaceId/toSurfaceId等、幾何以外のfieldには一切触れない。
+// Stage Connector Phase 1D・PART A・B：stairsだけはstage内限定から拡張し、既存のwaiting
+// area座標系（computeZones()）が定義するstage＋stageLeft＋stageRight＋upstageBackstageの
+// 外接矩形まで配置できるようにする。新しい座標系・新しいmargin定数は一切作らず、出演者
+// placementが既に使っているのと全く同じcomputeZones()をそのまま呼ぶだけで、
+// SIDE_WAITING_RATIO等の意味論をここで再実装しない（PART B）。platform用の
+// clampPlatformGeometry()はこの変更と完全に独立しており、一切変更しない（PART C：高台は
+// 引き続きstage内限定のまま）。
+function clampStageConnectorGeometry(stage, connector) {
+  if (!connector) return connector;
+  const safeStage = stage && Number.isFinite(stage.width) && Number.isFinite(stage.depth) ? stage : { width: 20, depth: 10 };
+  const zones = computeZones(safeStage);
+  // 外接矩形＝下手袖の外端(xMin)〜上手袖の外端(xMax)、舞台前端(yMin=0)〜舞台奥waiting areaの
+  // 奥端(yMax)。stage自体はこの範囲に完全に含まれるため、stage中央に置かれた既存stairsは
+  // 従来通りの範囲のまま扱われる（後方互換）。
+  const outerXMin = zones.stageLeft.xMin;
+  const outerXMax = zones.stageRight.xMax;
+  const outerYMin = zones.stage.yMin;
+  const outerYMax = zones.upstageBackstage.yMax;
+  const width = clamp(Number(connector.width) || STAGE_CONNECTOR_MIN_SIZE, STAGE_CONNECTOR_MIN_SIZE, outerXMax - outerXMin);
+  const depth = clamp(Number(connector.depth) || STAGE_CONNECTOR_MIN_SIZE, STAGE_CONNECTOR_MIN_SIZE, outerYMax - outerYMin);
+  const xMin = outerXMin + width / 2;
+  const xMax = outerXMax - width / 2;
+  const yMin = outerYMin + depth / 2;
+  const yMax = outerYMax - depth / 2;
+  const x = clamp(Number.isFinite(connector.x) ? connector.x : 0, xMin, xMax);
+  const y = clamp(Number.isFinite(connector.y) ? connector.y : 0, yMin, yMax);
+  return { ...connector, width, depth, x, y };
+}
+
+// stairs1件の「舞台座標上の矩形範囲」を返す共通pure helper（PART F）。getPlatformStageRect()と
+// 同じ考え方（x/yは中心点）だが、独立したconnector schema専用のhelperとして分離する
+// （platform helperをそのまま流用してschema意味論を混ぜない、という今回の方針）。
+function getStageConnectorStageRect(connector) {
+  if (!connector) return null;
+  const width = Math.max(STAGE_CONNECTOR_MIN_SIZE, Number(connector.width) || STAGE_CONNECTOR_MIN_SIZE);
+  const depth = Math.max(STAGE_CONNECTOR_MIN_SIZE, Number(connector.depth) || STAGE_CONNECTOR_MIN_SIZE);
+  const x = Number.isFinite(connector.x) ? connector.x : 0;
+  const y = Number.isFinite(connector.y) ? connector.y : 0;
+  return {
+    xMin: x - width / 2,
+    xMax: x + width / 2,
+    yMin: y - depth / 2,
+    yMax: y + depth / 2,
+  };
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1A・PART G・H・I：TopView / TopView Exportで共有するstairs visual用
+// pure geometry helper
+// ------------------------------------------------------------------
+// connector（x/y/width/depth/facing）だけから、舞台座標系（getStageConnectorStageRect()と
+// 同じ座標系）でline segment群を算出する。呼び出し側（SVGのtoScreenX/Y・CanvasのtoX/Y）は
+// 自前の座標変換へ通すだけでよく、幾何計算自体はTopViewとExportで二重実装しない
+// （getPlatformStageRect()と全く同じ考え方＝PART J）。
+// facingは「昇る方向」＝矩形のどちらの辺が高い側（toSurface側）かを表す。
+//   upstage    … 高い側の辺はyMax（舞台奥側）。移動方向はY軸 → 段差線はY軸に直交する横線。
+//   downstage  … 高い側の辺はyMin（客席側）。同じくY軸 → 横線。
+//   stageLeft  … 高い側の辺はxMin（下手側）。移動方向はX軸 → 段差線はX軸に直交する縦線。
+//   stageRight … 高い側の辺はxMax（上手側）。同じくX軸 → 縦線。
+const STAGE_CONNECTOR_FACING_VECTORS = {
+  upstage: { fx: 0, fy: 1 },
+  downstage: { fx: 0, fy: -1 },
+  stageLeft: { fx: -1, fy: 0 },
+  stageRight: { fx: 1, fy: 0 },
+};
+
+// 段数は永続fieldとして保存しない（PART H）。視認性優先の固定本数。
+const STAGE_CONNECTOR_STAIRS_STEP_COUNT = 3;
+
+function getStageConnectorStairsGeometry(connector) {
+  const rect = getStageConnectorStageRect(connector);
+  if (!rect) return null;
+  const { fx, fy } = STAGE_CONNECTOR_FACING_VECTORS[getStageConnectorFacing(connector)];
+  const isVerticalTravel = fy !== 0; // upstage/downstage：移動方向がY軸 → 段差線は横線
+
+  // 内部の段差線（PART H）：等間隔にSTEP_COUNT本。矩形の外枠（TopView側でdashed rectとして
+  // 別途描く）とは重ならないよう、両端を含まない内側だけに配置する。
+  const stepLines = [];
+  for (let i = 1; i <= STAGE_CONNECTOR_STAIRS_STEP_COUNT; i += 1) {
+    const t = i / (STAGE_CONNECTOR_STAIRS_STEP_COUNT + 1);
+    if (isVerticalTravel) {
+      const y = rect.yMin + (rect.yMax - rect.yMin) * t;
+      stepLines.push({ x1: rect.xMin, y1: y, x2: rect.xMax, y2: y });
+    } else {
+      const x = rect.xMin + (rect.xMax - rect.xMin) * t;
+      stepLines.push({ x1: x, y1: rect.yMin, x2: x, y2: rect.yMax });
+    }
+  }
+
+  // 上り方向の高い側の辺（PART I：太線で強調する側）。
+  const topEdge = isVerticalTravel
+    ? { x1: rect.xMin, y1: fy > 0 ? rect.yMax : rect.yMin, x2: rect.xMax, y2: fy > 0 ? rect.yMax : rect.yMin }
+    : { x1: fx > 0 ? rect.xMax : rect.xMin, y1: rect.yMin, x2: fx > 0 ? rect.xMax : rect.xMin, y2: rect.yMax };
+
+  // 上り方向を示す小さなchevron（矢印、PART I）。矩形中心から上り方向へ向く「V」字1本のみ。
+  // 文字ラベルは追加しない。
+  const cx = (rect.xMin + rect.xMax) / 2;
+  const cy = (rect.yMin + rect.yMax) / 2;
+  const arrowSize = clamp(Math.min(rect.xMax - rect.xMin, rect.yMax - rect.yMin) * 0.18, 0.15, 0.6);
+  const px = -fy;
+  const py = fx;
+  const tipX = cx + fx * arrowSize;
+  const tipY = cy + fy * arrowSize;
+  const backX = cx - fx * arrowSize * 0.5;
+  const backY = cy - fy * arrowSize * 0.5;
+  const chevron = [
+    { x1: backX + px * arrowSize * 0.6, y1: backY + py * arrowSize * 0.6, x2: tipX, y2: tipY },
+    { x1: backX - px * arrowSize * 0.6, y1: backY - py * arrowSize * 0.6, x2: tipX, y2: tipY },
+  ];
+
+  return { rect, stepLines, topEdge, chevron };
 }
 
 // ------------------------------------------------------------------
@@ -445,6 +650,9 @@ function createDefaultLightingArea(stage) {
     color: "white",
     intensity: DEFAULT_LIGHTING_AREA_INTENSITY,
     rotation: 0, // Lighting Area 回転 v1・5章：新規Areaは常に0°（既存Projectはrotation未定義→読み取り時に0へfallback）
+    // Phase 3F-B: new Areas start auto; missing mode in existing Areas remains manual.
+    surfaceMode: "auto",
+    surfaceId: null,
     // Lighting Area Move v1・STEP 2：新規Areaはpositionmovecounts未設定（=0/瞬時切替）のまま。
     // ここで明示的に0をセットする必要はない（getLightingAreaPositionMoveCounts()が
     // 未定義を0へfallbackするため）が、フィールドの存在をコード上わかりやすくする目的で
@@ -1332,6 +1540,14 @@ function interpolatePlacements(fromPlacements, toPlacements, progress, transitio
         // PART E）。それ以外（Phase 2Aまでの既存挙動）は従来どおり「到着の瞬間にのみ
         // 切り替え」のまま変わらない。
         surfaceId: resolveTransitionPlacementSurfaceId(a, b, { x: currentX, y: currentY, area: currentArea }, progress, platforms),
+        // Stage Connector Phase 1G・PART Q：この一時的な補間結果オブジェクトはsurfaceMode
+        // フィールドを持たなかったため、resolvePlacementEffectiveSurfaceHeight()が
+        // getPlacementSurfaceMode()で判定すると常に"manual"にfallbackし、Transition中は
+        // stairs continuous heightが一切効かなかった（work/slidesへは保存しないrender-time
+        // 一時objectへ、resolveTransitionPlacementSurfaceId()と全く同じ「A/B両方がauto」
+        // 判定をそのまま複製するだけで、resolveTransitionPlacementSurfaceId()自体は変更しない
+        // ＝PART E）。
+        surfaceMode: getPlacementSurfaceMode(a) === "auto" && getPlacementSurfaceMode(b) === "auto" ? "auto" : "manual",
         // 姿勢 v1.1→移動時の姿勢v1：poseの決定はresolveTransitionPose()という共通pure
         // helperへ集約した（曲線側のinterpolatePlacementsWithPathsと同じ判定を共有し、
         // 二重実装しない）。transitionPoseConfigが無い、またはそのperformerのentryが
@@ -1788,6 +2004,9 @@ function interpolatePlacementsWithPaths(fromPlacements, toPlacements, progress, 
       y: point.y,
       area: currentArea,
       surfaceId: resolveTransitionPlacementSurfaceId(a, b, { x: point.x, y: point.y, area: currentArea }, progress, platforms),
+      // Stage Connector Phase 1G・PART Q：直線側（interpolatePlacements）と全く同じ理由・
+      // 全く同じ判定式で、曲線側の一時的な補間結果objectにもsurfaceModeを保持する。
+      surfaceMode: getPlacementSurfaceMode(a) === "auto" && getPlacementSurfaceMode(b) === "auto" ? "auto" : "manual",
       pose: resolveTransitionPose(a.pose, b.pose, progress, transitionPoseConfig && transitionPoseConfig[id]),
     };
   });
@@ -1811,6 +2030,80 @@ function trajectoryArrowPoints(x1, y1, x2, y2, size) {
   const backY = y2 - uy * size;
   const halfW = size * 0.55;
   return `${x2},${y2} ${backX + px * halfW},${backY + py * halfW} ${backX - px * halfW},${backY - py * halfW}`;
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1I：Audience 3D trajectory
+// ------------------------------------------------------------------
+// Audience View（screen/Export）の移動軌跡だけに使う、既存transition engineへの最小限の
+// 差し込み。新しい3D移動エンジン・新しいcurve定義・新しいZ補間式は一切作らず、既存の
+// interpolatePlacementsWithPaths()（straight/curve・area・surfaceMode・surfaceIdをすべて
+// 既存ロジックのまま解決する）とresolvePlacementEffectiveSurfaceHeight()（Phase 1E〜1F.1の
+// stairs/platform continuous height）・projectAudiencePoint3D()をそのまま呼ぶだけ（PART B・
+// C・F・K）。
+// XY trajectory自体（straight/curveの形）はTopViewと完全に同じ経路データ（fromPos/toPos/
+// pathConfig）から毎回導出するため、performer本人のTransition経路とズレることがない
+// （PART F）。sample数は固定の小さな定数にとどめ（PART D）、過剰な計算コストを避ける。
+const AUDIENCE_TRAJECTORY_SAMPLE_COUNT = 32;
+
+// 1本のtrajectory（1 performer分のfrom→to）を、sample地点ごとのscreen point列へ変換する
+// 共通pure helper。screen（OverheadAudienceView）とExport（renderAudienceFormationExport）の
+// 両方がこの関数だけを呼び、Z計算・投影ロジックを二重実装しない（PART AC）。
+//   1. t=0..1をAUDIENCE_TRAJECTORY_SAMPLE_COUNT+1点でsample
+//   2. 各tについて、fromPos/toPosだけを含む最小限のplacements mapをinterpolatePlacementsWithPaths()
+//      へ通す（straight/curveどちらも既存関数が判定・計算する。曲線かどうかはpathConfigの
+//      有無で決まり、ここでは判定しない＝PART F）。戻り値のtemporary placementは、area・
+//      surfaceMode・surfaceIdまで既存のresolveTransitionArea()・
+//      resolveTransitionPlacementSurfaceId()・surfaceMode伝播（Phase 1G）で解決済み
+//      （PART G・H・I・J）。
+//   3. resolvePlacementEffectiveSurfaceHeight()でauto/manualそれぞれの実効高さを求める
+//      （PART K：新しいstairs height式を作らない）。
+//   4. projectAudiencePoint3D()でscreen座標へ投影する（PART C）。
+// fromPos/toPosのどちらかが無い場合は空配列を返す（PART AB：既存のtrajectory非表示条件を
+// 踏襲し、新しいnull crashを作らない）。
+// Stage Connector Phase 1I.2・PART I・J・K：maxProgress（0〜1、既存呼び出し元との互換のため
+// default 1）を追加した。0..maxProgressの範囲だけをAUDIENCE_TRAJECTORY_SAMPLE_COUNT+1点の
+// 固定gridからsampleし、Lighting Cue Exportのpartial trajectory（Cue progressに応じて
+// 途中まで伸びる軌跡）を、full pathと全く同じphysics・同じgridで表現できるようにする。
+// 既存呼び出し元（screen・通常Audience Formation Export）はmaxProgressを渡さないため、
+// 常にt=0..1のfull gridのまま、挙動は一切変わらない。gridの最後の点がちょうど
+// maxProgressと一致しない場合（例：maxProgress=0.375）は、末尾へexact maxProgress地点を
+// 追加し、trajectory末端が実際のperformer current position（同じprogressでの
+// interpolatePlacementsWithPaths()の結果）と必ず一致するようにする（PART K）。
+function buildAudienceTrajectoryScreenPoints(performerId, fromPos, toPos, pathConfig, platforms, zones, stageConnectors, bounds, stageDepth, maxProgress = 1) {
+  if (!fromPos || !toPos) return [];
+  const clampedMax = clamp(maxProgress, 0, 1);
+  const fromMap = { [performerId]: fromPos };
+  const toMap = { [performerId]: toPos };
+  const points = [];
+  let lastT = -1;
+  const projectAtProgress = (t) => {
+    const interpolated = interpolatePlacementsWithPaths(fromMap, toMap, t, pathConfig, null, platforms, zones)[performerId];
+    if (!interpolated) return null;
+    const z = resolvePlacementEffectiveSurfaceHeight(interpolated, platforms, stageConnectors);
+    return projectAudiencePoint3D(bounds, stageDepth, interpolated.x, interpolated.y, z);
+  };
+  for (let i = 0; i <= AUDIENCE_TRAJECTORY_SAMPLE_COUNT; i += 1) {
+    const t = i / AUDIENCE_TRAJECTORY_SAMPLE_COUNT;
+    if (t > clampedMax) break;
+    const p = projectAtProgress(t);
+    if (!p) continue;
+    points.push(p);
+    lastT = t;
+  }
+  if (clampedMax > lastT + 1e-9) {
+    const p = projectAtProgress(clampedMax);
+    if (p) points.push(p);
+  }
+  return points;
+}
+
+// sample点列からSVG polyline用の"M x y L x y L x y..."パス文字列を作るだけの小さなpure
+// helper（screen側で使用。Export側はCanvas lineToで同じpoints配列を直接使うため、この
+// 文字列化は不要）。
+function audienceTrajectoryPointsToPathD(points) {
+  if (!points || points.length < 2) return "";
+  return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.sx} ${p.sy}`).join(" ");
 }
 
 function roundZoom(z) {
@@ -2113,6 +2406,10 @@ function createInitialWork() {
     // 高台 Phase 1A・10-1章：新規workは常に[]から始める。古いworkはgetPlatforms()により
     // 自動的に[]へフォールバックするため、一括migrationは不要。
     platforms: [],
+    // Stage Connector Phase 1A・PART O：platformsと全く同じ考え方で、新規workは常に[]から
+    // 始める。古いworkはgetStageConnectors()により自動的に[]へフォールバックするため、
+    // 一括migrationは不要。
+    stageConnectors: [],
     slides: [createInitialSlide()],
     currentSlideIndex: 0,
     transitionCounts: {}, // { [移動元スライドのid]: カウント数 }。未設定時はDEFAULT_TRANSITION_COUNTSにフォールバックする
@@ -3370,6 +3667,73 @@ function getPlacementSurfaceMode(placement) {
   return placement && placement.surfaceMode === "auto" ? "auto" : "manual";
 }
 
+// ------------------------------------------------------------------
+// Stage Connector Phase 1F：auto performer surface × stairs height
+// ------------------------------------------------------------------
+// Audience View（screen/Export）の出演者Z決定だけに使う、既存surface architectureへの
+// 最小限の差し込み。既存resolvePlacementSurfaceHeight()・getPlacementSurfaceMode()は
+// 一切変更せず、そのまま呼ぶだけ（PART A・S：大規模refactorはしない。continuous height式は
+// Phase 1Eのresolveheight・list resolverをそのまま再利用し、ここで再実装しない）。
+//   manual（surfaceMode !== "auto"）→ 常にresolvePlacementSurfaceHeight()と完全に同じ結果
+//     （PART C：stairsを一切参照しない。manual performerをstairs rect上へ置いても自動で
+//     stairs高さへ乗らない。stageLeft/stageRight/upstageBackstage等のwaiting areaにいても
+//     同じ＝Phase 1F.1・PART C）。
+//   auto → areaに関わらず（Phase 1F.1・PART A・E：stage / stageLeft / stageRight /
+//     upstageBackstageのどこにいても同じ優先順位で扱う）、まずPhase 1Eのresolveheight
+//     resolveStageConnectorHeightAtPointFromList(placement.x, placement.y, stageConnectors,
+//     platforms)を試す。0も有効な高さのため、必ず`stairsZ !== null`で判定する（truthy判定は
+//     使わない＝PART D）。stairsZがnullなら、既存resolvePlacementSurfaceHeight()へfallbackする
+//     （PART E・F：stairs rect内は常にstairs優先、外は既存挙動）。stage areaでは
+//     resolvePlacementSurfaceHeight()がplatform auto/manual heightを返し、waiting area
+//     （area!=="stage"）ではその関数自身の既存安全条件により常に0を返す――つまり
+//     「waiting area + auto + stairs外は0のまま」（Phase 1F.1・PART B）は、
+//     resolvePlacementSurfaceHeight()の既存ロジックへ委譲するだけで自動的に成立し、
+//     ここへ新しいarea分岐を追加する必要はない。stairsとplatform footprintが重なっていても、
+//     rect内である限りstairs Zを優先することで、high側へ近づく途中でplatform footprintへ
+//     入った瞬間にZがジャンプするのを防ぐ。
+// Audience Ghost表示（getStageConnectorAudienceDisplayMode()）はここでは一切参照しない
+// （PART D・I：Ghost sleeve stairsも通常のstairsと全く同じ物理構造として扱う。Ghostか
+// normalかは描画表現だけで、heightはstageConnectors geometry＋from/to surface＋XYだけで
+// 決まる）。
+// placement.surfaceIdへstairsのidを書き込むことは一切しない（PART G：schema変更禁止。
+// continuous Zは呼び出しの都度algorithmで求めるderived valueのまま）。
+function resolvePlacementEffectiveSurfaceHeight(placement, platforms, stageConnectors) {
+  if (!placement || getPlacementSurfaceMode(placement) !== "auto") {
+    return resolvePlacementSurfaceHeight(placement, platforms);
+  }
+  const stairsZ = resolveStageConnectorHeightAtPointFromList(placement.x, placement.y, stageConnectors, platforms);
+  return stairsZ !== null ? stairsZ : resolvePlacementSurfaceHeight(placement, platforms);
+}
+
+// Phase 3E: UI-only common value. Auto ignores individually resolved surface IDs.
+// Missing platform references display as the normal stage, as in the single editor.
+function getSelectedPlacementSurfaceValue(placements, selectedIds, platforms) {
+  const selected = selectedIds.map((id) => placements[id]);
+  if (!selected.length || selected.some((pos) => !pos)) return "";
+  const mode = getPlacementSurfaceMode(selected[0]);
+  const surfaceId = getPlacementSurfaceId(selected[0]);
+  if (selected.some((pos) => getPlacementSurfaceMode(pos) !== mode ||
+      (mode !== "auto" && getPlacementSurfaceId(pos) !== surfaceId))) return "";
+  if (mode === "auto") return "__auto__";
+  const list = Array.isArray(platforms) ? platforms : [];
+  return list.some((pl) => pl && pl.id === surfaceId) ? surfaceId : "__stage__";
+}
+
+// Produces one placements update; committing/history remains the existing handler's job.
+function applySurfaceSettingToSelectedPlacements({ placements, selectedIds, mode, platformId, platforms }) {
+  let next = placements;
+  selectedIds.forEach((id) => {
+    const pos = placements[id];
+    if (!pos) return;
+    const surfaceMode = mode === "auto" ? "auto" : "manual";
+    const surfaceId = surfaceMode === "auto" ? resolveAutoPlacementSurfaceId(pos, platforms) : platformId || null;
+    if (pos.surfaceMode === surfaceMode && pos.surfaceId === surfaceId) return;
+    if (next === placements) next = { ...placements };
+    next[id] = { ...pos, surfaceMode, surfaceId };
+  });
+  return next;
+}
+
 // 指定した舞台座標(x, y)を含む高台のうち、最も高いものを1つ返す（無ければnull）。
 // 矩形判定は既存getPlatformStageRect()をそのまま再利用し、独自の矩形計算は増やさない。
 // 複数platformが重なる場合は「height最大」を採用し、同heightの場合はplatforms配列の
@@ -3460,109 +3824,232 @@ function isPlacementUnderPlatform(placement, platforms) {
   return !!resolvePlatformAtPoint(placement.x, placement.y, platforms);
 }
 
-// 高台 Phase 2D・PART H・I・J・K：「舞台奥待機の出演者が、高台の後ろに隠れて見える」判定。
-// ray castingやpolygon depth bufferのような本格的な3D遮蔽engineは作らず、現在の矩形高台と
-// stage座標だけを使った最小限のderived判定にする（保存fieldは持たない・完全に毎回導出）。
-// 矩形は必ず既存getPlatformStageRect()を再利用し、独自のplatform.x±width/2計算は行わない。
-// 条件（いずれか1つのplatformで満たせばtrue）：
-//   1. placement.area === "upstageBackstage"（下手袖・上手袖は対象外＝isWingPlacementOccludedByPlatform()の責務）
-//   2. 高台のheightが0より大きい（高さの無い高台は遮蔽しない）
-// 高台 Phase 2D.1f：横方向の判定を「高台真正面（coreX）」と「左右の補助遮蔽領域
-// （extendedX）」の2つに分岐し、奥行きの遮蔽開始位置をそれぞれ別に扱う。
-//   3a. 真正面（rect.xMin〜rect.xMaxの内側）にいる場合：
-//       placement.yがrect.yMax以上（高台奥端を越えた瞬間から遮蔽）。高台が1台だけの
-//       構成でも、真正面の裏側がPLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN分だけ透けて
-//       見えてしまう実機フィードバックに基づく修正。
-//   3b. 真正面の外側で、左右へPLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGINだけ広げた
-//       補助領域にいる場合：placement.yがrect.yMax + PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN
-//       以上（高台 Phase 2D.1c/1dで調整した「奥端からさらに奥へ入ってから遮蔽」を維持）。
-//       これは、内部areaがupstageBackstageになっている袖後方出演者を
-//       isWingPlacementOccludedByPlatform()（stageLeft/stageRight専用）が拾えない隙間を
-//       Backstage側から補うための領域（高台 Phase 2D.1b由来）。
-//   4. 上記いずれにも該当しなければfalse。
-// 高台 Phase 2D.1b：横方向の遮蔽帯を高台の横端から左右へ広げるための表示判定専用定数
-// （保存schemaではない）。isWingPlacementOccludedByPlatform()のPLATFORM_WING_OCCLUSION_*
-// とは別の定数として持つ（役割分担：upstageBackstage用はこちら、stageLeft/stageRight用は
-// あちら、を維持するため）。
-const PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN = 2.0; // 高台の横端から外側へ広げる帯の幅（180cm）
-// 高台 Phase 2D.1c：奥行き方向の遮蔽開始位置を高台の奥端からさらに奥へずらすための
-// 表示判定専用定数（保存schemaではない）。横方向のSIDE_MARGINとは別軸のmarginのため、
-// 別の定数として持つ。Phase 2D.1fでは、この定数は「左右の補助遮蔽領域（extendedX）」
-// だけに適用し、真正面（coreX）には適用しない。
-const PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN = 1.5; // 高台奥端からさらに奥へずらす距離（135cm）
-function isBackstagePlacementOccludedByPlatform(placement, platforms) {
-  if (!placement || placement.area !== "upstageBackstage") return false;
-  const list = Array.isArray(platforms) ? platforms : [];
-  return list.some((platform) => {
-    if (!platform) return false;
-    const height = Number.isFinite(platform.height) ? platform.height : 0;
-    if (height <= 0) return false;
-    const rect = getPlatformStageRect(platform);
-    if (!rect) return false;
-    const insideCoreX = placement.x >= rect.xMin && placement.x <= rect.xMax;
-    if (insideCoreX) {
-      return placement.y >= rect.yMax;
-    }
-    const insideExtendedX =
-      placement.x >= rect.xMin - PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN &&
-      placement.x <= rect.xMax + PLATFORM_BACKSTAGE_OCCLUSION_SIDE_MARGIN;
-    if (insideExtendedX) {
-      return placement.y >= rect.yMax + PLATFORM_BACKSTAGE_OCCLUSION_DEPTH_MARGIN;
-    }
-    return false;
+// Phase 3D.1: Backstage uses the rendered front/top silhouette, not stage-space margins.
+// Screen polygons use the { sx, sy } coordinates returned by the existing projection.
+function isPointInScreenPolygon(point, polygon) {
+  if (!point || !Number.isFinite(point.sx) || !Number.isFinite(point.sy) ||
+      !Array.isArray(polygon) || polygon.length < 3 ||
+      polygon.some((p) => !p || !Number.isFinite(p.sx) || !Number.isFinite(p.sy))) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[j], b = polygon[i];
+    const cross = (point.sx - a.sx) * (b.sy - a.sy) - (point.sy - a.sy) * (b.sx - a.sx);
+    if (Math.abs(cross) <= 1e-7 && point.sx >= Math.min(a.sx, b.sx) && point.sx <= Math.max(a.sx, b.sx) &&
+        point.sy >= Math.min(a.sy, b.sy) && point.sy <= Math.max(a.sy, b.sy)) return true;
+    if ((a.sy > point.sy) !== (b.sy > point.sy) &&
+        point.sx < (b.sx - a.sx) * (point.sy - a.sy) / (b.sy - a.sy) + a.sx) inside = !inside;
+  }
+  return inside;
+}
+
+function doesVerticalScreenSegmentIntersectPolygon(x, yTop, yBottom, polygon) {
+  if (![x, yTop, yBottom].every(Number.isFinite) || !Array.isArray(polygon) || polygon.length < 3 ||
+      polygon.some((p) => !p || !Number.isFinite(p.sx) || !Number.isFinite(p.sy))) return false;
+  const lo = Math.min(yTop, yBottom), hi = Math.max(yTop, yBottom);
+  if (isPointInScreenPolygon({ sx: x, sy: lo }, polygon) || isPointInScreenPolygon({ sx: x, sy: hi }, polygon)) return true;
+  return polygon.some((a, i) => {
+    const b = polygon[(i + 1) % polygon.length];
+    if (x < Math.min(a.sx, b.sx) || x > Math.max(a.sx, b.sx)) return false;
+    if (a.sx === b.sx) return Math.max(lo, Math.min(a.sy, b.sy)) <= Math.min(hi, Math.max(a.sy, b.sy));
+    const y = a.sy + (x - a.sx) * (b.sy - a.sy) / (b.sx - a.sx);
+    return y >= lo && y <= hi;
   });
 }
 
-// 高台 Phase 2D.1・PART E：袖（stageLeft/stageRight）の高台横遮蔽判定で使うmargin定数。
-// 保存schemaではなく、表示判定専用のmodule scope定数（1単位=90cm）。実機調整しやすいよう
-// 小さな値から開始する。
-const PLATFORM_WING_OCCLUSION_SIDE_MARGIN = 2.0; // 高台の横端から外側へ広げる帯の幅（180cm）
-const PLATFORM_WING_OCCLUSION_Y_MARGIN = 1.5; // 高台の奥端からどこまで手前を「奥側扱い」にするか（135cm）
-
-// 高台 Phase 2D.1・PART B・C・D・F・G：「舞台袖（下手・上手）の奥側で、高台の横端すぐ外に
-// いる出演者が、俯瞰投影上で高台の前後関係と紛らわしく見える」ケースだけを遮蔽する判定。
-// isBackstagePlacementOccludedByPlatform()（upstageBackstage専用）とは完全に別の対象・別の
-// 条件のため、そちらは変更せずこの専用helperを新設する。矩形は必ず既存
-// getPlatformStageRect()を再利用し、独自のplatform.x±width/2等の再計算は行わない。
-// 条件（いずれか1つのplatformで満たせばtrue）：
-//   1. placement.areaが"stageLeft"または"stageRight"（それ以外は常にfalse）
-//   2. 高台のheightが0より大きい
-//   3. placement.yが高台の奥端付近（rect.yMax - Y_MARGIN以上）
-//   4. placement.xが、高台の横幅そのものではなく「横端からSIDE_MARGINだけ外側へ広げた帯」の中
-//      （stageLeftならrect.xMinのすぐ外側、stageRightならrect.xMaxのすぐ外側）
-// 袖出演者を一律に隠すものではなく、実機で前後関係が紛らわしくなる狭い範囲だけを対象にする
-// （PART C：袖の外側に十分離れている出演者は従来通り表示する）。
-function isWingPlacementOccludedByPlatform(placement, platforms) {
-  if (!placement) return false;
-  const isLeft = placement.area === "stageLeft";
-  const isRight = placement.area === "stageRight";
-  if (!isLeft && !isRight) return false;
-  const list = Array.isArray(platforms) ? platforms : [];
-  return list.some((platform) => {
-    if (!platform) return false;
-    const height = Number.isFinite(platform.height) ? platform.height : 0;
-    if (height <= 0) return false;
-    const rect = getPlatformStageRect(platform);
-    if (!rect) return false;
-    const nearBack = placement.y >= rect.yMax - PLATFORM_WING_OCCLUSION_Y_MARGIN;
-    if (!nearBack) return false;
-    if (isLeft) {
-      return placement.x < rect.xMin && placement.x >= rect.xMin - PLATFORM_WING_OCCLUSION_SIDE_MARGIN;
-    }
-    return placement.x > rect.xMax && placement.x <= rect.xMax + PLATFORM_WING_OCCLUSION_SIDE_MARGIN;
+// body and faces must use the same screen coordinate system. Export supplies its
+// existing Canvas fit transform; Screen uses the untransformed SVG coordinates.
+function doesPerformerBodyIntersectPlatformSilhouette(body, platform, bounds, stageDepth, screenTransform) {
+  if (!body) return false;
+  const faces = getPlatformAudienceFaces(platform, bounds, stageDepth);
+  if (!faces) return false;
+  return [faces.front, faces.top].some((polygon) => {
+    const screenPolygon = screenTransform ? polygon.map(screenTransform) : polygon;
+    return doesVerticalScreenSegmentIntersectPolygon(body.x, body.headY, body.footY, screenPolygon);
   });
 }
 
-// 高台 Phase 2E・PART A：3つの既存遮蔽判定helper（isPlacementUnderPlatform・
-// isBackstagePlacementOccludedByPlatform・isWingPlacementOccludedByPlatform）を
-// まとめるだけの表示判定専用pure helper。新しい遮蔽判定ロジックは一切作らず、
-// 「どの理由で高台に隠れているか」は区別しない。保存fieldは追加しない。
-function isPlacementOccludedByPlatform(placement, platforms) {
-  return (
-    isPlacementUnderPlatform(placement, platforms) ||
-    isBackstagePlacementOccludedByPlatform(placement, platforms) ||
-    isWingPlacementOccludedByPlatform(placement, platforms)
-  );
+// Stage Connector Phase 1J.1.4・PART D：stage performerのoccluding platform候補選定「専用」の
+// front-only交差判定。既存doesPerformerBodyIntersectPlatformSilhouette()（front+top判定、
+// waiting area・legacy full-coverage判定が今も使用中＝PART E：無変更）はそのまま残し、
+// この新しいhelperはgetStagePlacementOccludingPlatforms()だけから呼ぶ（PART D：candidate判定を
+// mask面（front-only）と一致させる。topだけにしか交差しないplatformがmaskに使われない
+// polygonのせいで誤って候補になる、という不一致を防ぐ）。
+// geometry計算はgetPlatformAudienceOcclusionPolygons()（＝getPlatformAudienceFaces()）に
+// 一本化し、ここでは新しい投影式を作らない（PART C）。
+// Stage Connector Phase 1J.2・PART B・AA：唯一の呼び出し元だったgetStagePlacementOccludingPlatforms()
+// がSVG mask／Canvas evenodd clip方式ごとlive pathから外れたため（Painter's algorithmへ
+// 移行）、この関数もreference audit時点で未使用。削除せずそのまま残している（PART AA）。
+function doesPerformerBodyIntersectPlatformOcclusionFaces(body, platform, bounds, stageDepth, screenTransform) {
+  if (!body) return false;
+  const polygons = getPlatformAudienceOcclusionPolygons(platform, bounds, stageDepth);
+  if (polygons.length === 0) return false;
+  return polygons.some((polygon) => {
+    const screenPolygon = screenTransform ? polygon.map(screenTransform) : polygon;
+    return doesVerticalScreenSegmentIntersectPolygon(body.x, body.headY, body.footY, screenPolygon);
+  });
+}
+// Phase 3D.2: area is only the waiting-area entrance condition. All three areas
+// share the same front-face depth gate and the existing screen silhouette geometry.
+function isWaitingAreaPlacementOccludedByPlatform(placement, platforms, screenGeometry) {
+  if (!placement || !["stageLeft", "stageRight", "upstageBackstage"].includes(placement.area) || !screenGeometry) return false;
+  const { body, bounds, stageDepth, screenTransform } = screenGeometry;
+  const list = Array.isArray(platforms) ? platforms : [];
+  return list.some((platform) => {
+    if (!platform || !Number.isFinite(platform.height) || platform.height <= 0) return false;
+    const rect = getPlatformStageRect(platform);
+    if (!rect || !(placement.y >= rect.yMin)) return false;
+    return doesPerformerBodyIntersectPlatformSilhouette(body, platform, bounds, stageDepth, screenTransform);
+  });
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1J：final on-stage occlusion
+// ------------------------------------------------------------------
+// stage performer（area==="stage"）だけを対象にした、platform silhouetteによる「完全遮蔽」
+// 判定。既存のisWaitingAreaPlacementOccludedByPlatform()と同じ土台（doesPerformerBodyIntersect
+// PlatformSilhouette()・getPlatformAudienceFaces()・front/top face・depth gate）を再利用する
+// が、以下の2点が異なるため独立した関数として追加する（PART A：waiting area側の関数自体は
+// 一切変更しない）。
+//   1. 「一部でも重なれば遮蔽」ではなく「body vertical segmentの全域がsilhouetteに覆われている
+//      場合だけ遮蔽」というfull-coverage判定にする（PART D・E：脚だけ・頭だけ隠れるケースで
+//      全身を消さない）。
+//   2. 自分が今乗っているplatform（resolved surfaceIdが一致するplatform）は遮蔽物の候補から
+//      除外する（PART G：自分の乗っている高台自身によってhiddenにならない）。
+// 新しい3D投影・新しいplatform面計算は一切作らない（getPlatformAudienceFaces()をそのまま
+// 再利用）。stairs自体は今回occluderに含めない（PART I：安全性を優先し、stairs構造そのものが
+// 別performerを隠す判定は今回のスコープ外とする。stairs途中performerのeffective Zは、body
+// projection自体に反映されることでこの判定へ自然に伝わる＝下記PART B）。
+//
+// PART D・E：full-coverage判定。body verticalセグメント[headY, footY]をsample数点に区切り、
+// 全sample点がpolygon群（platformのfront+top面）のいずれかへ入っている場合だけtrueを返す。
+// 本格的なpolygon clip/合成は行わず、sampleベースの安全側近似にとどめる（PART T：partial
+// occlusionの本格実装はしない）。
+const STAGE_OCCLUSION_COVERAGE_SAMPLE_COUNT = 8;
+function isVerticalScreenSegmentFullyCoveredByPolygons(x, yTop, yBottom, polygons) {
+  if (![x, yTop, yBottom].every(Number.isFinite) || !Array.isArray(polygons) || polygons.length === 0) return false;
+  const lo = Math.min(yTop, yBottom);
+  const hi = Math.max(yTop, yBottom);
+  for (let i = 0; i <= STAGE_OCCLUSION_COVERAGE_SAMPLE_COUNT; i += 1) {
+    const y = lo + ((hi - lo) * i) / STAGE_OCCLUSION_COVERAGE_SAMPLE_COUNT;
+    const point = { sx: x, sy: y };
+    const covered = polygons.some((polygon) => isPointInScreenPolygon(point, polygon));
+    if (!covered) return false;
+  }
+  return true;
+}
+
+// PART D：既存doesPerformerBodyIntersectPlatformSilhouette()と全く同じ土台（getPlatformAudienceFaces()
+// のfront/top面、同じscreenTransform適用方式）を使うが、「交差するか」ではなく「全域が
+// 覆われているか」を判定する版。
+function isPerformerBodyFullyOccludedByPlatformSilhouette(body, platform, bounds, stageDepth, screenTransform) {
+  if (!body) return false;
+  const faces = getPlatformAudienceFaces(platform, bounds, stageDepth);
+  if (!faces) return false;
+  const polygons = [faces.front, faces.top].map((polygon) => (screenTransform ? polygon.map(screenTransform) : polygon));
+  return isVerticalScreenSegmentFullyCoveredByPolygons(body.x, body.headY, body.footY, polygons);
+}
+
+// PART B・C・F・G・H：stage performer用のtop-level判定。
+//   - area!=="stage"なら対象外（waiting area・area:nullはこの関数を経由しない＝PART A・S）。
+//   - 自分が今乗っているplatform（resolved surfaceIdが一致するplatform.id）は候補から除外
+//     （PART G：own-platform除外。stairs上のperformerはsurfaceIdがどのplatformとも一致しない
+//     のが通常のため、この除外は素通りする）。
+//   - depth gate（PART F）：既存waiting occlusionと同じ「performer.y >= platform rectの
+//     downstage端（yMin）」を流用。yより手前（客席側）にいるperformerは候補にしない。
+//   - full-coverage（PART D・E）：body全体がそのplatformのfront+top面に完全に覆われている
+//     場合だけ遮蔽対象とする。
+// 「どれか1つのplatformで完全遮蔽されればhidden」（PART H）。screenGeometry.bodyは呼び出し側が
+// resolvePlacementEffectiveSurfaceHeight()（PART B）で正しいcontinuous Zを使って投影した
+// ものを渡す想定（この関数自体はZ計算を行わない＝新しいocclusion専用height計算を作らない）。
+// Stage Connector Phase 1J.1.2・PART D：Phase 1J.1でSVG mask／Canvas evenodd clipによる
+// partial occlusion architecture（getStagePlacementOccludingPlatforms()経由）が完成したため、
+// この関数はisPlacementOccludedByPlatform()のcall pathから外した（下記参照）。
+// 「platformの後ろに入った瞬間に高さに関わらず全身が消える」という誤判定の原因だったこの
+// binary full-hide判定は、現在アプリのrender pathからは呼ばれていない。reference auditの
+// 結果、focused testsから直接参照され続けているため（PART D「tests専用の参照が残っている
+// 場合は無理に削除しない」）、関数自体は削除せずそのまま残している。
+function isStagePlacementOccludedByPlatformSilhouette(placement, platforms, screenGeometry) {
+  if (!placement || placement.area !== "stage" || !screenGeometry) return false;
+  const { body, bounds, stageDepth, screenTransform } = screenGeometry;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const ownSurfaceId = getPlacementSurfaceId(placement);
+  return list.some((platform) => {
+    if (!platform || !Number.isFinite(platform.height) || platform.height <= 0) return false;
+    if (ownSurfaceId != null && platform.id === ownSurfaceId) return false;
+    const rect = getPlatformStageRect(platform);
+    if (!rect || !(placement.y >= rect.yMin)) return false;
+    return isPerformerBodyFullyOccludedByPlatformSilhouette(body, platform, bounds, stageDepth, screenTransform);
+  });
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1J.1：platform partial performer occlusion
+// ------------------------------------------------------------------
+// PART B・C・F・G・H・I・J：stage performer用のtop-level判定。
+//   - area==="stage"のみ（PART S：waiting areaは対象外）
+//   - 自分が乗っているplatform（resolved surfaceIdが一致するplatform.id）は除外（PART D）
+//   - depth gate（PART E）：isStagePlacementOccludedByPlatformSilhouette()と全く同じ
+//     `placement.y >= rect.yMin`をそのまま流用。新しいdepth axis式は作らない。
+// Stage Connector Phase 1J.1.4・PART D：交差判定はfront-only版の
+// doesPerformerBodyIntersectPlatformOcclusionFaces()へ切り替えた（旧・front+top版の
+// doesPerformerBodyIntersectPlatformSilhouette()は使わない）。mask自体をfront-onlyにしても
+// candidate選定がtop交差依存のままだと、「topにしか重なっていないplatformが候補に残る」
+// という不一致が起きるため、candidate判定とmask面を揃える。
+// 戻り値は交差しているplatformの配列（0件なら「遮蔽なし」）。「どれか1つで完全遮蔽」という
+// Phase 1Jの判定ロジック自体はここでは変更しない（PART U：複数platformのunionで結果的に
+// 全身が隠れても、render listからの除外へ格上げする処理は追加しない。視覚的にすべて
+// maskされれば十分）。
+// Stage Connector Phase 1J.2・PART B・AA：SVG mask／Canvas evenodd clip方式そのものを
+// Painter's algorithm（platform-front itemをdepthMergedItemsへ混ぜ、描画順だけで前後関係を
+// 表現する方式）へ置き換えたため、この関数はreference auditの結果、live render pathからは
+// 呼ばれなくなった（renderPerformerBody()・renderAudienceFormationExport()のどちらからも
+// 呼び出しを削除済み）。「tests専用等で参照が残るなら無理に削除しない」（PART AA）方針により、
+// この関数・内部で使うdoesPerformerBodyIntersectPlatformOcclusionFaces()・
+// getPlatformAudienceOcclusionPolygons()は削除せずそのまま残している。
+function getStagePlacementOccludingPlatforms(placement, platforms, screenGeometry) {
+  if (!placement || placement.area !== "stage" || !screenGeometry) return [];
+  const { body, bounds, stageDepth, screenTransform } = screenGeometry;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const ownSurfaceId = getPlacementSurfaceId(placement);
+  return list.filter((platform) => {
+    if (!platform || !Number.isFinite(platform.height) || platform.height <= 0) return false;
+    if (ownSurfaceId != null && platform.id === ownSurfaceId) return false;
+    const rect = getPlatformStageRect(platform);
+    if (!rect || !(placement.y >= rect.yMin)) return false;
+    return doesPerformerBodyIntersectPlatformOcclusionFaces(body, platform, bounds, stageDepth, screenTransform);
+  });
+}
+
+// Stage Connector Phase 1H.1・PART A・E：isBackstagePlacementOccludedByPlatform()・
+// isWingPlacementOccludedByPlatform()という2つの「compatibility wrapper」は、
+// isPlacementOccludedByPlatform()から直接呼ばれることも、他のどこからも呼ばれることもない
+// （isPlacementOccludedByPlatform()は下記の通りisWaitingAreaPlacementOccludedByPlatform()を
+// 直接呼んでいる）ことを全文検索で確認したため、reference audit の結果として削除した
+// （Phase 1Hのwaiting-area Ghost policy変更とは無関係に、元から未使用だった2関数）。
+
+// Under-platform behavior is unchanged; waiting-area occlusion has one geometry.
+// Stage Connector Phase 1J.1.2・PART A：Phase 1JでOR条件として追加していた
+// isStagePlacementOccludedByPlatformSilhouette()（stage performer用のsilhouette
+// full-coverage判定）をここから外した。Phase 1J.1でSVG mask／Canvas evenodd clipによる
+// partial occlusion architectureが完成したため、stage performerのplatform silhouette遮蔽は
+// すべてgetStagePlacementOccludingPlatforms()経由のmask/clipへ一本化する（PART E）。
+// このfull-hide判定をpartial maskより先に走らせていたことが、「platformの後ろに入った瞬間に
+// 高さに関わらず全身が消える」という誤判定の原因だった。
+// Stage Connector Phase 1J.1.3・PART A：もう1つの誤判定原因だった
+// isPlacementUnderPlatform()（stage-space binaryな「platform footprint内なら高台の下として
+// 即hidden」判定。height／pose／silhouetteを一切見ない）を、Audienceのearly-hide call path
+// からも外した。surfaceId===null（＝高台に乗っていない）のstage performerがplatform
+// footprint内にいても、この関数だけではもうhiddenにならない。visual上の遮蔽は
+// getStagePlacementOccludingPlatforms()経由のSVG mask／Canvas evenodd clip（render listに
+// 残ったperformerに対して適用される）へ完全に一本化される（PART D）。
+// isPlacementUnderPlatform()自体はcleanup目的だけでは削除していない（PART B・I：「高台の下」と
+// 「高台の後ろ」を将来差別化する可能性があるため、helperとしては残す。focused testsからの
+// 直接参照もある）。ここで外したのは、Audienceのこのcall pathからの呼び出しだけ。
+// isWaitingAreaPlacementOccludedByPlatform()（waiting area専用、PART J：無変更）は
+// 一切変更していない。Screen/Exportとも、この1つの関数だけを呼ぶことで
+// normal/hidden判定が常に一致する（PART I：Export専用の別判定式を作らない）。
+function isPlacementOccludedByPlatform(placement, platforms, screenGeometry) {
+  return isWaitingAreaPlacementOccludedByPlatform(placement, platforms, screenGeometry);
 }
 
 // ------------------------------------------------------------------
@@ -3791,6 +4278,43 @@ function getLightingAreaStagePoints(area) {
   }
   return points;
 }
+
+// 高台 Phase 3C・PART C：Lighting Areaへのoptional field surfaceIdのsafe getter。
+// 既存Projectにはこのfieldが存在しないため、undefinedは必ずnull（＝通常舞台）として扱う
+// （一括migrationはしない）。getPlacementSurfaceId()・getLightingBeam3DTargetSurfaceId()と
+// 全く同じ「optional field + fallback」方針。
+// Phase 3F-B: optional mode with legacy manual fallback, without migration.
+function getLightingAreaSurfaceMode(area) {
+  return area && area.surfaceMode === "auto" ? "auto" : "manual";
+}
+
+function getLightingAreaSurfaceId(area) {
+  return area && typeof area.surfaceId === "string" ? area.surfaceId : null;
+}
+
+// 高台 Phase 3C・PART D：AreaがsurfaceIdで指定した高台の高さ（z）を解決する。
+// Beamのtarget.zのような既存z保存値がAreaには存在しないため、fallbackは常に0（通常舞台）。
+//   ・surfaceIdなし → 0
+//   ・有効なplatform（height>0）が見つかる → platform.height
+//   ・参照先platformが存在しない（削除済み等）・height<=0 → 0
+// workデータ（area.surfaceIdそのもの）は一切書き換えない。出演者surface
+// （resolvePlacementSurfaceHeight）・Beam target surface（resolveLightingBeam3DTargetSurfaceHeight）
+// とは完全に別概念のため、Area専用のこの関数だけを使う（PART E：既存helperは変更しない）。
+function resolveLightingAreaSurfaceHeight(area, platforms) {
+  // Use only the current (post-Move) center. The saved surfaceId remains untouched.
+  if (getLightingAreaSurfaceMode(area) === "auto") {
+    if (!Number.isFinite(area.x) || !Number.isFinite(area.y)) return 0;
+    const platform = resolvePlatformAtPoint(area.x, area.y, platforms);
+    return platform && Number.isFinite(platform.height) && platform.height > 0 ? platform.height : 0;
+  }
+
+  const surfaceId = getLightingAreaSurfaceId(area);
+  if (!surfaceId) return 0;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const platform = list.find((pl) => pl && pl.id === surfaceId && Number(pl.height) > 0);
+  return platform ? Number(platform.height) || 0 : 0;
+}
+
 
 // ------------------------------------------------------------------
 // Area resize v1・F章：平面図TopView専用のリサイズハンドル配置
@@ -4928,9 +5452,8 @@ function createDefaultLightingBeam3D(stage) {
     logicalBeamId: makeId("logical-beam"),
     source: { x: sourceX, y: sourceY, z: clamp(20, LIGHTING_BEAM_3D_MIN_Z, LIGHTING_BEAM_3D_MAX_Z) },
     target: { x: targetX, y: targetY, z: 0 }, // C章：STEP1ではtarget.zは常に0（舞台床）
-    // 高台 Phase 3A・PART A・U：新規Beamのtargetは常に「通常舞台」から始める。
-    // targetSurfaceIdが高台矩形内へ入ったからといって自動で高台へ切り替える仕様
-    // （auto surfaceに相当するもの）は今回実装しない（PART Y：明示選択のみ）。
+    // Phase 3F-A: only newly created Beams start in auto; legacy missing mode stays manual.
+    targetSurfaceMode: "auto",
     targetSurfaceId: null,
     color: "white",
     intensity: DEFAULT_LIGHTING_BEAM_3D_INTENSITY,
@@ -4970,6 +5493,16 @@ function resolveLightingBeam3DTarget(beam, displayPlacements) {
 // safe getter。既存Projectにはこのfieldが存在しないため、undefinedは必ずnull（＝通常舞台）
 // として扱う（一括migrationはしない）。getPlacementSurfaceId()と全く同じ「optional field +
 // fallback」方針。
+// Phase 3F-A: optional mode, no migration of existing Beams or Cue snapshots.
+function getLightingBeam3DTargetSurfaceMode(beam) {
+  return beam && beam.targetSurfaceMode === "auto" ? "auto" : "manual";
+}
+
+function isLightingBeam3DDirectionFlipDisabled(beam) {
+  return !!beam?.followPerformerId || !!getLightingBeam3DTargetSurfaceId(beam) ||
+    getLightingBeam3DTargetSurfaceMode(beam) === "auto";
+}
+
 function getLightingBeam3DTargetSurfaceId(beam) {
   return beam && typeof beam.targetSurfaceId === "string" ? beam.targetSurfaceId : null;
 }
@@ -4982,6 +5515,13 @@ function getLightingBeam3DTargetSurfaceId(beam) {
 //   getPlatforms()と同じ考え方）
 // target.z自体は削除・上書きしない（呼び出し側が別途effective targetを組み立てる）。
 function resolveLightingBeam3DTargetSurfaceHeight(beam, platforms) {
+  // Resolve the current (post-Move) target without committing its height or surface ID.
+  if (getLightingBeam3DTargetSurfaceMode(beam) === "auto") {
+    if (!Number.isFinite(beam.target?.x) || !Number.isFinite(beam.target?.y)) return 0;
+    const platform = resolvePlatformAtPoint(beam.target.x, beam.target.y, platforms);
+    return platform && Number.isFinite(platform.height) && platform.height > 0 ? platform.height : 0;
+  }
+
   const surfaceId = getLightingBeam3DTargetSurfaceId(beam);
   const fallbackZ = beam && beam.target && Number.isFinite(Number(beam.target.z)) ? Number(beam.target.z) : 0;
   if (!surfaceId) return fallbackZ;
@@ -4991,13 +5531,29 @@ function resolveLightingBeam3DTargetSurfaceHeight(beam, platforms) {
   return Number(platform.height) || 0;
 }
 
-// 高台 Phase 3A・PART D：表示用のeffective target（x/yは既存の追尾解決、zだけ
-// targetSurfaceIdから解決した高さに差し替える）を1箇所で作る共通pure helper。
-// 今回はfollowPerformer時の「出演者自身のsurface heightへの自動追従」は実装しない
-// （PART T：x/yはperformer位置、zはtargetSurfaceIdで選んだ照射面高さという、互いに独立した
-// 値のまま）。TopView・OverheadAudienceView・Export・Thumbnailのいずれもこの1つの関数を
-// 通し、target解決ロジックを二重実装しない。
-function resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms) {
+// 高台 Phase 3B・PART B・D：表示用のeffective target。
+//   1. beamがnull → null
+//   2. followPerformerIdがあり、displayPlacements内に対象placementが見つかる場合
+//      → x/yは既存の追尾解決（出演者の現在位置）のまま、zは出演者自身の足元の舞台面高さ
+//        （既存resolvePlacementSurfaceHeight()、Phase 2Cのplacement.surfaceId/surfaceMode
+//        判定をそのまま再利用し、新しいsurface計算は作らない＝PART C）。追尾中は
+//        beam.targetSurfaceIdをz決定に使わない（PART B）。ただしtargetSurfaceId自体は
+//        削除・変更しない（PART E：追尾解除後にPhase 3Aの固定照射面へ自然に戻すため）。
+//   3. それ以外（追尾していない、または追尾対象placementが見つからない＝出演者削除・
+//      stage外等）→ Phase 3Aのまま：保存済みtarget（resolveLightingBeam3DTarget()）へ
+//      targetSurfaceIdによるsurface height（resolveLightingBeam3DTargetSurfaceHeight()）を
+//      適用する。
+// TopView・OverheadAudienceView・Export・Thumbnailのいずれもこの1つの関数だけを通し、
+// target解決ロジックを二重実装しない。
+function resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms, stageConnectors = []) {
+  if (!beam) return null;
+  const followId = beam.followPerformerId;
+  if (followId && displayPlacements) {
+    const pos = displayPlacements[followId];
+    if (pos) {
+      return { x: pos.x, y: pos.y, z: resolvePlacementEffectiveSurfaceHeight(pos, platforms, stageConnectors) };
+    }
+  }
   const followedTarget = resolveLightingBeam3DTarget(beam, displayPlacements);
   if (!followedTarget) return followedTarget;
   const surfaceZ = resolveLightingBeam3DTargetSurfaceHeight(beam, platforms);
@@ -5016,10 +5572,10 @@ function resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms
 // 追尾していないBeam・targetSurfaceIdなしのBeーム（大多数の既存Projectのケース）は、
 // resolveLightingBeam3DEffectiveTarget()が返すオブジェクトが既存target.zと同じ値になる
 // ため、実質的に旧resolveLightingBeams3DForDisplay()と完全に同じ結果になる（後方互換）。
-function resolveLightingBeams3DForDisplay(beams3D, displayPlacements, platforms = []) {
+function resolveLightingBeams3DForDisplay(beams3D, displayPlacements, platforms = [], stageConnectors = []) {
   const list = Array.isArray(beams3D) ? beams3D : [];
   return list.map((beam) => {
-    const resolvedTarget = resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms);
+    const resolvedTarget = resolveLightingBeam3DEffectiveTarget(beam, displayPlacements, platforms, stageConnectors);
     return resolvedTarget === beam.target ? beam : { ...beam, target: resolvedTarget };
   });
 }
@@ -6142,6 +6698,36 @@ function FrontFigureKneeling({ color, selected, warn, heightPx, refHeightPx }) {
   );
 }
 
+// Stage Connector Phase 1H.0.1・PART H・I：Ghost selection outline専用のpure helper。
+// FrontFigure／FrontFigureKneelingが内部で独自に描いているselected outline（PART S・L：
+// この2つのコンポーネント自体には一切手を加えない）と全く同じ式・値（x/y/width/height/rx、
+// stroke=THEME.accent, strokeWidth=3）をそのまま複製しただけ。Ghost本体（GhostFigure）の
+// dash・color・opacity・pose geometryは変更せず、selection outlineは常に外側へ独立して
+// 追加するだけにする。
+function getPerformerSelectionOutlineRect(pose, heightPx, refHeightPx) {
+  const H = heightPx;
+  const R = refHeightPx != null ? refHeightPx : heightPx;
+  const headR = R * FIGURE_HEAD_R_RATIO;
+  const torsoW = R * FIGURE_TORSO_W_RATIO;
+  if (pose === POSE_KNEELING) {
+    const legW = R * FIGURE_LEG_W_RATIO;
+    return {
+      x: -torsoW - legW - 6,
+      y: -H - headR * 2 - 6,
+      width: torsoW * 2 + legW * 2 + 12,
+      height: H + headR * 2 + 12,
+      rx: 8,
+    };
+  }
+  return {
+    x: -torsoW - 6,
+    y: -H - headR * 2 - 6,
+    width: torsoW * 2 + 12,
+    height: H + headR * 2 + 12,
+    rx: 8,
+  };
+}
+
 // 高台 Phase 2E・PART G・H：高台裏ゴースト専用の描画（SVG、俯瞰客席ビュー画面用）。
 // 実体のFrontFigure/FrontFigureKneelingとは完全に別コンポーネントとし、既存の身体描画を
 // 分岐だらけにしない（PART G）。ジオメトリ計算だけはFrontFigure/computeKneelingFigureGeometry()
@@ -6298,7 +6884,13 @@ function stageViewToScreenY(bounds, yUnits) {
 // という既存の一貫性（構成ごとに画角がバラつかない）はそのまま維持される。
 // zonesを渡さない既存の呼び出し（FormationThumbnail）は今まで通り一切挙動が変わらない
 // （第2引数省略時は元の計算式と完全に同一の結果になる＝後方互換）。
-function computeFormationThumbnailBounds(stage, zones) {
+// Stage Connector Phase 1D・PART H：第3引数stageConnectorsは今回追加した任意引数（省略時は
+// 従来通りの挙動を維持し、backward compatible）。「待機エリアを表示」トグルとは完全に独立して、
+// stage外に置かれたstairsのrect（getStageConnectorStageRect()、TopView/screenと共通のpure
+// helper）だけをbounds計算へ折り込む（PART H：待機エリア背景・出演者はOFFのままでよいが、
+// stage外stairs自体はExportでclipされないようにする、という要件を分離して実現する）。
+// zonesを丸ごと含める既存ロジック（待機エリアON時）とは別の、connector単位の最小限の拡張。
+function computeFormationThumbnailBounds(stage, zones, stageConnectors) {
   const stageWcm = stage.width * UNIT_CM;
   const stageDcm = stage.depth * UNIT_CM;
   // 余白最適化：TopView編集画面（computeStageViewBounds）と同じSTAGE_VIEW_PADDING_RATIO・
@@ -6314,6 +6906,16 @@ function computeFormationThumbnailBounds(stage, zones) {
     minX = Math.min(minX, zones.stageLeft.xMin * UNIT_CM);
     maxX = Math.max(maxX, zones.stageRight.xMax * UNIT_CM);
     maxY = Math.max(maxY, zones.upstageBackstage.yMax * UNIT_CM);
+  }
+  if (Array.isArray(stageConnectors) && stageConnectors.length > 0) {
+    stageConnectors.forEach((connector) => {
+      const rect = getStageConnectorStageRect(connector);
+      if (!rect) return;
+      minX = Math.min(minX, rect.xMin * UNIT_CM);
+      maxX = Math.max(maxX, rect.xMax * UNIT_CM);
+      minY = Math.min(minY, rect.yMin * UNIT_CM);
+      maxY = Math.max(maxY, rect.yMax * UNIT_CM);
+    });
   }
   return {
     minX,
@@ -6341,6 +6943,9 @@ const TopView = forwardRef(function TopView(
     // 高台 Phase 1A・10-6章：表示専用（読み取り専用）の高台一覧。未指定時は既存Projectと
     // 同じ見た目になるよう空配列にフォールバックする。
     platforms = [],
+    // Stage Connector Phase 1A・PART G：表示専用（読み取り専用）の階段一覧。
+    // platformsと全く同じ考え方で、未指定時は空配列にフォールバックする。
+    stageConnectors = [],
     selectedIds,
     onSelect,
     onToggleSelect,
@@ -6421,14 +7026,25 @@ const TopView = forwardRef(function TopView(
   const stageWcm = stage.width * UNIT_CM;
   const stageDcm = stage.depth * UNIT_CM;
 
-  // 構成一覧 v1・4章：bounds計算自体は共通のcomputeStageViewBounds（TopViewの元の実装と
-  // 完全に同じ計算式）へ切り出した。ステージ本体だけでなく、袖・舞台奥待機エリアの分も
-  // 常に画面内に収まるようにする、という挙動そのものは一切変更していない。
-  // 余白最適化：固定95cm相当のマージンをやめ、computeStageViewBounds内の
-  // STAGE_VIEW_PADDING_RATIOベースの比率paddingへ委ねる（第5引数を省略）。
+  // Stage Connector Phase 1H.2・PART A・B（root cause）：以前はcomputeStageViewBounds()が
+  // performers/placementsを直接受け取り、現在の出演者位置（±60cm）をbounds.totalW/totalH
+  // （＝toScreenX/Yが使う「コンテンツ座標空間」の広さ）へ毎回組み込んでいた。zoom/pan自体
+  // （viewState、onViewStateChange経由）は一切変更されていないにもかかわらず、bounds
+  // （＝ズーム前のベースとなる画角）がperformerの移動に追従して伸び縮みするため、
+  // 「舞台袖の外側へ出演者を動かすと、ある地点で急にステージ全体が小さく見える」という
+  // 体感上のauto-fitが発生していた（これがroot cause。viewState/onViewStateChange/
+  // computeFitViewStateのどれも原因ではなかった）。
+  // 修正：TopViewのbounds計算を、出演者位置に一切依存しない既存computeFormationThumbnailBounds()
+  // （stage＋zones＋stageConnectorsだけで決まる、Export/構成一覧サムネイルと共通のpure
+  // helper。新しいbounds計算式は作らない＝PART P）へ差し替える。stage.width/depthや
+  // stageConnectorsの変更には引き続き反応する（PART N：stage resize時の挙動は維持）ため、
+  // 「舞台自体のサイズが変わった時にbounds/画角が更新される」という既存挙動は変わらない。
+  // 一方、performer/placementの位置変更だけではbounds自体が変化しなくなり、範囲外へ出た
+  // performerは画面外に見えなくなること（クリップ）を正式に許容する（完成条件通り）。
+  // computeStageViewBounds()自体は削除しない（他の用途で必要になった場合のため残す）。
   const bounds = useMemo(
-    () => computeStageViewBounds(stage, zones, performers, placements),
-    [stageWcm, stageDcm, stage, zones, performers, placements]
+    () => computeFormationThumbnailBounds(stage, zones, stageConnectors),
+    [stageWcm, stageDcm, stage, zones, stageConnectors]
   );
 
   // toScreenX/Y・fromScreenX/Y は「コンテンツ座標（cm、ズーム前）」⇔「舞台の単位座標」の変換。
@@ -6501,7 +7117,22 @@ const TopView = forwardRef(function TopView(
   // 拡大縮小・画面移動（表示用の操作。出演者データそのものは一切変更しない）
   // ------------------------------------------------------------
   useImperativeHandle(ref, () => ({
-    fitAll: () => onViewStateChange({ ...DEFAULT_VIEW_STATE }),
+    // Stage Connector Phase 1H.2・PART K：「全体を表示」は既存仕様通り、出演者・待機エリア等
+    // 現在含めるべきobjectをすべて含めてfitする。以前はbounds自体が常に出演者位置まで含めて
+    // 動的に広がっていたため、DEFAULT_VIEW_STATEへのreset（＝zoom/pan無し）だけで「全体表示」を
+    // 実現できていたが、PART Bの修正でbounds（画面のベースとなる画角）を出演者位置に依存しない
+    // 固定サイズへ変更したため、fitAllボタン自体は「出演者を含む対象範囲」を明示的に計算して
+    // fitするよう変更した。ロジックは変更せず、既存のcomputeStageViewBounds()（出演者位置を
+    // 含めるbounds計算。PART Pにより削除せず残してある）とcomputeFitViewState()（fitStage・
+    // fitSelectedと共通の既存関数）をそのまま組み合わせるだけ。
+    fitAll: () => {
+      const target = computeStageViewBounds(stage, zones, performers, placements);
+      const targetMinX = toScreenX(target.minX / UNIT_CM);
+      const targetMaxX = toScreenX(target.maxX / UNIT_CM);
+      const targetTopPx = toScreenY(target.maxY / UNIT_CM);
+      const targetBottomPx = toScreenY(target.minY / UNIT_CM);
+      onViewStateChange(computeFitViewState(targetMinX, targetTopPx, targetMaxX, targetBottomPx, bounds, 0.86));
+    },
     fitStage: () => onViewStateChange(computeFitViewState(stageLeftPx, stageTopPx, stageRightPx, stageBottomPx, bounds, 0.82)),
     fitSelected: () => {
       if (!selectedIds.length) return;
@@ -7260,6 +7891,93 @@ const TopView = forwardRef(function TopView(
             );
           })()}
 
+        {/* Stage Connector Phase 1A・PART G・H・I：階段レイヤー。高台レイヤーの直後（＝高台と
+            同じく舞台床/グリッドより手前、Lighting Area・出演者・軌跡よりは背面）に描く
+            読み取り専用表示。今回もcanvas上のドラッグ・リサイズ・回転ハンドルは作らず、
+            pointerEvents="none"のまま既存操作を一切妨げない。
+            幾何計算はgetStageConnectorStairsGeometry()（Export側と共有するpure helper）を
+            再利用し、ここではtoScreenX/Yへ通すだけにする（座標計算の二重実装を避ける＝PART J）。
+            色は高台と同じgetPlatformVisualColors()を再利用しつつ（PART G：新しい派手な色は
+            追加しない）、外枠だけdashed（破線）にすることで矩形高台と混同しないよう
+            差別化する（PART G）。内部の段差線・上り方向chevronはgetStageConnectorStairsGeometry()
+            が返す線分をそのまま描くだけで、ここでは向き・段数の判定ロジックを持たない。 */}
+        {stageConnectors.length > 0 &&
+          (() => {
+            const connectorVisualColors = getPlatformVisualColors(floorColorKey);
+            return (
+              <g pointerEvents="none" aria-hidden="true">
+                {stageConnectors.map((connector) => {
+                  const geometry = getStageConnectorStairsGeometry(connector);
+                  if (!geometry) return null;
+                  const { rect, stepLines, topEdge, chevron } = geometry;
+                  const rectX = toScreenX(rect.xMin);
+                  const rectY = toScreenY(rect.yMax);
+                  const rectW = toScreenX(rect.xMax) - rectX;
+                  const rectH = toScreenY(rect.yMin) - rectY;
+                  const toScreenLine = (seg) => ({
+                    x1: toScreenX(seg.x1),
+                    y1: toScreenY(seg.y1),
+                    x2: toScreenX(seg.x2),
+                    y2: toScreenY(seg.y2),
+                  });
+                  const screenTopEdge = toScreenLine(topEdge);
+                  return (
+                    <g key={connector.id}>
+                      <rect
+                        x={rectX}
+                        y={rectY}
+                        width={rectW}
+                        height={rectH}
+                        fill="none"
+                        stroke={connectorVisualColors.strokeColor}
+                        strokeWidth={2.0}
+                        strokeDasharray="6 4"
+                      />
+                      {stepLines.map((seg, i) => {
+                        const s = toScreenLine(seg);
+                        return (
+                          <line
+                            key={`step-${connector.id}-${i}`}
+                            x1={s.x1}
+                            y1={s.y1}
+                            x2={s.x2}
+                            y2={s.y2}
+                            stroke={connectorVisualColors.strokeColor}
+                            strokeWidth={1.4}
+                          />
+                        );
+                      })}
+                      <line
+                        x1={screenTopEdge.x1}
+                        y1={screenTopEdge.y1}
+                        x2={screenTopEdge.x2}
+                        y2={screenTopEdge.y2}
+                        stroke={connectorVisualColors.frontStrokeColor}
+                        strokeWidth={3.0}
+                        strokeLinecap="square"
+                      />
+                      {chevron.map((seg, i) => {
+                        const s = toScreenLine(seg);
+                        return (
+                          <line
+                            key={`chevron-${connector.id}-${i}`}
+                            x1={s.x1}
+                            y1={s.y1}
+                            x2={s.x2}
+                            y2={s.y2}
+                            stroke={connectorVisualColors.frontStrokeColor}
+                            strokeWidth={2.2}
+                            strokeLinecap="round"
+                          />
+                        );
+                      })}
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })()}
+
         {/* Lighting Area v1・M章：照明Areaレイヤー。描画順は「stage floor/grid → Lighting Area →
             transition trajectory → performers」（M章）。showLightingAreasはApp側で
             showLighting && currentLightingScene && currentLightingScene.enabled
@@ -7980,6 +8698,11 @@ function buildFormationExportModel({
   // 場合は常に[]となり、renderer側の高台描画は自然にスキップされる（Lighting Cue Exportは
   // 今回必須ではないため、既存構造上自然に共有できる分だけ反映する＝10-7章の方針）。
   platforms = [],
+  // Stage Connector Phase 1A・PART J：platformsと全く同じ考え方。work.stageConnectors
+  // （getStageConnectors()で既にfallback済みの配列）が渡ってくる想定で、未指定（Lighting Cue
+  // Export等、今回stageConnectorsを渡さない呼び出し元）の場合は常に[]となり、renderer側の
+  // 階段描画は自然にスキップされる（Lighting Cue Exportは今回のスコープ外＝PART Q）。
+  stageConnectors = [],
 }) {
   if (!slide || !Array.isArray(slides) || slideIndex == null || slideIndex < 0 || slideIndex >= slides.length) {
     return null;
@@ -8009,6 +8732,14 @@ function buildFormationExportModel({
   // 画面と同じfromPlacements/toPlacements/fromSlideIdを得る（経路計算ロジック自体は
   // 一切複製しない＝12〜13章の方針を維持）。
   let transitionPaths = [];
+  // Stage Connector Phase 1I・PART AC：Audience Export（renderAudienceFormationExport）が
+  // 3D trajectory samplingを行うために必要な生materials（area/surfaceMode/surfaceId込みの
+  // raw placementsとpathConfig）。transitionPaths（x/yだけに間引かれた表示専用データ、
+  // renderTopFormationExportが今まで通り使う＝PART AD）とは別に、追加のmodel fieldとして
+  // 持たせるだけで、既存のtransitionPaths自体・その消費側は一切変更しない。
+  let trajectoryFromPlacements = null;
+  let trajectoryToPlacements = null;
+  let trajectoryPathConfig = null;
   if (showTrajectory) {
     const ref = getTrajectoryPlacements({ slides, currentSlideIndex: slideIndex, mode: trajectoryMode });
     if (ref) {
@@ -8016,6 +8747,9 @@ function buildFormationExportModel({
       // App側で既に計算済みのeffectiveTransitionPathConfigをそのまま参照する。
       const pathConfig = (effectiveTransitionPathConfig && effectiveTransitionPathConfig[ref.fromSlideId]) || null;
       transitionPaths = computeTransitionPaths(ref.fromPlacements || {}, ref.toPlacements || {}, pathConfig);
+      trajectoryFromPlacements = ref.fromPlacements || {};
+      trajectoryToPlacements = ref.toPlacements || {};
+      trajectoryPathConfig = pathConfig;
     }
   }
 
@@ -8049,7 +8783,17 @@ function buildFormationExportModel({
     // ここでは形式の安全確認だけ行い、Undo/Redo・work schemaには一切関与しない
     // （Export Modelは常に「作品データのスナップショット」であり、書き込みは行わない）。
     platforms: Array.isArray(platforms) ? platforms : [],
+    // Stage Connector Phase 1A・PART J：platformsと全く同じ表示専用field。呼び出し元が
+    // getStageConnectors(work)を渡す想定で、ここでは形式の安全確認だけ行う。
+    stageConnectors: Array.isArray(stageConnectors) ? stageConnectors : [],
     transitionPaths,
+    // Stage Connector Phase 1I・PART AC：renderAudienceFormationExport専用の3D trajectory
+    // sampling用raw materials。transitionPaths自体は変更せず、追加のfieldとしてだけ持たせる。
+    // showTrajectory OFF、またはfrom/to参照が無い場合はnullのまま（renderer側はnullなら
+    // 従来のフラット2D描画へ安全にfallbackする＝下位互換）。
+    trajectoryFromPlacements,
+    trajectoryToPlacements,
+    trajectoryPathConfig,
     // P-03 第一段階「選択出演者を強調して出力」・5章：表示専用field。強調対象のperformerId
     // （またはnull）をそのまま保持するだけで、ここでは強調の可否判定（selectedIds.length===1
     // 等）は一切行わない（判定は呼び出し元＝App側のExport実行ハンドラの責務）。
@@ -8089,7 +8833,7 @@ function buildFormationExportModel({
       // 高台 Phase 3A・PART Q：この関数が受け取ったplatforms（通常Formation Exportと同じ
       // 配列）を渡し、高台照射Beamのtarget.zがExportでも正しく解決されるようにする。
       // Export専用の別target height計算は作らない。
-      return resolveLightingBeams3DForDisplay(getLightingBeams3D(scene), slide.placements || {}, platforms);
+      return resolveLightingBeams3DForDisplay(getLightingBeams3D(scene), slide.placements || {}, platforms, stageConnectors);
     })(),
     // 追尾スポット軌跡Export v1・2〜3・11〜17章：selectionには一切依存せず、対象Formationの
     // Base Lighting Scene内に存在するfollowPerformerId付きBeamすべてを対象にする（固定Beamは
@@ -8155,6 +8899,9 @@ function buildFormationExportModels({
   // 同じ高台一覧（work.platforms）を使う想定のため、Formationごとに異なる値を持たせる
   // 仕組みは作らない。
   platforms,
+  // Stage Connector Phase 1A・PART J：platformsと全く同じ考え方でbuildFormationExportModelへ
+  // そのまま伝播するだけ。全Formationで同じwork.stageConnectorsを使う想定。
+  stageConnectors,
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -8184,6 +8931,7 @@ function buildFormationExportModels({
         showLightingTrackingPaths,
         highlightedPerformerId,
         platforms,
+        stageConnectors,
       })
     )
     .filter((m) => m !== null);
@@ -8224,6 +8972,12 @@ function buildLightingCueExportModels({
   // 現在Projectのwork.platforms（getPlatforms(work)で既に[]へfallback済みの配列）を
   // そのまま受け取るだけ。未指定時は既存互換のため[]にfallbackする。
   platforms = [],
+  // Stage Connector Phase 1A.1・PART 1：platformsと全く同じ考え方。work.stageConnectors
+  // （getStageConnectors()で既に[]へfallback済みの配列）をそのまま受け取るだけ。stairsは
+  // stage-level objectでCueごとに状態変化しないため、ここで受け取った配列をclone/mutateせず、
+  // 開始時・keep・transitionのすべてのcutへ同じ参照のまま渡す（下記baseModelのspreadにより
+  // 自動的にそうなる）。
+  stageConnectors = [],
 }) {
   if (!slide || !Array.isArray(slides)) return [];
   const scene = findLightingSceneBySlideId(lightingScenes || [], slide.id);
@@ -8235,6 +8989,10 @@ function buildLightingCueExportModels({
   // showTrajectory:falseで生成する＝baseModel自体は「軌跡なしの土台」のまま維持）。
   // 高台 Phase 2E.2・PART B：通常Formation Exportと同じplatformsを渡すことで、
   // baseModel.platformsが空配列fallbackにならず、既存rendererが自然に高台を描く。
+  // Stage Connector Phase 1A.1・PART 2：同じくstageConnectorsを渡す。以降のcuts.push()は
+  // すべて{...baseModel, ...}でbaseModelをspreadしており、どのcutもstageConnectorsを
+  // 明示的に上書きしていないため、開始時・keep Cue・transition Cueのすべてで自動的に
+  // 同じstageConnectorsが保持される（Cueごとの個別対応・再計算・cloneは不要＝PART 5）。
   const baseModel = buildFormationExportModel({
     slide,
     slideIndex,
@@ -8253,6 +9011,7 @@ function buildLightingCueExportModels({
     lightingEnabled: true,
     lightingScenes,
     platforms,
+    stageConnectors,
   });
   if (!baseModel) return [];
 
@@ -8283,6 +9042,19 @@ function buildLightingCueExportModels({
   // （開始時より前のTransitionへは遡らない＝0章）。
   const trajectoryForStartOrKeep = trajectoryMode === "next" && showTrajectory ? fullTransitionPaths : [];
 
+  // Stage Connector Phase 1I.2・PART B・G・H：Audience Export側の3D trajectory sampling
+  // （buildAudienceTrajectoryScreenPoints()、通常Audience Formation Exportと全く同じ関数）に
+  // 必要なraw materials。TopView用のtransitionPaths（trajectoryForStartOrKeep、x/yだけに
+  // 間引かれた表示専用データでTopView Cue Exportがそのまま使い続ける＝PART E・F）とは別の
+  // model fieldとして持たせるだけで、既存のtransitionPaths自体・sliceTransitionPathsAtProgress()
+  // は一切変更しない。開始時・keep Cueはfull path（trajectoryProgress=1、performerがまだ
+  // 動いていないため経路の全体をプレビュー表示する既存仕様＝trajectoryForStartOrKeepと同じ
+  // 条件でfull pathになる）、transition Cueはそのカットのprogressまでの部分trajectoryになる
+  // （下で個別に上書きする）。
+  const audienceTrajectoryEnabled = trajectoryMode === "next" && showTrajectory && hasNext && !!nextSlide;
+  const audienceTrajectoryFromPlacements = audienceTrajectoryEnabled ? slide.placements : null;
+  const audienceTrajectoryToPlacements = audienceTrajectoryEnabled ? nextSlide.placements : null;
+  const audienceTrajectoryPathConfig = audienceTrajectoryEnabled ? pathConfig : null;
   // 追尾スポット軌跡のfull path（Cue時点のresolved beams3Dを渡して都度求める、20〜21章）。
   // beamsAtThisMomentはそのカット時点でresolveLightingCueState()が返した生のbeams3D
   // （followPerformerId/colorがそのCueの状態を反映済み＝18・19・25・26章）を渡す。
@@ -8315,6 +9087,10 @@ function buildLightingCueExportModels({
     // （entry Fadeの途中状態はresolveせずExport modelへ渡さない）。
     lightingCueEntryFadeCounts: Number.isFinite(Number(scene.entryFadeCounts)) ? Math.max(0, Number(scene.entryFadeCounts)) : 0,
     transitionPaths: trajectoryForStartOrKeep,
+    trajectoryFromPlacements: audienceTrajectoryFromPlacements,
+    trajectoryToPlacements: audienceTrajectoryToPlacements,
+    trajectoryPathConfig: audienceTrajectoryPathConfig,
+    trajectoryProgress: 1,
     lightingBeamTrackingPaths: trackingPathsForStartOrKeep(baseBeams3D),
   });
 
@@ -8339,8 +9115,12 @@ function buildLightingCueExportModels({
       lightingAreas: resolved.areas,
       // 高台 Phase 3A・PART R：この関数が受け取ったplatformsをそのまま渡し、開始時・keep・
       // transitionすべてのCueで高台照射target.zが反映されるようにする。
-      lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, slide.placements || {}, platforms),
+      lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, slide.placements || {}, platforms, stageConnectors),
       transitionPaths: trajectoryForStartOrKeep,
+      trajectoryFromPlacements: audienceTrajectoryFromPlacements,
+      trajectoryToPlacements: audienceTrajectoryToPlacements,
+      trajectoryPathConfig: audienceTrajectoryPathConfig,
+      trajectoryProgress: 1,
       // 18章：keep Cue時点でresolveされた生のbeams3D（resolved.beams3D）をfollow判定に使う
       // （resolveLightingBeams3DForDisplay適用後のtarget解決済みリストではなく、生のリスト）。
       lightingBeamTrackingPaths: trackingPathsForStartOrKeep(resolved.beams3D),
@@ -8357,6 +9137,14 @@ function buildLightingCueExportModels({
   if (hasNext && nextSlide) {
     const keepEndState = resolveLightingCueState({ baseAreas, baseBeams3D, cues: keepCues, elapsedCounts: keep });
     const transitionPoseConfig = getTransitionPosesForSlide(transitionPoses, slide.id);
+    // Stage Connector Phase 1I.2・PART B・G・H：transition Cue用の3D trajectory raw materials。
+    // hasNext && nextSlideはこのifブロック自体で保証済みのため、条件はshowTrajectoryだけでよい
+    // （既存slicedTransitionPathsの条件と完全に一致させる＝PART C：Cue progress semanticsを
+    // 変更しない）。
+    const audienceTransitionTrajectoryEnabled = showTrajectory;
+    const audienceTransitionTrajectoryFromPlacements = audienceTransitionTrajectoryEnabled ? slide.placements : null;
+    const audienceTransitionTrajectoryToPlacements = audienceTransitionTrajectoryEnabled ? nextSlide.placements : null;
+    const audienceTransitionTrajectoryPathConfig = audienceTransitionTrajectoryEnabled ? pathConfig : null;
     transitionCues.forEach((cue) => {
       const displayCount = keep + cue.count + 1;
       const resolved = resolveLightingCueState({
@@ -8415,8 +9203,15 @@ function buildLightingCueExportModels({
         placements: cutPlacements,
         lightingAreas: resolved.areas,
         // 高台 Phase 3A・PART R：keep Cueと同じくplatformsを渡す。
-        lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, cutPlacements, platforms),
+        lightingBeams3D: resolveLightingBeams3DForDisplay(resolved.beams3D, cutPlacements, platforms, stageConnectors),
         transitionPaths: slicedTransitionPaths,
+        trajectoryFromPlacements: audienceTransitionTrajectoryFromPlacements,
+        trajectoryToPlacements: audienceTransitionTrajectoryToPlacements,
+        trajectoryPathConfig: audienceTransitionTrajectoryPathConfig,
+        // Stage Connector Phase 1I.2・PART C・K：既存progress（cue.count/move、clamp 0..1済み）
+        // をそのまま渡すだけ。partial trajectoryの末端が、このカットのcutPlacements
+        // （同じprogressでinterpolatePlacementsWithPaths()した結果）と一致する（PART S）。
+        trajectoryProgress: progress,
         lightingBeamTrackingPaths: slicedTrackingPaths,
       });
     });
@@ -8465,6 +9260,9 @@ function buildLightingCueExportModelsForSlides({
   // 高台 Phase 2E.2・PART C：buildLightingCueExportModels()と同じ表示用引数。通常
   // Formation Exportと同じplatformsをそのまま束ねて渡すだけで、加工・clone・再計算はしない。
   platforms = [],
+  // Stage Connector Phase 1A.1・PART 1：platformsと全く同じ考え方で、内部builderへ
+  // そのまま渡すだけ。
+  stageConnectors = [],
 }) {
   if (!Array.isArray(slides) || slides.length === 0) return [];
   const orderedIndices = Array.isArray(slideIndices)
@@ -8497,6 +9295,8 @@ function buildLightingCueExportModelsForSlides({
       showLightingTrackingPaths,
       // 高台 Phase 2E.2・PART D：内部builderへそのまま渡すだけ。
       platforms,
+      // Stage Connector Phase 1A.1・PART 1：platformsと全く同じく内部builderへそのまま渡す。
+      stageConnectors,
     });
     result.push(...models);
   });
@@ -8839,6 +9639,30 @@ function isPerformerVisibleForExport(pos, showWaitingAreas) {
 }
 
 // ------------------------------------------------------------------
+// Stage Connector Phase 1H：Audience performer visibility policy v2
+// ------------------------------------------------------------------
+// TopView＝「舞台全体の構造・待機位置・舞台裏の動きを管理するビュー」、Audience View＝
+// 「観客から見える舞台上の動きを確認するビュー」という役割分担に基づき、Audience側の
+// 出演者表示を「舞台上＝実体、舞台外＝表示するなら常にGhost」の1本の意味論へ揃える
+// pure classification helper（PART A）。screen（OverheadAudienceView）・Export
+// （renderAudienceFormationExport）の両方がこの1つの関数だけを呼び、waiting areaかどうかの
+// 分類ロジックを二重実装しない。
+//   area === "stageLeft" | "stageRight" | "upstageBackstage"（waiting area）
+//     → showWaiting ? "ghost" : "hidden"（platform occlusion判定は一切行わない＝PART B）
+//   area === "stage" または area == null（範囲外＝警告対象。既存の「showWaiting OFFでも
+//     隠さない」安全仕様をそのまま維持＝PART E）
+//     → "normal"（stage performerのplatform遮蔽はこの関数の外でisPlacementOccludedByPlatform()
+//     を使って判定する。screen geometryが必要なためこのpure helperには混ぜない＝PART A末尾）
+function getAudiencePerformerDisplayMode(placement, showWaiting) {
+  if (!placement) return "hidden";
+  const area = placement.area;
+  if (area === "stageLeft" || area === "stageRight" || area === "upstageBackstage") {
+    return showWaiting ? "ghost" : "hidden";
+  }
+  return "normal";
+}
+
+// ------------------------------------------------------------------
 // ファイル名生成（20章）
 // ------------------------------------------------------------------
 function sanitizeExportFilenameName(name) {
@@ -8896,9 +9720,10 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   // Export表示倍率 v1・PART G・H：auto-fit後の構図倍率（1.0＝100%）。平面図・俯瞰客席ビュー
   // どちらのrendererにも同じ値を渡す（それぞれのauto-fit計算・bounds計算自体は無変更）。
   const displayScale = renderOptions && typeof renderOptions.displayScale === "number" ? renderOptions.displayScale : 1;
-  // 高台 Phase 2E・PART O：俯瞰客席ビュー（audience）出力の場合だけ渡す。平面図（top）側の
-  // renderTopFormationExport()へは渡さない（PART S：平面図は今回一切変更しない）。
-  const showOccludedPerformerGhosts = !!(renderOptions && renderOptions.showOccludedPerformerGhosts);
+  // Stage Connector Phase 1H.1・PART D：旧「高台裏をゴースト表示」optionのderive/転送は、
+  // renderAudienceFormationExport()側が既にこのoptionを一切使わなくなった（Phase 1H）ため、
+  // reference auditの結果削除した。俯瞰客席ビューのwaiting performer Ghost表示は現在
+  // showWaitingAreasだけで決まる。
 
   const PADDING = 40;
   // Lighting Cue Export v1・26章：Cue Export時（model.lightingCueLabelがある場合）だけ、
@@ -8927,7 +9752,7 @@ function renderFormationExportToCanvas(model, canvas, renderOptions) {
   };
 
   if (viewMode === "audience") {
-    renderAudienceFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, displayScale, showOccludedPerformerGhosts });
+    renderAudienceFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, displayScale });
   } else {
     renderTopFormationExport(ctx, model, stageAreaRect, { showWaitingAreas, showPerformerNames, displayScale });
   }
@@ -9048,7 +9873,11 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
   // 中に入るようにする。v1.1のバグは、ON時でもこのzonesが一切渡されておらず、fit/clipが
   // 常にステージ本体だけの狭い範囲のままだったため、待機エリアの矩形・ラベル・出演者が
   // 常にクリップ範囲外に計算され、ONにしても実際には何も見えていなかったことが原因。
-  const bounds = computeFormationThumbnailBounds(model.stage, showWaitingAreas ? model.zones : null);
+  // Stage Connector Phase 1D・PART H：第3引数にmodel.stageConnectorsを渡す。これは
+  // showWaitingAreasの値に関わらず常に渡すことで、「待機エリアの背景・出演者はOFFのままで
+  // 良いが、stage外に置かれたstairs自体はExportでclipされない」という要件を、待機エリア
+  // 表示トグルとは独立に実現する（PART H：stairs visibilityの分離）。
+  const bounds = computeFormationThumbnailBounds(model.stage, showWaitingAreas ? model.zones : null, model.stageConnectors);
   const fit = applyExportDisplayScale(
     computeContainFitTransform(bounds.totalW, bounds.totalH, stageAreaW, stageAreaH),
     stageAreaW,
@@ -9220,6 +10049,58 @@ function renderTopFormationExport(ctx, model, stageAreaRect, options) {
       ctx.moveTo(rectX, frontEdgeY);
       ctx.lineTo(rectX + rectW, frontEdgeY);
       ctx.stroke();
+    });
+  }
+
+  // Stage Connector Phase 1A・PART J：階段レイヤー。高台レイヤーの直後（＝出演者・Lighting
+  // Areaより先＝背面）に描く読み取り専用の表示。TopViewと全く同じgetStageConnectorStairsGeometry()
+  // を再利用し、座標変換だけをExport用のtoX/toYへ差し替える（幾何計算の二重実装を避ける＝
+  // PART J）。model.stageConnectorsはbuildFormationExportModel側で既に[]へfallback済みの配列。
+  // 高台と同じgetPlatformVisualColors()を再利用しつつ、外枠だけdashed（破線）にすることで
+  // 矩形高台と混同しないよう差別化する（TopViewと同じ視覚言語＝PART G）。
+  if (model.stageConnectors && model.stageConnectors.length > 0) {
+    const connectorVisualColors = getPlatformVisualColors(exportFloorColorKey);
+    model.stageConnectors.forEach((connector) => {
+      const geometry = getStageConnectorStairsGeometry(connector);
+      if (!geometry) return;
+      const { rect, stepLines, topEdge, chevron } = geometry;
+      const rectX = toX(rect.xMin);
+      const rectY = toY(rect.yMax);
+      const rectW = toX(rect.xMax) - rectX;
+      const rectH = toY(rect.yMin) - rectY;
+      const toCanvasLine = (seg) => ({ x1: toX(seg.x1), y1: toY(seg.y1), x2: toX(seg.x2), y2: toY(seg.y2) });
+
+      ctx.strokeStyle = connectorVisualColors.strokeColor;
+      ctx.lineWidth = 2.0;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(rectX, rectY, rectW, rectH);
+      ctx.setLineDash([]);
+
+      ctx.lineWidth = 1.4;
+      stepLines.forEach((seg) => {
+        const s = toCanvasLine(seg);
+        ctx.beginPath();
+        ctx.moveTo(s.x1, s.y1);
+        ctx.lineTo(s.x2, s.y2);
+        ctx.stroke();
+      });
+
+      const screenTopEdge = toCanvasLine(topEdge);
+      ctx.strokeStyle = connectorVisualColors.frontStrokeColor;
+      ctx.lineWidth = 3.0;
+      ctx.beginPath();
+      ctx.moveTo(screenTopEdge.x1, screenTopEdge.y1);
+      ctx.lineTo(screenTopEdge.x2, screenTopEdge.y2);
+      ctx.stroke();
+
+      ctx.lineWidth = 2.2;
+      chevron.forEach((seg) => {
+        const s = toCanvasLine(seg);
+        ctx.beginPath();
+        ctx.moveTo(s.x1, s.y1);
+        ctx.lineTo(s.x2, s.y2);
+        ctx.stroke();
+      });
     });
   }
 
@@ -9579,15 +10460,19 @@ function drawTopPerformerMarker(ctx, sx, sy, performer, figureRadius, highlighte
 // 一本化し、画面側のOverheadAudienceViewと全く同じ関数を呼ぶ（二重実装しない）。
 function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   const showWaitingAreas = !!(options && options.showWaitingAreas);
-  // 高台 Phase 2E・PART P・Q：画面側と同じ「高台裏を表示」optionをExport側でも受け取る。
-  // 未指定時はfalse（従来通りghostなし、完全非表示のまま）にfallbackする。
-  const showOccludedPerformerGhosts = !!(options && options.showOccludedPerformerGhosts);
+  // Stage Connector Phase 1H.1・PART D：旧「高台裏を表示」option（showOccludedPerformerGhosts）
+  // は、Phase 1Hでwaiting performer Ghost表示がshowWaitingAreasだけで決まるよう変更した後、
+  // この関数内では一切参照されなくなっていたことをreference auditで確認したため削除した。
   const { x: stageAreaX, y: stageAreaY, w: stageAreaW, h: stageAreaH } = stageAreaRect;
 
   // 18章：OverheadAudienceViewと同じcomputeAudienceViewBounds()で「舞台空間そのもの」の
   // 固定範囲（showWaitingAreasに応じてステージ本体のみ／下手袖+上手袖まで含む）を求め、
   // それをcomputeContainFitTransform()でCanvasの固定領域にcontain-fitさせるだけ。
-  const bounds = computeAudienceViewBounds(model.stage, model.zones, showWaitingAreas);
+  // Stage Connector Phase 1D・PART I：第4引数にmodel.stageConnectorsを渡す。showWaitingAreas
+  // の値に関わらず常に渡すことで、stage外に置かれたstairsがAudience Formation Exportで
+  // clipされないようにする（screen側と同じcomputeAudienceViewBounds()をそのまま共有し、
+  // Export専用の別bounds計算は作らない＝PART I）。
+  const bounds = computeAudienceViewBounds(model.stage, model.zones, showWaitingAreas, model.stageConnectors);
   const fit = applyExportDisplayScale(
     computeContainFitTransform(bounds.totalW, bounds.totalH, stageAreaW, stageAreaH),
     stageAreaW,
@@ -9782,64 +10667,83 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
     ctx.globalAlpha = 1;
   }
 
-  // 高台 Phase 1B：俯瞰客席ビューでの高さ表現（Export対応）。画面側のOverheadAudienceViewと
-  // 全く同じgetPlatformAudienceFaces()（getPlatformStageRect()＋projectAudiencePoint3Dだけを
-  // 使う共通pure helper）を再利用し、Export専用の別geometryは作らない。model.platformsは
-  // buildFormationExportModel側で既に[]へfallback済みの配列（Phase 1Aから追加済みのfieldを
-  // そのまま使うだけで、新しいExport model fieldは追加しない）。Lighting Areaより先
-  // （＝背面）に描くことで、画面側と同じ「高台は舞台構造物、Lightingは光」という重なり方を
-  // 維持する。複数高台はplatform.yの降順（奥から先）で描画する。
-  // 高台 Phase 2D・PART A・B：枠色・線幅は現在の画面側（OverheadAudienceView）に完全に
-  // 追従させる。getPlatformAudienceColors()のfrontStrokeColor/strokeColorはもう枠には
-  // 使わず（fillのfrontFillColor/topFillColorは維持）、舞台本体polygonと同じTHEME.gridLineを
-  // 直接使う（新しい色helperは作らない）。
-  if (model.platforms && model.platforms.length > 0) {
-    const platformAudienceColors = getPlatformAudienceColors(exportFloorColorKey);
-    const sortedPlatforms = [...model.platforms].sort((a, b) => (b.y || 0) - (a.y || 0));
-    sortedPlatforms.forEach((pl) => {
-      const faces = getPlatformAudienceFaces(pl, bounds, model.stage.depth);
-      if (!faces) return;
-      const drawFace = (facePoints, fillColor, strokeColor, lineWidth) => {
-        ctx.beginPath();
-        facePoints.forEach((pt, i) => {
-          const sp = { sx: stageAreaX + fit.offsetX + fit.scale * pt.sx, sy: stageAreaY + fit.offsetY + fit.scale * pt.sy };
-          if (i === 0) ctx.moveTo(sp.sx, sp.sy);
-          else ctx.lineTo(sp.sx, sp.sy);
-        });
-        ctx.closePath();
-        ctx.fillStyle = fillColor;
-        ctx.fill();
-        ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = lineWidth;
-        ctx.stroke();
-      };
-      drawFace(faces.front, platformAudienceColors.frontFillColor, THEME.gridLine, 1.2);
-      drawFace(faces.top, platformAudienceColors.topFillColor, THEME.gridLine, 1.0);
-
-      // 高台 Phase 2D・PART C・D・E・F：高台天面グリッド（Export対応）。画面側と全く同じ
-      // getPlatformTopGridSegments()（高台専用の別grid生成ロジックは作らない）で通常舞台
-      // stageGuideから該当部分を切り出し、projectAudiencePoint3D()でz=platform.heightへ
-      // 持ち上げてから、既存のCanvas fit transformを適用する（新しい遠近投影式は作らない）。
-      // 見た目は画面側（THEME.gridLineHalf, opacity 0.5, width 0.6）と同じ値を使う。
-      // 描画順は「高台front/top（すぐ上）→高台天面grid（ここ）→Lighting（このブロックの
-      // 次）」を維持し、Lighting Area/Beamの既存描画順には触れない。
-      const gridSegs = getPlatformTopGridSegments(pl, stageGuide);
-      const drawTopGridLine = (seg) => {
-        const a = projectAudiencePoint3D(bounds, model.stage.depth, seg.x1, seg.y1, pl.height);
-        const b = projectAudiencePoint3D(bounds, model.stage.depth, seg.x2, seg.y2, pl.height);
-        const sa = { sx: stageAreaX + fit.offsetX + fit.scale * a.sx, sy: stageAreaY + fit.offsetY + fit.scale * a.sy };
-        const sb = { sx: stageAreaX + fit.offsetX + fit.scale * b.sx, sy: stageAreaY + fit.offsetY + fit.scale * b.sy };
-        ctx.beginPath();
-        ctx.moveTo(sa.sx, sa.sy);
-        ctx.lineTo(sb.sx, sb.sy);
-        ctx.stroke();
-      };
-      ctx.strokeStyle = THEME.gridLineHalf;
-      ctx.globalAlpha = 0.5;
-      ctx.lineWidth = 0.6;
-      gridSegs.vertical.forEach(drawTopGridLine);
-      gridSegs.horizontal.forEach(drawTopGridLine);
+  // Stage Connector Phase 1D.1・PART A〜G：高台・stairsを「別々の固定描画ブロック」ではなく、
+  // 同じ舞台構造物群として奥→手前のPainter's algorithmで統合する（Export対応）。画面側の
+  // OverheadAudienceViewと全く同じbuildAudienceStageStructureDrawItems()・
+  // sortAudienceStageStructureItems()（PART G：screen/Exportで共有するpure helper）を再利用し、
+  // Export専用の別sortロジックは作らない。getPlatformAudienceFaces()・
+  // getStageConnectorAudienceFaces()自体のgeometry計算は一切変更しない（PART K・L）。
+  // Lighting Areaより先（＝背面）に描く、という既存の重なり方はそのまま維持する（PART H）。
+  // 画面側との違いは、返ってきた生のsx/syへこの関数のCanvas fit transform
+  // （stageAreaX+offsetX+scale*sx）を適用するだけという座標変換の差だけ。
+  // Stage Connector Phase 1J.2・PART D・T、1J.2.1・PART B・T：platform front face・top strip・
+  // top grid lineは、この後のBeam slice + Performer depth統合（STEP③）へ回すため、ここでは
+  // 一旦外側スコープの変数へ保持しておく（PART G：front/topともperformerとのPainter's
+  // algorithm比較対象にする。stairsはこれまで通りこの構造ブロックで描画する＝PART X）。
+  let platformStructureOcclusionItems = [];
+  if ((model.platforms && model.platforms.length > 0) || (model.stageConnectors && model.stageConnectors.length > 0)) {
+    const structureColors = getPlatformAudienceColors(exportFloorColorKey);
+    const drawFace = (facePoints, fillColor, strokeColor, lineWidth) => {
+      ctx.beginPath();
+      facePoints.forEach((pt, i) => {
+        const sp = { sx: stageAreaX + fit.offsetX + fit.scale * pt.sx, sy: stageAreaY + fit.offsetY + fit.scale * pt.sy };
+        if (i === 0) ctx.moveTo(sp.sx, sp.sy);
+        else ctx.lineTo(sp.sx, sp.sy);
+      });
+      ctx.closePath();
+      ctx.fillStyle = fillColor;
+      ctx.fill();
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+    };
+    // Stage Connector Phase 1D.4・PART F・J・K：完全に舞台袖外にあるlateral stairsの参考表示
+    // （Export対応）。screen側（OverheadAudienceView）と全く同じ視覚言語（fillなし・破線・
+    // opacity低め・無彩色THEME.textDim）を使い、Export専用の別style判定は作らない。
+    const drawGhostFace = (facePoints, strokeColor, lineWidth) => {
+      ctx.beginPath();
+      facePoints.forEach((pt, i) => {
+        const sp = { sx: stageAreaX + fit.offsetX + fit.scale * pt.sx, sy: stageAreaY + fit.offsetY + fit.scale * pt.sy };
+        if (i === 0) ctx.moveTo(sp.sx, sp.sy);
+        else ctx.lineTo(sp.sx, sp.sy);
+      });
+      ctx.closePath();
+      ctx.globalAlpha = 0.35;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = lineWidth;
+      ctx.stroke();
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
+    };
+    const allItems = buildAudienceStageStructureDrawItems({
+        platforms: model.platforms,
+        stageConnectors: model.stageConnectors,
+        bounds,
+        stageDepth: model.stage.depth,
+        stage: model.stage,
+      });
+    const frontItems = allItems.filter((item) => item.kind === "platform-front");
+    const topItems = (model.platforms || []).flatMap((pl) =>
+      buildPlatformAudienceTopStructureDepthItems({ platform: pl, stageGuide, bounds, stageDepth: model.stage.depth })
+    );
+    platformStructureOcclusionItems = [...frontItems, ...topItems, ...getNormalAudienceStairsDepthItems(allItems)];
+    const items = sortAudienceStageStructureItems(allItems).filter((item) => item.displayMode === "ghost");
+    items.forEach((item) => {
+      if (item.kind === "stairs-riser") {
+        if (item.displayMode === "ghost") {
+          drawGhostFace(item.points, THEME.textDim, 1.2);
+          return;
+        }
+        drawFace(item.points, structureColors.frontFillColor, THEME.gridLine, 1.0);
+        return;
+      }
+      // stairs-tread
+      if (item.displayMode === "ghost") {
+        drawGhostFace(item.points, THEME.textDim, 1.2);
+        return;
+      }
+      drawFace(item.points, structureColors.topFillColor, THEME.gridLine, 1.0);
     });
   }
 
@@ -9847,17 +10751,20 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   // model.lightingAreasは平面図Exportと全く同じ既にLighting ON/OFF・Scene enabled判定済みの
   // 配列（buildFormationExportModel側で共通に算出）なので、ここでも条件判定は一切行わない。
   // 編集画面のOverheadAudienceViewと全く同じgetLightingAreaStagePoints()で舞台座標上の
-  // 頂点列を取得し、このrenderer既存のproject()（projectAudiencePoint＋Canvas fit変換の
-  // ラッパー、上のstageFrontLeft等と全く同じ関数）へそのまま通して投影する（M章：Areaだけ
-  // 別の遠近法にしない）。色・opacityは平面図Exportと同じcolor/opacity helperを再利用する。
+  // 頂点列を取得する（x/y専用のまま変更しない＝高台 Phase 3C・PART F）。
+  // 高台 Phase 3C・PART N：画面と同じresolveLightingAreaSurfaceHeight()を使い、
+  // project3D()（projectAudiencePoint3D＋Canvas fit変換、Beam footprint Phase 3Aと同じ
+  // 既存経路）へ通すことで、高台選択Areaも同じ高さへ持ち上がるようにする。Export専用の
+  // 別surface計算は作らない。色・opacityは平面図Exportと同じcolor/opacity helperを再利用する。
   if (model.lightingAreas && model.lightingAreas.length > 0) {
     ctx.save();
     model.lightingAreas.forEach((area) => {
       const stagePoints = getLightingAreaStagePoints(area);
       if (stagePoints.length === 0) return;
+      const areaSurfaceZ = resolveLightingAreaSurfaceHeight(area, model.platforms);
       ctx.beginPath();
       stagePoints.forEach((p, i) => {
-        const sp = project(p.x, p.y);
+        const sp = project3D(p.x, p.y, areaSurfaceZ);
         if (i === 0) ctx.moveTo(sp.sx, sp.sy);
         else ctx.lineTo(sp.sx, sp.sy);
       });
@@ -9908,53 +10815,6 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   const visiblePerformers = model.performers.filter((p) => isPerformerVisibleForExport(model.placements[p.id], showWaitingAreas));
   const visibleIds = new Set(visiblePerformers.map((p) => p.id));
   const visibleTransitionPaths = model.transitionPaths.filter((p) => visibleIds.has(p.id));
-
-  // 描画順2：移動軌跡（OverheadAudienceViewと同じ「project()で投影した3点をそのまま
-  // 二次ベジェとして描く」近似方式。矢印の算出もtrajectoryArrowPoints()を再利用する）。
-  // Export品質改善・PART F〜I：固定値0.55ではなく、平面図Export側と共通のEXPORT_TRAJECTORY_ALPHAを
-  // 使う（線・矢印とも同じ透明度＝PART H）。ctx.save()/restore()で囲み、この透明度が
-  // 後続の出演者描画（各performerごとのopacity設定）へ漏れないようにする（PART I）。
-  // 照明ビームExport対応・STEP③：編集画面の描画順（Lighting Area→footprint→trajectory→
-  // depth統合）に合わせ、このtrajectoryブロックをBeam本体描画より前へ移動した
-  // （trajectoryの描画コード自体・EXPORT_TRAJECTORY_ALPHA等は一切変更していない）。
-  ctx.save();
-  ctx.globalAlpha = EXPORT_TRAJECTORY_ALPHA;
-  visibleTransitionPaths.forEach((path) => {
-    const performer = model.performers.find((p) => p.id === path.id);
-    const color = (performer && performer.color) || THEME.textDim;
-    const fromP = project(path.from.x, path.from.y);
-    const toP = project(path.to.x, path.to.y);
-    const isCurve = path.type === "curve" && path.waypoint;
-    const wpP = isCurve ? project(path.waypoint.x, path.waypoint.y) : null;
-
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(fromP.sx, fromP.sy);
-    if (isCurve) {
-      ctx.quadraticCurveTo(wpP.sx, wpP.sy, toP.sx, toP.sy);
-    } else {
-      ctx.lineTo(toP.sx, toP.sy);
-    }
-    ctx.stroke();
-
-    const arrowSize = 9;
-    const arrowPts = isCurve
-      ? trajectoryArrowPoints(wpP.sx, wpP.sy, toP.sx, toP.sy, arrowSize)
-      : trajectoryArrowPoints(fromP.sx, fromP.sy, toP.sx, toP.sy, arrowSize);
-    if (arrowPts) {
-      const pts = arrowPts.split(" ").map((pair) => pair.split(",").map(Number));
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0], pts[0][1]);
-      ctx.lineTo(pts[1][0], pts[1][1]);
-      ctx.lineTo(pts[2][0], pts[2][1]);
-      ctx.closePath();
-      ctx.fill();
-    }
-  });
-  ctx.restore();
 
   // 描画順2.5：追尾スポット軌跡（追尾スポット軌跡Export v1・38〜41・42章）。平面図Export
   // （STEP①相当）と全く同じmodel.lightingBeamTrackingPaths配列をそのまま使い、新しい
@@ -10055,39 +10915,41 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
   }
 
   // Performer item化：STEP②.5のsorted生成をそのまま使い、単独sortはせずitem化だけ行う。
-  // 高台 Phase 2D・PART G・O：画面側のOverheadAudienceViewと全く同じ意味論で、「通常舞台として
-  // 高台の下にいる」出演者（isPlacementUnderPlatform）と、「待機表示ON時に高台の後ろへ隠れる
-  // 舞台奥待機の出演者」（isBackstagePlacementOccludedByPlatform）を、depth統合の対象へ入れる
-  // 前のこの1箇所で除外する。新しい高台下判定・別の遮蔽ロジックは作らず、画面側のPhase 2C/2Dと
-  // 完全に同じ2つのpure helperをそのまま再利用する。beamItems側・depthMergedItemsのsort/
-  // tie-break（すぐ下）には一切手を加えない。showWaitingAreas===falseの場合はそもそも
-  // isPerformerVisibleForExport()により舞台奥出演者がvisiblePerformersへ入らないため、
-  // 既存挙動は変わらない（PART M）。
-  // 高台 Phase 2D.1・PART I：袖（stageLeft/stageRight）で高台横に紛らわしく見える出演者
-  // （isWingPlacementOccludedByPlatform）も、画面側と全く同じpure helperをそのまま使って
-  // 同じ位置で除外する（Export専用の別ロジックは作らない）。
-  // 高台 Phase 2E・PART P：画面側と同じくisPlacementOccludedByPlatform()（3helperをまとめた
-  // だけの判定）を唯一の判定元として、通常出演者（performerItems→depth統合）と遮蔽出演者
-  // （occludedPerformerEntries→ghost専用）を分離する。
-  const audiencePerformerEntries = visiblePerformers.map((p) => ({ p, pos: model.placements[p.id] })).filter((v) => !!v.pos);
+  // Stage Connector Phase 1H・PART A・B・C・N：getAudiencePerformerDisplayMode()で
+  // stage/null（"normal"候補）とwaiting area（"ghost"、showWaitingAreas===falseの分は
+  // isPerformerVisibleForExport()により既にvisiblePerformersへ入っていない）を分類する。
+  // Stage Connector Phase 1J.1.3・PART Aにより、isPlacementOccludedByPlatform()は現在
+  // isWaitingAreaPlacementOccludedByPlatform()だけを呼ぶ判定になっており、これは
+  // waiting area（stageLeft/stageRight/upstageBackstage）以外のplacementに対しては
+  // 常にfalseを返す（area gateが先頭にあるため）。つまりarea==="stage"またはnull
+  // （＝displayMode==="normal"）のstage performerについて、この判定は既に恒常的にfalseで
+  // あり、Stage Connector Phase 1J.2でplatform遮蔽をdepthMergedItemsのPainter's algorithmへ
+  // 完全移行したことで、この関数呼び出し自体が事実上のdead computationになっていた
+  // （reference audit・PART AA）。そのためここでは単純にoccluded:falseを直接返し、
+  // 呼び出しに必要だったsurfaceHeight/project3D/screenTransformの計算も省略する
+  // （isWaitingAreaPlacementOccludedByPlatform()自体・isPlacementOccludedByPlatform()自体は
+  // 一切変更せず、waiting area側の判定はそのまま生きている＝PART E）。
+  const audiencePerformerEntries = visiblePerformers.map((p) => ({ p, pos: model.placements[p.id] })).filter((v) => !!v.pos)
+    .map((v) => {
+      const displayMode = getAudiencePerformerDisplayMode(v.pos, showWaitingAreas);
+      return { ...v, displayMode, occluded: false };
+    });
   const performerItems = audiencePerformerEntries
-    .filter((v) => !isPlacementOccludedByPlatform(v.pos, model.platforms))
+    .filter((v) => v.displayMode === "normal" && !v.occluded)
     .map((v) => ({ kind: "performer", key: v.p.id, depthY: v.pos.y, p: v.p, pos: v.pos }));
-  const occludedPerformerEntries = audiencePerformerEntries.filter((v) => isPlacementOccludedByPlatform(v.pos, model.platforms));
+  // Stage Connector Phase 1H・PART B・F・G・K・L：waiting area performer（"ghost"分類）専用の
+  // 一覧。stage performerの遮蔽（occluded===true）はPART Cによりhidden（＝performerItems・
+  // occludedPerformerEntriesどちらにも入らない）になるため、旧「stage遮蔽performer専用の
+  // Ghost配列」はもう作らない。
+  const occludedPerformerEntries = audiencePerformerEntries.filter((v) => v.displayMode === "ghost");
 
-  // 編集画面のdepthMergedItemsと全く同じ比較関数（同ファイル7162〜7169行目）。
-  // 奥（depthYが大きい）ほど先に描画し、同depth（差がTIE_BREAK_EPSILON以下）の場合は
-  // Performerを後ろ（＝画面上で手前）にする。Beam同士・Performer同士は0を返し、
-  // Array.prototype.sortの安定ソートにより元の配列順（生成順）をそのまま維持する
-  // （新しいtie-breakを追加しない＝16章）。
-  const depthMergedItems = [...beamItems, ...performerItems];
-  const TIE_BREAK_EPSILON = 1e-6;
-  depthMergedItems.sort((a, b) => {
-    const diff = b.depthY - a.depthY;
-    if (Math.abs(diff) > TIE_BREAK_EPSILON) return diff;
-    if (a.kind === b.kind) return 0;
-    return a.kind === "performer" ? 1 : -1;
-  });
+  // Stage Connector Phase 1J.2・PART D・G・T、1J.2.1・PART B・T：Screen（OverheadAudienceView）
+  // と全く同じ共有pure関数sortAudienceDepthMergedItems()を使い、beamItems・performerItemsに
+  // platformStructureOcclusionItems（上記の構造ブロックで積んでおいたplatform-front・
+  // platform-top-strip・platform-top-grid-line item。`points`/`a`/`b`自体はScreen版と同じ
+  // 生の投影結果であり、実際の座標変換は下のforEach内でScreen側と同様にfit変換して行う）を
+  // 混ぜて並べ替える。別々のsortロジックは作らない（PART T：Screen/Export parity）。
+  const depthMergedItems = sortAudienceDepthMergedItems([...beamItems, ...performerItems, ...platformStructureOcclusionItems]);
 
   // Beam sliceとPerformerを交互に描画する可能性があるため、item処理ごとに必要な
   // Canvas state（globalAlpha・fillStyle）を毎回明示的に設定する（13章：状態の
@@ -10109,33 +10971,212 @@ function renderAudienceFormationExport(ctx, model, stageAreaRect, options) {
       ctx.fill();
       return;
     }
+    if (item.kind === "platform-front" || item.kind === "stairs-riser" || item.kind === "stairs-tread") {
+      // Stage Connector Phase 1J.2・PART B・G・T：SVG mask／Canvas evenodd clipはもう使わない。
+      // platform-frontはperformerと同じdepthMergedItems配列内でPainter's algorithmにより
+      // 描画順だけで前後関係を表現する。fill/stroke自体は従来のstructure描画と全く同じ
+      // （getPlatformAudienceColors()のfrontFillColor・THEME.gridLine・lineWidth=1.2）。
+      const structureColors = getPlatformAudienceColors(exportFloorColorKey);
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      item.points.forEach((pt, i) => {
+        const px = stageAreaX + fit.offsetX + fit.scale * pt.sx;
+        const py = stageAreaY + fit.offsetY + fit.scale * pt.sy;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.closePath();
+      ctx.fillStyle = item.kind === "stairs-tread" ? structureColors.topFillColor : structureColors.frontFillColor;
+      ctx.fill();
+      ctx.strokeStyle = THEME.gridLine;
+      ctx.lineWidth = item.kind === "platform-front" ? 1.2 : 1.0;
+      ctx.stroke();
+      return;
+    }
+    if (item.kind === "platform-top-strip") {
+      // Stage Connector Phase 1J.2.1・PART F・T：Screenと同じくfillのみ（strip内部境界に
+      // strokeを付けない）。
+      const structureColors = getPlatformAudienceColors(exportFloorColorKey);
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      item.points.forEach((pt, i) => {
+        const px = stageAreaX + fit.offsetX + fit.scale * pt.sx;
+        const py = stageAreaY + fit.offsetY + fit.scale * pt.sy;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.closePath();
+      ctx.fillStyle = structureColors.topFillColor;
+      ctx.fill();
+      return;
+    }
+    if (item.kind === "platform-top-grid-line" || item.kind === "platform-top-outline-line") {
+      const isOutline = item.kind === "platform-top-outline-line";
+      ctx.globalAlpha = isOutline ? 1 : 0.5;
+      ctx.strokeStyle = isOutline ? THEME.gridLine : THEME.gridLineHalf;
+      ctx.lineWidth = isOutline ? 1.0 : 0.6;
+      ctx.beginPath();
+      ctx.moveTo(stageAreaX + fit.offsetX + fit.scale * item.a.sx, stageAreaY + fit.offsetY + fit.scale * item.a.sy);
+      ctx.lineTo(stageAreaX + fit.offsetX + fit.scale * item.b.sx, stageAreaY + fit.offsetY + fit.scale * item.b.sy);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      return;
+    }
     // Performer：本体＋番号はdrawExportPerformerAudience()内部で連続して描画される
     // （既存構造。STEP②.5のstyleは一切変更していない）。番号だけを後でまとめて
     // 描画する構造にはしない（9章：奥の人物の番号が手前を貫通しないようにするため）。
     // 高台 Phase 2A・11章：画面側と全く同じresolvePlacementSurfaceHeight()を使い、
     // 高台上出演者をplatform.height分だけ持ち上げる。model.placements内のsurfaceIdを
     // そのまま使うだけで、新しいExport model fieldは追加しない。
+    // Stage Connector Phase 1F・PART B・K：auto performerがstairs矩形内にいる場合は
+    // resolvePlacementEffectiveSurfaceHeight()経由でcontinuous stairs Zを優先する。
+    // 画面側（renderPerformerBody）と全く同じhelperを使い、Export専用の別判定は作らない。
     const { p, pos } = item;
-    const surfaceHeight = resolvePlacementSurfaceHeight(pos, model.platforms);
+    const surfaceHeight = resolvePlacementEffectiveSurfaceHeight(pos, model.platforms, model.stageConnectors);
     const { sx, sy, scale } = project3D(pos.x, pos.y, surfaceHeight);
     const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
     const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
     ctx.globalAlpha = 1;
+    // Stage Connector Phase 1J.2・PART B・S：SVG mask／Canvas evenodd clipはもう使わない
+    // （getStagePlacementOccludingPlatforms()・getPlatformAudienceOcclusionPolygons()は
+    // 呼ばない）。platformとの前後関係はdepthMergedItems内の描画順（Painter's algorithm）
+    // だけで表現する。
     drawExportPerformerAudience(ctx, sx, sy, heightPx, p, getPlacementPose(pos), refHeightPx);
   });
   ctx.globalAlpha = 1;
   ctx.restore();
 
+  // Phase 1J.2.4: trajectory overlay after physical scene, within the existing canvas state.
+  // 描画順2：移動軌跡（OverheadAudienceViewと同じ「project()で投影した3点をそのまま
+  // 二次ベジェとして描く」近似方式。矢印の算出もtrajectoryArrowPoints()を再利用する）。
+  // Export品質改善・PART F〜I：固定値0.55ではなく、平面図Export側と共通のEXPORT_TRAJECTORY_ALPHAを
+  // 使う（線・矢印とも同じ透明度＝PART H）。ctx.save()/restore()で囲み、この透明度が
+  // 後続の出演者描画（各performerごとのopacity設定）へ漏れないようにする（PART I）。
+  // 照明ビームExport対応・STEP③：編集画面の描画順（Lighting Area→footprint→trajectory→
+  // depth統合）に合わせ、このtrajectoryブロックをBeam本体描画より前へ移動した
+  // （trajectoryの描画コード自体・EXPORT_TRAJECTORY_ALPHA等は一切変更していない）。
+  ctx.save();
+  ctx.globalAlpha = EXPORT_TRAJECTORY_ALPHA;
+  // Stage Connector Phase 1I・PART AC、Phase 1I.2.2：3D trajectory（screenと共有する
+  // buildAudienceTrajectoryScreenPoints()を使うだけ）。model.trajectoryFromPlacements/
+  // trajectoryToPlacementsが無い場合は、既存のフラット2D描画（project()による疑似遠近法投影
+  // のみ、Z=0相当）へそのまま従来通りfallbackする。Z計算・投影ロジックの二重実装はしない
+  // （PART K）。
+  // Phase 1I.2.2・仕様修正：このアプリの「次へ」移動軌跡が示す意味は「現在位置までの移動履歴」
+  // ではなく「この構成から次の構成へ最終的にどこへ・どの経路で移動するか」。そのため
+  // Lighting Cue Exportのtransition Cueでも、trajectory自体は常にfrom→toのfull path
+  // （maxProgress=1）として描画する。Cue時点のperformer placements（model.placements、
+  // performer本体の描画に使われる）は一切変更しない——変わるのはtrajectoryの長さだけで、
+  // 出演者本体の位置とtrajectoryは独立して扱う。model.trajectoryProgressはCue進行度の
+  // 情報として残す（他用途のため削除しない）が、Audience trajectory描画の長さには使用しない。
+  visibleTransitionPaths.forEach((path) => {
+    const performer = model.performers.find((p) => p.id === path.id);
+    const color = (performer && performer.color) || THEME.textDim;
+    const rawPoints =
+      model.trajectoryFromPlacements && model.trajectoryToPlacements
+        ? buildAudienceTrajectoryScreenPoints(
+            path.id,
+            model.trajectoryFromPlacements[path.id],
+            model.trajectoryToPlacements[path.id],
+            model.trajectoryPathConfig,
+            model.platforms,
+            model.zones,
+            model.stageConnectors,
+            bounds,
+            model.stage.depth
+          )
+        : [];
+    // screen側のprojectAudiencePoint3D()生座標へ、このExport関数のCanvas fit変換だけを
+    // 追加で適用する（project3D()と全く同じ変換式。座標計算自体は共有helperのまま）。
+    const points = rawPoints.map((p) => ({
+      sx: stageAreaX + fit.offsetX + fit.scale * p.sx,
+      sy: stageAreaY + fit.offsetY + fit.scale * p.sy,
+    }));
+
+    if (points.length >= 2) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      points.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(p.sx, p.sy);
+        else ctx.lineTo(p.sx, p.sy);
+      });
+      ctx.stroke();
+
+      // Phase 1I.2.2：常にfull trajectoryのため、Phase 1I.2.1で追加したpartial trajectory用の
+      // arrow tip pullback処理（endpointから12px手前へ引く）は不要になったため削除した。
+      // 通常Audience Formation Exportと同じ、endpoint（=full pathの最終到達地点）そのものへ
+      // 矢印を描くsemanticsへ戻す。
+      const arrowSize = 9;
+      const last = points[points.length - 1];
+      const prev = points[points.length - 2];
+      const arrowPts = trajectoryArrowPoints(prev.sx, prev.sy, last.sx, last.sy, arrowSize);
+      if (arrowPts) {
+        const pts = arrowPts.split(" ").map((pair) => pair.split(",").map(Number));
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        ctx.lineTo(pts[1][0], pts[1][1]);
+        ctx.lineTo(pts[2][0], pts[2][1]);
+        ctx.closePath();
+        ctx.fill();
+      }
+      return;
+    }
+
+    // fallback：既存のフラット2D描画（model.trajectoryFromPlacements等が無い場合のみ）。
+    const fromP = project(path.from.x, path.from.y);
+    const toP = project(path.to.x, path.to.y);
+    const isCurve = path.type === "curve" && path.waypoint;
+    const wpP = isCurve ? project(path.waypoint.x, path.waypoint.y) : null;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(fromP.sx, fromP.sy);
+    if (isCurve) {
+      ctx.quadraticCurveTo(wpP.sx, wpP.sy, toP.sx, toP.sy);
+    } else {
+      ctx.lineTo(toP.sx, toP.sy);
+    }
+    ctx.stroke();
+
+    const arrowSize = 9;
+    const arrowPts = isCurve
+      ? trajectoryArrowPoints(wpP.sx, wpP.sy, toP.sx, toP.sy, arrowSize)
+      : trajectoryArrowPoints(fromP.sx, fromP.sy, toP.sx, toP.sy, arrowSize);
+    if (arrowPts) {
+      const pts = arrowPts.split(" ").map((pair) => pair.split(",").map(Number));
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      ctx.lineTo(pts[1][0], pts[1][1]);
+      ctx.lineTo(pts[2][0], pts[2][1]);
+      ctx.closePath();
+      ctx.fill();
+    }
+  });
   ctx.restore();
 
-  // 高台 Phase 2E・PART I・Q：高台裏ゴースト表示レイヤー。showOccludedPerformerGhosts
-  // （defaultはfalse＝完全非表示、従来のPhase 2D.1fと完全に同じ見え方を維持）がtrueの時だけ、
-  // occludedPerformerEntries（isPlacementOccludedByPlatform()で判定した遮蔽対象）を薄い
-  // 点線シルエット＋番号で描画する。通常出演者（depthMergedItems・Beam depth統合）より後に
-  // 描画するだけの単純な追加レイヤーとし、Beamのdepth統合には一切加えない。
-  if (showOccludedPerformerGhosts && occludedPerformerEntries.length > 0) {
+  ctx.restore();
+
+  // Stage Connector Phase 1H・PART B・F・G・N・O：waiting area performerのGhost表示レイヤー
+  // （Export対応）。showWaitingAreas（「待機エリアを表示」）だけで表示要否が決まる。ONの時は
+  // showWaitingAreas===falseなら既にvisiblePerformers側で除外済みのwaiting area performerが
+  // ここへ来て、area分類だけでGhost表示になる（platform occlusion判定は行わない＝PART B）。
+  // 旧「高台裏をゴースト表示」toggle（exportShowOccludedPerformerGhosts）はPhase 1H.1の
+  // reference auditでどこからも参照されなくなったことを確認し、state自体を削除済み。
+  // 通常出演者（depthMergedItems・Beam depth統合）より後に描画するだけの単純な追加レイヤーとし、
+  // Beamのdepth統合には一切加えない。
+  if (occludedPerformerEntries.length > 0) {
     occludedPerformerEntries.forEach(({ p, pos }) => {
-      const surfaceHeight = resolvePlacementSurfaceHeight(pos, model.platforms);
+      // Stage Connector Phase 1F・PART B：ghost表示中の遮蔽出演者も、本体描画と同じ
+      // effective height helperを使う（isPlacementOccludedByPlatform()自体の判定条件・
+      // occlusion対象の選定ロジックには一切触れない＝PART P。ここは選ばれた後のZ表示のみ）。
+      const surfaceHeight = resolvePlacementEffectiveSurfaceHeight(pos, model.platforms, model.stageConnectors);
       const { sx, sy, scale } = project3D(pos.x, pos.y, surfaceHeight);
       const heightPx = (p.height || DEFAULT_PERFORMER_HEIGHT) * scale * fit.scale;
       const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * fit.scale;
@@ -10526,15 +11567,30 @@ const PERSPECTIVE = {
 // 各エリアの人数（0人でも100人でも）や、出演者が袖⇔ステージのどちらにいるかによって
 // この範囲が変化することはない。将来、カメラ位置や画角を調整可能にする場合も、
 // この関数だけを差し替えれば済むようにしてある。
-function computeAudienceReferenceBounds(stage, zones, showWaitingAreas) {
+// Stage Connector Phase 1D・PART G・I：第4引数stageConnectorsは今回追加した任意引数
+// （省略時は従来通り、backward compatible）。showWaitingAreasの値に関わらず、stage外に
+// 置かれたstairsのrect（getStageConnectorStageRect()、TopViewと共通のpure helper）だけを
+// 横方向の基準へ折り込む。待機エリア表示トグルとstairs visibilityを分離する（PART H・I）。
+// 縦方向（奥行き）はprojectAudiencePoint()のt=clamp(yUnits/stageDepth, -0.4, 1.6)が既に
+// stage.depthの1.6倍までの奥行きを想定して設計されているため、upstageBackstage相当の
+// 深さでは追加の変更なしに成立する（新しい分岐は増やさない＝PART N）。
+function computeAudienceReferenceBounds(stage, zones, showWaitingAreas, stageConnectors) {
   const halfW = stage.width / 2;
-  if (!showWaitingAreas) {
-    return { minXUnits: -halfW, maxXUnits: halfW };
+  let minXUnits = -halfW;
+  let maxXUnits = halfW;
+  if (showWaitingAreas) {
+    minXUnits = Math.min(minXUnits, zones.stageLeft.xMin);
+    maxXUnits = Math.max(maxXUnits, zones.stageRight.xMax);
   }
-  return {
-    minXUnits: Math.min(-halfW, zones.stageLeft.xMin),
-    maxXUnits: Math.max(halfW, zones.stageRight.xMax),
-  };
+  if (Array.isArray(stageConnectors) && stageConnectors.length > 0) {
+    stageConnectors.forEach((connector) => {
+      const rect = getStageConnectorStageRect(connector);
+      if (!rect) return;
+      minXUnits = Math.min(minXUnits, rect.xMin);
+      maxXUnits = Math.max(maxXUnits, rect.xMax);
+    });
+  }
+  return { minXUnits, maxXUnits };
 }
 
 // PNG Export v1.2・PART D・18章：俯瞰客席ビューの「100%表示」基準（bounds）を計算する
@@ -10542,8 +11598,10 @@ function computeAudienceReferenceBounds(stage, zones, showWaitingAreas) {
 // 依存しない形でそのまま切り出しただけ（数式・依存する値は完全に同一＝挙動は変更しない）。
 // PNG Exportの俯瞰レンダラーがOverheadAudienceViewと全く同じ画角の計算をそのまま
 // 再利用できるようにするための共通化（19章：俯瞰PNG専用の別の遠近座標計算を作らない）。
-function computeAudienceViewBounds(stage, zones, showWaitingAreas) {
-  const ref = computeAudienceReferenceBounds(stage, zones, showWaitingAreas);
+// Stage Connector Phase 1D・PART G・I：第4引数stageConnectorsは
+// computeAudienceReferenceBounds()へそのまま伝播するだけ（省略時は従来通り）。
+function computeAudienceViewBounds(stage, zones, showWaitingAreas, stageConnectors) {
+  const ref = computeAudienceReferenceBounds(stage, zones, showWaitingAreas, stageConnectors);
   const minX = ref.minXUnits * UNIT_CM;
   const maxX = ref.maxXUnits * UNIT_CM;
   const leftMargin = 80;
@@ -10637,6 +11695,651 @@ function getPlatformAudienceFaces(platform, bounds, stageDepth) {
   ];
   return { top, front };
 }
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1J.1.4：Platform partial occlusion front-vs-top isolation
+// ------------------------------------------------------------------
+// PART C：「performer遮蔽maskとしてどのfaceを使うか」だけを決めるpure helper。
+// geometryは一切再計算せず、必ずgetPlatformAudienceFaces()を呼んでその結果から選ぶだけ
+// （PART C：内部で新しい投影式を作らない）。platform自体の構造描画（stage structure
+// renderer、"platform-front"/"platform-top"のitem化）はこの関数を経由しないため無変更（PART B）。
+// 今回はfront face（客席側vertical面）のみを遮蔽用polygonとして返す。top face
+// （platform天面）は、Audience遠近投影上でperformerの上半身・頭まで広く覆ってしまい、
+// 低いplatformでも全身が消える過剰遮蔽の原因だったため、performer occlusion用途からは
+// 除外する（top faceそのものの計算・platform構造としての描画は変更しない＝PART B・F）。
+// Stage Connector Phase 1J.2・PART B・AA：唯一の呼び出し元だった
+// doesPerformerBodyIntersectPlatformOcclusionFaces()ごとlive pathから外れたため、reference
+// audit時点で未使用（mask/clip方式をPainter's algorithmへ置き換えたため）。削除せずそのまま
+// 残している（PART AA）。platform-front自体の描画（depthMergedItems内のPainter's algorithm）
+// は、buildAudienceStageStructureDrawItems()が返すgetPlatformAudienceFaces()の生のfront
+// polygonをそのまま使っており、この関数は経由していない。
+function getPlatformAudienceOcclusionPolygons(platform, bounds, stageDepth) {
+  const faces = getPlatformAudienceFaces(platform, bounds, stageDepth);
+  return faces ? [faces.front] : [];
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1B：Audience View stairs visual v1
+// ------------------------------------------------------------------
+// TopView側のgetStageConnectorStairsGeometry()（PART Q：既存TopView geometryは変更禁止）とは
+// 完全に独立した、Audience View専用のpure helper群。platform用のgetPlatformAudienceFaces()へも
+// stairs分岐を追加しない（PART E：platformとStage Connectorのgeometryは別helperに保つ）。
+// resolvePlatformAtPoint()は使わず、fromSurfaceId/toSurfaceIdという明示IDだけから高さを
+// 解決する（PART A：位置からの推測はしない）。
+
+// PART A：surface1件分の高さ解決。null＝通常舞台（0）、有効なplatform.id＝その高さ、
+// 削除済み/不正IDは常に0へfallbackする（PART M：データ自体は自動修正しない。表示側だけが
+// 安全にfallbackする）。
+function resolveStageConnectorSurfaceHeight(surfaceId, platforms) {
+  if (surfaceId === null || surfaceId === undefined) return 0;
+  const list = Array.isArray(platforms) ? platforms : [];
+  const found = list.find((pl) => pl && pl.id === surfaceId);
+  return found && Number.isFinite(found.height) ? found.height : 0;
+}
+
+// PART B：connector 1件分のfrom/to実効高さ。fromSurfaceId/toSurfaceIdをcurrentのplatforms
+// から毎回deriveするだけで、connectorデータへ高さを一切保存しない（Beam/Area autoの
+// 「derived結果は保存しない」という既存方針と同じ考え方）。これにより、接続先platformの
+// heightを変更すると次回描画時に即座に反映される。
+function resolveStageConnectorHeights(connector, platforms) {
+  const fromHeight = resolveStageConnectorSurfaceHeight(getStageConnectorFromSurfaceId(connector), platforms);
+  const toHeight = resolveStageConnectorSurfaceHeight(getStageConnectorToSurfaceId(connector), platforms);
+  return { fromHeight, toHeight };
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1E：stairs continuous surface height geometry
+// ------------------------------------------------------------------
+// stairsの占有矩形内にある任意の舞台座標(x,y)について、そのstairs上の連続した高さZを
+// pureに求める。出演者表示・surfaceMode="auto"・Transition/Playback/Scrub・occlusion・
+// Lightingへは今回まだ一切接続しない（Phase 1F以降で使用予定）。
+// point-in-stairs判定は既存getStageConnectorStageRect()（TopView/Audienceと共通の矩形）を
+// そのまま使い、新しい矩形計算は作らない（PART B）。高さの解決はresolveStageConnectorHeights()
+// （直上の既存helper）をそのまま再利用し、height/fromHeight/toHeight/steps/progressは
+// connectorへ一切保存しない（すべてderived value＝PART S）。
+// Audience Ghost表示（getStageConnectorAudienceDisplayMode()の"ghost"）かどうかはこの
+// resolverの判定に一切関与しない（PART L：Ghost stairsも通常のstairsと全く同じ物理構造として
+// 扱う。displayModeはあくまで今回のAudience Viewでの見せ方だけを決めるrender時点の判定）。
+
+// PART B：point-in-rect判定。境界はinside扱い（微小なepsilonで浮動小数点誤差だけを吸収し、
+// 明確にrect外の点までinsideと誤判定しないようにする）。
+const STAGE_CONNECTOR_POINT_EPSILON = 1e-9;
+function isPointInsideStageConnectorRect(x, y, rect) {
+  if (!rect) return false;
+  return (
+    x >= rect.xMin - STAGE_CONNECTOR_POINT_EPSILON &&
+    x <= rect.xMax + STAGE_CONNECTOR_POINT_EPSILON &&
+    y >= rect.yMin - STAGE_CONNECTOR_POINT_EPSILON &&
+    y <= rect.yMax + STAGE_CONNECTOR_POINT_EPSILON
+  );
+}
+
+// PART D：facingから進行率t（0=fromSurface側、1=toSurface側）を求める。4方向とも
+// STAGE_CONNECTOR_FACING_VECTORS（TopView/Audienceで既に共有済みのfacing→前進ベクトル対応表。
+// この定数自体は変更しない）と同じ意味論を使い、t=0が必ずfromSurface側になるよう、facingごとに
+// 正しい軸・向きで正規化する。span（rectの該当軸方向の幅）が0になる異常値でも0除算しない。
+function resolveStageConnectorProgressAtPoint(x, y, connector, rect) {
+  const { fx, fy } = STAGE_CONNECTOR_FACING_VECTORS[getStageConnectorFacing(connector)];
+  const isVerticalTravel = fy !== 0;
+  let t;
+  if (isVerticalTravel) {
+    const span = rect.yMax - rect.yMin;
+    t = span > 0 ? (fy > 0 ? (y - rect.yMin) / span : (rect.yMax - y) / span) : 0;
+  } else {
+    const span = rect.xMax - rect.xMin;
+    t = span > 0 ? (fx > 0 ? (x - rect.xMin) / span : (rect.xMax - x) / span) : 0;
+  }
+  return clamp(t, 0, 1);
+}
+
+// PART A・C・E・F・G・H・I：single connector用のcontinuous height resolver。
+//   pointがconnector占有rect外 → null（「該当しない」を0で表現しない＝PART A・I。0は
+//     通常舞台として有効な高さのため、明確にnullで区別する）。
+//   rect内 → fromHeight〜toHeightをfacingに沿ってlinear interpolationする（段ごとの
+//     quantizeはしない＝PART E：出演者の将来の移動は「徐々に斜めに上がる／下がる」表現の
+//     ため）。fromHeight>toHeight（下る階段）にも同じ式でそのまま対応する（PART F）。
+//     platform→platform・null→null・fromHeight===toHeightもすべて同じ数式で成立する
+//     （PART G・H）。
+function resolveStageConnectorHeightAtPoint(x, y, connector, platforms) {
+  if (!connector) return null;
+  const rect = getStageConnectorStageRect(connector);
+  if (!isPointInsideStageConnectorRect(x, y, rect)) return null;
+  const { fromHeight, toHeight } = resolveStageConnectorHeights(connector, platforms);
+  const t = resolveStageConnectorProgressAtPoint(x, y, connector, rect);
+  return fromHeight + (toHeight - fromHeight) * t;
+}
+
+// PART J・K：複数stairsのrectが同じXYを含み得るため、matchする各connectorのcontinuous zの
+// うち最も高いものを採用する（resolvePlatformAtPoint()の「複数platform重複時は最も高い方を
+// 優先し、同値なら配列で先に見つかった方を優先する」という既存precedenceと同じ考え方に
+// 揃えたもの。配列順だけに偶然依存する設計を避けるため）。マッチするconnectorが1件もなければ
+// null。
+function resolveStageConnectorHeightAtPointFromList(x, y, stageConnectors, platforms) {
+  const list = Array.isArray(stageConnectors) ? stageConnectors : [];
+  let bestZ = null;
+  list.forEach((connector) => {
+    const z = resolveStageConnectorHeightAtPoint(x, y, connector, platforms);
+    if (z === null) return;
+    // z===bestZの場合はbestZを更新しない＝先に見つかった（配列で先にある）connectorのzが
+    // 優先される（resolvePlatformAtPoint()と同じtie-break思想）。
+    if (bestZ === null || z > bestZ) bestZ = z;
+  });
+  return bestZ;
+}
+
+// PART D：Audience立体表示専用の視覚的な段数（永続fieldにはしない）。物理cm換算はしない
+// （platform.heightはcmではない）。高さ差が無くても最低3段、大きいほど増やすが6段を上限にする
+// 簡単なderive。TopViewのSTAGE_CONNECTOR_STAIRS_STEP_COUNT（固定3本の段差線）とは無関係の、
+// 別の定数・別のderive方針（PART Q：TopView側の定数・関数は変更しない）。
+const STAGE_CONNECTOR_AUDIENCE_MIN_STEPS = 3;
+const STAGE_CONNECTOR_AUDIENCE_MAX_STEPS = 6;
+function deriveStageConnectorAudienceStepCount(fromHeight, toHeight) {
+  const diff = Math.abs((Number(toHeight) || 0) - (Number(fromHeight) || 0));
+  const steps = STAGE_CONNECTOR_AUDIENCE_MIN_STEPS + Math.round(clamp(diff, 0, 20) / 5);
+  return clamp(steps, STAGE_CONNECTOR_AUDIENCE_MIN_STEPS, STAGE_CONNECTOR_AUDIENCE_MAX_STEPS);
+}
+
+// PART E・F・G・H：Audience View用のstairs 3D geometry helper。screen（OverheadAudienceView）と
+// Export（renderAudienceFormationExport）の両方がこの関数だけを呼び、3D geometry計算を
+// 二重実装しない（PART O：projection wrapperの違いだけにする）。
+// 向きの意味論はTopViewのgetStageConnectorStairsGeometry()と完全に一致させる（PART G）：
+//   upstage    … yMin側=from、yMax側=to
+//   downstage  … yMax側=from、yMin側=to
+//   stageLeft  … xMax側=from、xMin側=to
+//   stageRight … xMin側=from、xMax側=to
+// STAGE_CONNECTOR_FACING_VECTORS（TopView用に定義済みの「facing→前進ベクトル」対応表）を
+// そのままdataとして再利用するだけで、TopView側のgeometry関数自体には一切触れない。
+// 各3D頂点は必ずprojectAudiencePoint3D()へ通す（PART H：新しいprojectionは作らない）。
+// fromHeight > toHeightのデータでもクラッシュしない（PART C：down stairsにも使えるgeometry）。
+function getStageConnectorAudienceFaces(connector, bounds, stageDepth, platforms) {
+  const rect = getStageConnectorStageRect(connector);
+  if (!rect || !bounds) return null;
+  const { fromHeight, toHeight } = resolveStageConnectorHeights(connector, platforms);
+  const { fx, fy } = STAGE_CONNECTOR_FACING_VECTORS[getStageConnectorFacing(connector)];
+  const isVerticalTravel = fy !== 0;
+  const stepCount = deriveStageConnectorAudienceStepCount(fromHeight, toHeight);
+
+  // t（0=from側の端、1=to側の端）における、移動軸に直交する断面線（stage座標の2端点）。
+  const crossLineAt = (t) => {
+    if (isVerticalTravel) {
+      const y = fy > 0 ? lerp(rect.yMin, rect.yMax, t) : lerp(rect.yMax, rect.yMin, t);
+      return { ax: rect.xMin, ay: y, bx: rect.xMax, by: y };
+    }
+    const x = fx > 0 ? lerp(rect.xMin, rect.xMax, t) : lerp(rect.xMax, rect.xMin, t);
+    return { ax: x, ay: rect.yMin, bx: x, by: rect.yMax };
+  };
+
+  const p = (x, y, z) => projectAudiencePoint3D(bounds, stageDepth, x, y, z);
+
+  // 各段：tread（踏面・水平面）＋riser（蹴込み・垂直面）。from側から順にi=0..stepCount-1。
+  // tread高さはfromHeight→toHeightへ段階的に分割し、最終段（i=stepCount-1）は必ずtoHeightと
+  // 一致させる（PART K：階段の最上段が高台topと自然につながって見えるようにするため）。
+  const steps = [];
+  for (let i = 0; i < stepCount; i += 1) {
+    const t0 = i / stepCount;
+    const t1 = (i + 1) / stepCount;
+    const prevHeight = i === 0 ? fromHeight : lerp(fromHeight, toHeight, i / stepCount);
+    const treadHeight = lerp(fromHeight, toHeight, (i + 1) / stepCount);
+    const back = crossLineAt(t0); // from側寄りの断面（riserの位置）
+    const front = crossLineAt(t1); // to側寄りの断面（treadの終端）
+
+    const tread = [
+      p(back.ax, back.ay, treadHeight),
+      p(back.bx, back.by, treadHeight),
+      p(front.bx, front.by, treadHeight),
+      p(front.ax, front.ay, treadHeight),
+    ];
+    const riser = [
+      p(back.ax, back.ay, prevHeight),
+      p(back.bx, back.by, prevHeight),
+      p(back.bx, back.by, treadHeight),
+      p(back.ax, back.ay, treadHeight),
+    ];
+    steps.push({ tread, riser, height: treadHeight });
+  }
+
+  return { steps, fromHeight, toHeight };
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1D.4：Audience Viewでの袖stairs Ghost表示
+// ------------------------------------------------------------------
+// 目的：完全に舞台袖の外側にある左右方向(lateral)stairsは、疑似3D projection上でplatformとの
+// 自然な前後関係を完全に表現するのが難しい（Phase 1D.3で実際にplatform side faceを追加した
+// ところ、無関係なplatformの見た目まで壊れる副作用が出たため完全revert済み）。そこで
+// Audience Viewだけ、こうしたstairsを「観客から直接見えている実体3D」ではなく「袖に存在する
+// stairsの参考表示（Ghost）」として描き分ける（TopViewは変更しない＝PART L）。
+// PART N：Audienceでghost表示になることは、そのstairsが物理的に無効という意味ではない。
+// 次Phase以降（continuous surface height統合）では、ghost表示中のstairsも出演者が実際に
+// 昇り降りする実在のstairsとしてsurface計算に使う予定であり、今回のdisplayModeは
+// あくまで「今回のAudience Viewでの見せ方」だけを決めるrender時点の判定である。
+//
+// PART A・B・D・E：判定はgetStageConnectorStageRect()（TopViewと共通の矩形）と、main stage
+// 矩形（概念上 xMin=-stage.width/2, xMax=stage.width/2, yMin=0, yMax=stage.depth。既存
+// computeZones()のstage部分と同じ値）だけで行うpure関数。facing・rect intersectionのみで
+// 判定し、surfaceId・platform接続・name・connector順序からは一切推測しない（PART D）。
+// Stage Connector Phase 1D.4.1・PART A・B・C：「stageとの正の面積を持つ重なりがあるか」で
+// 判定する（overlap width・overlap depthの両方がepsilonより大きい場合だけ"normal"）。
+// 境界線へぴったり接するだけ（重なり幅・重なり奥行きのどちらかがちょうど0）のlateral
+// stairsは、面積としては重なっていないため"ghost"になる。これはPhase 1D.4完成時の
+// inclusive intersection（境界接触も含めて"normal"としていた）から仕様変更したもの――
+// 実機で「完全に舞台袖にあり、stage境界へぴったり接続しているlateral stairs」がGhost表示
+// されない不具合が判明したため（境界接触というほぼ確実に発生する配置が、常にnormal側へ
+// 倒れてしまっていた）。少しでも実際の面積を持ってstage内へ入ったstairs（例：0.5 stage
+// unit分めり込んでいる）は、引き続き"normal"のまま（PART C）。
+function getStageConnectorAudienceDisplayMode(connector, stage) {
+  const facing = getStageConnectorFacing(connector);
+  const isLateral = facing === "stageLeft" || facing === "stageRight";
+  if (!isLateral) return "normal"; // PART C・7：upstage/downstageはstage外でも常にnormal
+  const rect = getStageConnectorStageRect(connector);
+  if (!rect || !stage || !Number.isFinite(stage.width) || !Number.isFinite(stage.depth)) return "normal";
+  const halfW = stage.width / 2;
+  const stageRect = { xMin: -halfW, xMax: halfW, yMin: 0, yMax: stage.depth };
+  const EPS = 1e-6;
+  const overlapWidth = Math.min(rect.xMax, stageRect.xMax) - Math.max(rect.xMin, stageRect.xMin);
+  const overlapDepth = Math.min(rect.yMax, stageRect.yMax) - Math.max(rect.yMin, stageRect.yMin);
+  const overlapsStageArea = overlapWidth > EPS && overlapDepth > EPS;
+  return overlapsStageArea ? "normal" : "ghost";
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1D.1：Audience Viewの舞台構造物（高台＋stairs）depth ordering
+// ------------------------------------------------------------------
+// 目的：高台とstairsが「platform→platform top grid→stairs」という固定順の別ブロックだった
+// ため、stage外stairsを高台の奥や横に置いた場合に前後関係が不自然になる問題（PART A）を、
+// 奥→手前のPainter's algorithmへ統合することで解消する。
+// getPlatformAudienceFaces()・getStageConnectorAudienceFaces()自体のgeometry計算は一切
+// 変更せず（PART K・L）、それらが返した結果をdepth key付きの一時render item配列へ変換して
+// まとめてsortするだけ（PART B）。この一時データはwork schemaへは一切保存しない。
+//
+// depth keyは、既存platform sort（platform.y降順＝奥から先）と全く同じ考え方の「stage座標の
+// y値」を使う。projectAudiencePoint()はyUnitsだけがdepth（縮小率・持ち上げ量）を決め、xは
+// 横位置とwidthScaleにしか影響しないため（既存の疑似遠近法投影式そのものは変更しない）、
+// yが唯一の信頼できるdepth軸になる（PART C）。
+// stairsは矩形全体を1個のdepth keyにまとめず、各段（tread+riser）ごとにその段が占める
+// yレンジの中点を個別のdepth keyとして持たせる（PART D：face-level splitting。object単位の
+// 1点tie-breakでは、舞台奥から高台へ連続的につながるstairsの「奥側の段は遠くのplatformより
+// 先に、手前側の段は近くのplatformより後に」というグラデーション順を表現できないため）。
+// stageLeft/stageRight向き（移動軸がx）のstairsは全段が同じyレンジ（矩形全体のyMin〜yMax）を
+// 共有するため、結果として同じdepth keyになる。これは「左右方向の段差は奥行き位置を
+// 変えない」という物理的な意味と一致する。
+// 接続先platform（toSurfaceId/fromSurfaceId）だからという理由による固定的な前後関係は
+// 一切使わない（PART E：実際のstage位置だけで決める）。
+function getStageConnectorStepDepthKeys(connector, platforms) {
+  const rect = getStageConnectorStageRect(connector);
+  if (!rect) return [];
+  const { fromHeight, toHeight } = resolveStageConnectorHeights(connector, platforms);
+  const stepCount = deriveStageConnectorAudienceStepCount(fromHeight, toHeight);
+  const { fy } = STAGE_CONNECTOR_FACING_VECTORS[getStageConnectorFacing(connector)];
+  const isVerticalTravel = fy !== 0;
+  const keys = [];
+  for (let i = 0; i < stepCount; i += 1) {
+    if (isVerticalTravel) {
+      const t0 = i / stepCount;
+      const t1 = (i + 1) / stepCount;
+      const y0 = fy > 0 ? lerp(rect.yMin, rect.yMax, t0) : lerp(rect.yMax, rect.yMin, t0);
+      const y1 = fy > 0 ? lerp(rect.yMin, rect.yMax, t1) : lerp(rect.yMax, rect.yMin, t1);
+      keys.push((y0 + y1) / 2);
+    } else {
+      keys.push((rect.yMin + rect.yMax) / 2);
+    }
+  }
+  return keys;
+}
+
+// platform・stairsのgeometry計算結果を、depth key付きの一時render item配列へ変換するだけの
+// pure関数（PART G：screen/renderAudienceFormationExportの両方がこれを呼び、別々のsort
+// ルールを作らない）。色はここでは決めず、呼び出し側（screen/Export）が自分のTHEME/
+// floorColorKeyから引いた色をitemの型に応じて後付けする。
+// PART F：platform天面grid（platform-grid）は、そのplatformのfront/topと全く同じdepthKeyを
+// 持つitemとして統合する。build時点でfront→top→gridの順に積むため、後段のsortが安定sort
+// （ECMAScript仕様上保証済み）である限り、同depthKey内の相対順は自然にfront→top→gridの
+// ままになり、gridだけが全platform描画後の最前面へ飛び出ることはない。
+// Stage Connector Phase 1D.2・PART B：stairs itemには、work schemaへは一切保存しない一時的な
+// render metadataとして、platformId（platform item側）・connectedPlatformIds／lateral
+// （stairs item側）を追加する。getStageConnectorFromSurfaceId()/getStageConnectorToSurfaceId()
+// をそのまま呼ぶだけで、位置からの推測は行わない（PART H）。
+// Stage Connector Phase 1D.4・PART I・J：stairs itemには、同じく一時的なrender metadataとして
+// displayMode（"normal"|"ghost"）を追加する。判定はgetStageConnectorAudienceDisplayMode()に
+// 完全委譲し、screen/Exportどちらもこのbuild関数を経由するだけで同じ判定を共有する
+// （PART J：Ghost判定ロジックの二重実装を避ける）。
+// Stage Connector Phase 1J.2・PART D・E・G：platform-front itemにだけ、既存depthKey（platform
+// 中心のy。structure同士のsort――stairsとの前後関係等――に使う既存値。無変更）とは別に、
+// `occlusionDepthY`（＝rect.yMin、客席側front edgeのstage-y座標）を追加する。performerとの
+// painter's algorithm統合（下記depthMergedItems）では、structure同士の相対順に使うdepthKeyでは
+// なく、この客席側edge基準の値を使う（PART G：「front edgeより奥にいるperformerより後から
+// 描画する」）。新しいgeometry計算はしない（getPlatformStageRect()を呼ぶだけ）。
+function buildAudienceStageStructureDrawItems({ platforms, stageConnectors, bounds, stageDepth, stage }) {
+  const items = [];
+  (Array.isArray(platforms) ? platforms : []).forEach((pl) => {
+    const faces = getPlatformAudienceFaces(pl, bounds, stageDepth);
+    if (!faces) return;
+    const depthKey = Number.isFinite(pl.y) ? pl.y : 0;
+    const rect = getPlatformStageRect(pl);
+    const occlusionDepthY = rect && Number.isFinite(rect.yMin) ? rect.yMin : depthKey;
+    items.push({ kind: "platform-front", key: `${pl.id}-front`, depthKey, occlusionDepthY, points: faces.front, platformId: pl.id });
+    items.push({ kind: "platform-top", key: `${pl.id}-top`, depthKey, points: faces.top, platformId: pl.id });
+    items.push({ kind: "platform-grid", key: `${pl.id}-grid`, depthKey, platform: pl, platformId: pl.id });
+  });
+  (Array.isArray(stageConnectors) ? stageConnectors : []).forEach((connector) => {
+    const geometry = getStageConnectorAudienceFaces(connector, bounds, stageDepth, platforms);
+    if (!geometry) return;
+    const depthKeys = getStageConnectorStepDepthKeys(connector, platforms);
+    // PART B・H：fromSurfaceId/toSurfaceIdをそのまま読むだけ。文字列でなければ含めない
+    // （getStageConnectorFromSurfaceId/ToSurfaceIdが既にnull fallback済みのため、null同士は
+    // 重複除去の対象にならない）。
+    const fromSurfaceId = getStageConnectorFromSurfaceId(connector);
+    const toSurfaceId = getStageConnectorToSurfaceId(connector);
+    const connectedPlatformIds = [fromSurfaceId, toSurfaceId].filter((id) => typeof id === "string");
+    // Stage Connector Phase 1D.2.1・PART A・B：fromSurfaceId/toSurfaceIdの両方が文字列
+    // platform.idの場合だけ「platform-to-platform stairs」と判定する、一時的なrender-only
+    // metadata。位置からは一切推測しない。両platformの高さが同じか違うかは無関係
+    // （高さは見ていない）。work schemaへは保存しない。
+    const hasTwoPlatformEndpoints = typeof fromSurfaceId === "string" && typeof toSurfaceId === "string";
+    // PART C：特殊tie-breakはstageLeft/stageRightのみ対象（upstage/downstageはPhase 1D.1の
+    // 段階的depth gradientのままにする）。
+    const lateral = getStageConnectorFacing(connector) === "stageLeft" || getStageConnectorFacing(connector) === "stageRight";
+    // Stage Connector Phase 1D.4・PART A：normal/ghostの判定は接続1件につき1回だけ行い、
+    // その接続の全stepへ同じdisplayModeを適用する（段ごとに変える理由はないため）。
+    const displayMode = getStageConnectorAudienceDisplayMode(connector, stage);
+    geometry.steps.forEach((step, i) => {
+      const depthKey = depthKeys[i] != null ? depthKeys[i] : 0;
+      items.push({
+        kind: "stairs-riser",
+        key: `${connector.id}-${i}-riser`,
+        depthKey,
+        points: step.riser,
+        connectedPlatformIds,
+        lateral,
+        displayMode,
+        hasTwoPlatformEndpoints,
+      });
+      items.push({
+        kind: "stairs-tread",
+        key: `${connector.id}-${i}-tread`,
+        depthKey,
+        points: step.tread,
+        connectedPlatformIds,
+        lateral,
+        displayMode,
+        hasTwoPlatformEndpoints,
+      });
+    });
+  });
+  return items;
+}
+
+// Stage Connector Phase 1D.2・PART D・E：左右方向(lateral)のstairsが、接続先platformと
+// ほぼ同depthの場合だけ「stairs→platform」の順（stairsを奥、platformを手前）へ入れ替える
+// tie-break。primary sort（depthKey降順）はPART Aの通り変更しない――このtie-breakは
+// Math.abs(depthKey差) <= epsilonの範囲内でのみ働く小さな補正で、明確にdepthが異なる場合は
+// 一切介入しない（下のcompare関数がdepthDiffをそのまま返すため）。
+// PART H：fromSurfaceId/toSurfaceIdで実際に接続されているplatformだけを対象にする
+// （位置だけから接続を推測しない）。upstage/downstageのstairs（lateral=false）には
+// 一切適用しない（PART C）。戻り値は「aを先にする場合は負、bを先にする場合は正、
+// このtie-breakが該当しない場合は0（=呼び出し側がdepthKeyのdiffへfallbackする）」。
+// Stage Connector Phase 1D.2.1・PART C：ただし、そのstairsがplatform-to-platform
+// （fromSurfaceId・toSurfaceIdの両方がplatform.id＝hasTwoPlatformEndpoints）の場合は、この
+// 特殊tie-breakを適用しない（0を返す）。「通常舞台↔platform」の片側platformケースだけに
+// 限定する（PART E：既存Phase 1D.2挙動を維持）。理由：中央高台→上手高台のように両端が
+// platformのstairsまで「stairsを両platformより奥へ送る」と、stairsが両方のplatformの後ろへ
+// 隠れてしまい、「2つの高台をつなぐ階段」として見えなくなるため。
+const LATERAL_STAIRS_PLATFORM_TIE_EPSILON = 0.01;
+function resolveLateralStairsPlatformTieBreak(a, b) {
+  const isLateralConnectedStairs = (item) =>
+    (item.kind === "stairs-riser" || item.kind === "stairs-tread") &&
+    item.lateral === true &&
+    Array.isArray(item.connectedPlatformIds) &&
+    item.connectedPlatformIds.length > 0 &&
+    item.hasTwoPlatformEndpoints !== true;
+  const isPlatformPart = (item) =>
+    item.kind === "platform-front" || item.kind === "platform-top" || item.kind === "platform-grid" ||
+    item.kind === "platform-top-strip" || item.kind === "platform-top-grid-line" || item.kind === "platform-top-outline-line";
+
+  let stairsItem = null;
+  let platformItem = null;
+  if (isLateralConnectedStairs(a) && isPlatformPart(b)) {
+    stairsItem = a;
+    platformItem = b;
+  } else if (isLateralConnectedStairs(b) && isPlatformPart(a)) {
+    stairsItem = b;
+    platformItem = a;
+  } else {
+    return 0;
+  }
+  if (!stairsItem.connectedPlatformIds.includes(platformItem.platformId)) return 0;
+  // stairsを先（奥）、platformを後（手前）＝PART D・F・I。
+  return stairsItem === a ? -1 : 1;
+}
+
+// 奥→手前（depthKey降順）でsortするpure関数（PART G：screen/Exportで共有）。
+// Stage Connector Phase 1D.2：depthKeyの差がLATERAL_STAIRS_PLATFORM_TIE_EPSILON以内の場合
+// だけ、resolveLateralStairsPlatformTieBreak()による特殊tie-breakを試みる（PART A：primary
+// sortはdepthKey降順のまま。tie-breakが該当しない組み合わせは0を返すため、そのまま従来通り
+// depthKeyの差（≒0）にfallbackし、Array.prototype.sortの安定性＝同depth内は元の配列順
+// （PART F：platform front→top→grid、PART H：非接続stairsはbuild順のまま）を維持する）。
+function sortAudienceStageStructureItems(items) {
+  return [...items].sort((a, b) => {
+    if (Math.abs(a.depthKey - b.depthKey) <= LATERAL_STAIRS_PLATFORM_TIE_EPSILON) {
+      const tieBreak = resolveLateralStairsPlatformTieBreak(a, b);
+      if (tieBreak !== 0) return tieBreak;
+    }
+    return b.depthKey - a.depthKey;
+  });
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1J.2：Audience performer / stage structure unified depth ordering
+// ------------------------------------------------------------------
+// 従来（Phase 1J.1系）は「platformの後ろにいるperformerをどれだけ隠すか」を、performerの
+// body silhouetteとplatform faceのpolygon交差／被覆率から毎回計算していた（SVG mask・Canvas
+// evenodd clip）。今回はその計算をやめ、「奥にあるものを先に描き、手前にあるものを後から描く」
+// というPainter's algorithmだけに置き換える（PART B・C：mask/clip・early-hideのどちらへも
+// 戻さない）。
+//   - performer同士・beamSlice同士の比較は既存の考え方のまま（depthYの差でsort、
+//     同depthならperformerを後ろ＝手前にする）。
+//   - performerとplatform構造itemの比較で唯一の例外：performerが「自分が乗っているplatform」
+//     （resolved surfaceId一致、既存getPlacementSurfaceId()を再利用。新しいpersistent
+//     relationは作らない）のitemと比較される場合は、depth値に関わらず必ずperformerを
+//     後（＝画面上で手前）にする。これがないと、own-platform performerのplacement.yは
+//     通常そのplatformのfootprint内にあるため、純粋なdepth比較では「構造itemの後ろ＝隠れる」
+//     と誤判定されてしまう。
+// Stage Connector Phase 1J.2.1・PART B・J：platform top面もPainter's algorithmへ統合した
+// ため（下記buildPlatformAudienceTopDepthSlices()・buildPlatformAudienceTopGridDepthItems()）、
+// own-platform例外の対象をfront faceだけでなく「そのplatform由来の構造item全般
+// （platform-front・platform-top-strip・platform-top-grid-line）」へ一般化した
+// （旧resolveOwnPlatformFrontDepthTieBreak()をresolveOwnPlatformStructureDepthTieBreak()へ
+// 改名・一般化。判定基準はgetPlacementSurfaceId(performer.pos)===item.platformIdのみで、
+// 新しいpersistent relationは追加していない＝PART J）。
+const AUDIENCE_DEPTH_MERGE_TIE_EPSILON = 1e-6;
+function resolveOwnPlatformStructureDepthTieBreak(a, b) {
+  const isPerformer = (item) => item.kind === "performer";
+  const isPlatformStructure = (item) =>
+    item.kind === "platform-front" || item.kind === "platform-top-strip" || item.kind === "platform-top-grid-line" || item.kind === "platform-top-outline-line";
+  let performerItem = null;
+  let structureItem = null;
+  if (isPerformer(a) && isPlatformStructure(b)) {
+    performerItem = a;
+    structureItem = b;
+  } else if (isPerformer(b) && isPlatformStructure(a)) {
+    performerItem = b;
+    structureItem = a;
+  } else {
+    return 0;
+  }
+  const ownSurfaceId = getPlacementSurfaceId(performerItem.pos);
+  if (ownSurfaceId == null || ownSurfaceId !== structureItem.platformId) return 0;
+  // performerを後ろ（＝画面上で手前）にする。
+  return performerItem === a ? 1 : -1;
+}
+
+// item種別ごとに、比較へ使う「舞台y座標」を1つに揃えるだけのpure helper。performer・
+// beamSlice・platform-top-strip・platform-top-grid-lineは共通のdepthYフィールドを使い、
+// platform-frontだけはPART Gの通りoccludingDepthY（＝rect.yMin、客席側front edge）を使う
+// （front faceのdepth基準がbuildAudienceStageStructureDrawItems()で別名保持されているため）。
+// Phase 1J.2.2: retain the builder's stairs geometry, depth and generation order.
+function getNormalAudienceStairsDepthItems(items) {
+  return items.flatMap((item, structureOrder) =>
+    (item.kind === "stairs-riser" || item.kind === "stairs-tread") && item.displayMode !== "ghost"
+      ? [{ ...item, structureOrder }] : []);
+}
+
+function audienceDepthMergeItemY(item) {
+  if (item.kind === "stairs-riser" || item.kind === "stairs-tread") return item.depthKey;
+  return item.kind === "platform-front" ? item.occlusionDepthY : item.depthY;
+}
+
+// Stage Connector Phase 1J.2・PART D・S・T、1J.2.1・PART B：performer・beamSlice・
+// platform-front・platform-top-strip・platform-top-grid-lineを同じ「奥→手前」sortへ統合する
+// 共有pure関数。Screen（OverheadAudienceView）・Export（renderAudienceFormationExport）の
+// 両方がこれだけを呼び、別々のsortロジックを作らない（PART S・T：Screen/Export parity）。
+// 既存のbeamSlice/performer間tie-break（同depthならperformerを手前にする。PART F：新しい
+// 経験則を大量に追加しない）はそのまま踏襲し、own-platform performerの例外だけを追加する。
+function sortAudienceDepthMergedItems(items) {
+  return [...items].sort((a, b) => {
+    const ownPlatformTie = resolveOwnPlatformStructureDepthTieBreak(a, b);
+    if (ownPlatformTie !== 0) return ownPlatformTie;
+    const diff = audienceDepthMergeItemY(b) - audienceDepthMergeItemY(a);
+    // Use the existing connection rule only at nearly equal physical depth.
+    if (Math.abs(diff) <= LATERAL_STAIRS_PLATFORM_TIE_EPSILON) {
+      const stairsTie = resolveLateralStairsPlatformTieBreak(a, b);
+      if (stairsTie !== 0) return stairsTie;
+    }
+    // Preserve the old exact-depth stairs ordering, including riser before tread.
+    if (Number.isFinite(a.structureOrder) && Number.isFinite(b.structureOrder)) {
+      return diff || a.structureOrder - b.structureOrder;
+    }
+    if (Math.abs(diff) > AUDIENCE_DEPTH_MERGE_TIE_EPSILON) return diff;
+    if (a.kind === b.kind) return 0;
+    if (a.kind === "performer") return 1;
+    if (b.kind === "performer") return -1;
+    return 0;
+  });
+}
+
+// ------------------------------------------------------------------
+// Stage Connector Phase 1J.2.1：Platform top depth slicing
+// ------------------------------------------------------------------
+// platform top面（xMin〜xMax・yMin〜yMax・z=platform.heightの平面）は、front faceと違って
+// stage-depth方向にrangeを持つため、front同様1つのdepth itemとして扱うとperformerとの
+// 前後関係が「天面の上に貼り付いた」ように不自然になる（PART C）。ここではtop面を
+// stage-y方向へ複数stripへ分割し、各stripへ自分のdepthYを持たせることで、performer・
+// beamSlice・platform-frontと同じsortAudienceDepthMergedItems()へ混ぜられるようにする。
+// 新しいperspective式・新しい3D投影は作らず、既存getPlatformStageRect()・
+// projectAudiencePoint3D()だけを使う（PART C）。
+// strip解像度：1グリッド=90cm（UNIT_CM）の半分＝0.5 stage unitを基準にする（PART D）。
+// 極端に奥行きの深いplatformでもstrip数が際限なく増えないよう、上限を設ける
+// （PART D「合理的な上限を設けてもよい」）。
+const AUDIENCE_PLATFORM_TOP_SLICE_DEPTH = 0.5;
+const AUDIENCE_PLATFORM_TOP_SLICE_MAX_COUNT = 40;
+function buildPlatformAudienceTopDepthSlices({ platform, bounds, stageDepth }) {
+  const rect = getPlatformStageRect(platform);
+  if (!rect || !bounds || !platform) return [];
+  const height = Number.isFinite(platform.height) ? platform.height : 0;
+  const depth = rect.yMax - rect.yMin;
+  if (!(depth > 0)) return [];
+  const rawCount = Math.round(depth / AUDIENCE_PLATFORM_TOP_SLICE_DEPTH);
+  const stripCount = Math.min(AUDIENCE_PLATFORM_TOP_SLICE_MAX_COUNT, Math.max(1, rawCount));
+  const p = (x, y, z) => projectAudiencePoint3D(bounds, stageDepth, x, y, z);
+  const strips = [];
+  for (let i = 0; i < stripCount; i += 1) {
+    const y0 = rect.yMin + (depth * i) / stripCount;
+    const y1 = rect.yMin + (depth * (i + 1)) / stripCount;
+    strips.push({
+      kind: "platform-top-strip",
+      key: `${platform.id}-top-strip-${i}`,
+      platformId: platform.id,
+      depthY: (y0 + y1) / 2,
+      y0,
+      y1,
+      points: [
+        p(rect.xMin, y0, height), // A
+        p(rect.xMax, y0, height), // B
+        p(rect.xMax, y1, height), // C
+        p(rect.xMin, y1, height), // D
+      ],
+    });
+  }
+  return strips;
+}
+
+// Stage Connector Phase 1J.2.1・PART N・O：platform天面のvisual grid線
+// （getPlatformTopGridSegments()、無変更＝新しいgrid計算を作らない）を、上記top stripsと
+// 同じy境界でdepth item化するpure helper。横方向grid線は元々単一のstage-y（seg.y1===seg.y2）
+// を持つため、そのままdepthYとして使う。縦方向grid線はyMin〜yMaxへrangeを持つため、
+// stripBoundaries（buildPlatformAudienceTopDepthSlices()が返した各stripのy0/y1）と同じ境界で
+// 分割し、piece単位でdepthYを持たせる（PART O「top stripごとに縦grid segmentを分割する」を
+// 採用。見た目＝線の位置・太さ・色は一切変更しない）。
+function buildPlatformAudienceTopGridDepthItems({ platform, stageGuide, bounds, stageDepth, stripBoundaries }) {
+  if (!platform) return [];
+  const gridSegs = getPlatformTopGridSegments(platform, stageGuide);
+  const height = Number.isFinite(platform.height) ? platform.height : 0;
+  const p = (x, y, z) => projectAudiencePoint3D(bounds, stageDepth, x, y, z);
+  const items = [];
+  (gridSegs.horizontal || []).forEach((seg, i) => {
+    items.push({
+      kind: "platform-top-grid-line",
+      key: `${platform.id}-grid-h-${i}`,
+      platformId: platform.id,
+      depthY: seg.y1,
+      a: p(seg.x1, seg.y1, height),
+      b: p(seg.x2, seg.y2, height),
+    });
+  });
+  const boundaries = Array.isArray(stripBoundaries) && stripBoundaries.length > 0
+    ? stripBoundaries
+    : [{ y0: getPlatformStageRect(platform).yMin, y1: getPlatformStageRect(platform).yMax }];
+  (gridSegs.vertical || []).forEach((seg, i) => {
+    boundaries.forEach((b, j) => {
+      const segY0 = Math.max(Math.min(seg.y1, seg.y2), b.y0);
+      const segY1 = Math.min(Math.max(seg.y1, seg.y2), b.y1);
+      if (!(segY1 > segY0)) return;
+      items.push({
+        kind: "platform-top-grid-line",
+        key: `${platform.id}-grid-v-${i}-${j}`,
+        platformId: platform.id,
+        depthY: (segY0 + segY1) / 2,
+        a: p(seg.x1, segY0, height),
+        b: p(seg.x1, segY1, height),
+      });
+    });
+  });
+  return items;
+}
+
+// Stage Connector Phase 1J.2.1・PART B・R・S・T：1つのplatformぶんのtop strip＋grid line
+// depth itemをまとめて生成するだけのpure helper（front faceは既存
+// buildAudienceStageStructureDrawItems()側でそのまま生成する。新しい二重model・新しい
+// front geometryは作らない）。Screen・Exportの両方がこれだけを呼ぶ。
+// Phase 1J.2.3: outer edges participate in physical depth, independently of grid.
+// Front is already stroked by platform-front. Side segments follow the fill slices.
+function buildPlatformAudienceTopOutlineDepthItems({ platform, bounds, stageDepth, strips }) {
+  const rect = getPlatformStageRect(platform);
+  if (!rect || !bounds || !strips || strips.length === 0) return [];
+  const height = Number.isFinite(platform.height) ? platform.height : 0;
+  const p = (x, y) => projectAudiencePoint3D(bounds, stageDepth, x, y, height);
+  const line = (edge, depthY, a, b, suffix = "") => ({
+    kind: "platform-top-outline-line", platformId: platform.id,
+    key: `${platform.id}-outline-${edge}${suffix}`, edge, depthY, a, b,
+  });
+  return [
+    line("rear", rect.yMax, p(rect.xMin, rect.yMax), p(rect.xMax, rect.yMax)),
+    ...strips.flatMap((strip, i) => [
+      line("stageLeft", strip.depthY, strip.points[0], strip.points[3], `-${i}`),
+      line("stageRight", strip.depthY, strip.points[1], strip.points[2], `-${i}`),
+    ]),
+  ];
+}
+
+function buildPlatformAudienceTopStructureDepthItems({ platform, stageGuide, bounds, stageDepth }) {
+  const strips = buildPlatformAudienceTopDepthSlices({ platform, bounds, stageDepth });
+  const stripBoundaries = strips.map((s) => ({ y0: s.y0, y1: s.y1 }));
+  const gridItems = buildPlatformAudienceTopGridDepthItems({ platform, stageGuide, bounds, stageDepth, stripBoundaries });
+  const outlineItems = buildPlatformAudienceTopOutlineDepthItems({ platform, bounds, stageDepth, strips });
+  return [...strips, ...gridItems, ...outlineItems];
+}
+
+
 
 // 高台 Phase 2C・PART B：高台天面グリッド用のgeometry helper。新しい独立したグリッド体系は
 // 作らず、既存のbuildAudienceStageGuideGeometry()が返すstageGuide.gridVertical/
@@ -10946,13 +12649,17 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     height,
     locked,
     transitionPaths,
+    // Stage Connector Phase 1I・PART C・G：3D trajectory samplingに必要なraw placements
+    // （area/surfaceMode/surfaceId込み）とpathConfig。未指定時（showTrajectory OFF等）は
+    // nullにフォールバックし、trajectory描画自体をスキップする（PART V：不要な計算をしない）。
+    trajectorySource = null,
     // 高台 Phase 1B：表示専用（読み取り専用）の高台一覧。TopViewと同じく未指定時は既存
     // Projectと同じ見た目になるよう空配列にフォールバックする。
     platforms = [],
-    // 高台 Phase 2E・PART D：俯瞰客席ビュー専用のUI state（work/Project/localStorage/
-    // Backupには保存しない）。未指定時はfalse＝完全非表示にフォールバックし、Phase 2D.1fと
-    // 完全に同じ見え方を維持する。TopViewには渡さない。
-    showOccludedPerformerGhosts = false,
+    // Stage Connector Phase 1B・PART N：表示専用（読み取り専用）の階段一覧。
+    // platformsと全く同じ考え方で、未指定時は空配列にフォールバックする。FormationやCueに
+    // よってstageConnectors自体は変化しない（stage-level static object）。
+    stageConnectors = [],
     // Lighting v0・K章：Projectごとの舞台外観（床色）。TopViewと同じフォールバック方針。
     floorColorKey = "black",
     // Lighting UI整理 v1・H章：俯瞰客席ビューの「舞台の周囲・背景」に反映する壁・背景色。
@@ -11001,9 +12708,11 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   // 切り出し、ここではuseMemoでラップして呼ぶだけにした（依存配列・結果は元の実装と完全に
   // 同一で、挙動は変更していない）。これによりPNG Exportの俯瞰レンダラーも同じ関数を通して
   // 常に同一の画角を得られる（19章：俯瞰PNG専用の別計算を作らない）。
+  // Stage Connector Phase 1D・PART G：第4引数にstageConnectorsを渡す。showWaitingの値に
+  // 関わらず常に渡すことで、stage外に置かれたstairsが画面上で見切れないようにする。
   const bounds = useMemo(
-    () => computeAudienceViewBounds(stage, zones, showWaiting),
-    [stage, zones, showWaiting]
+    () => computeAudienceViewBounds(stage, zones, showWaiting, stageConnectors),
+    [stage, zones, showWaiting, stageConnectors]
   );
 
   // 疑似遠近法の投影： 奥ほど「小さく／上に／中央へ圧縮／少し透ける」
@@ -11078,47 +12787,52 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   );
 
   // 奥の人から先に描画（手前の人が上に重なる）。選択中は（複数でも）必ず最前面に描画する。
-  // 高台 Phase 2C・PART H・I・J：「通常舞台として高台の下にいる」出演者（isPlacementUnderPlatform、
-  // PART I）は、俯瞰客席ビューでは常に描画対象から除外する。ここでrestSorted/selectedSorted/
-  // depthMergedItemsへ入る前に取り除くことで、Beamのdepth統合ロジック（lightingBeam3DSlices・
-  // depthMergedItemsのsort/tie-break）には一切手を加えずに済む（PART J：本体・番号を
-  // セットで消すため、個別のrender関数側でのnullチェックではなく、この元データの時点で
-  // 取り除く）。再生中かどうか（Formation静止編集・keep・Transition・scrub・連続Playbackの
-  // いずれでも）は判定条件に入れない（PART H：客席から見える状態を表現するビューという
-  // 位置づけのため）。TopView側のvisiblePerformers/出演者filterには今回一切追加しない
-  // （PART K：TopViewは物理配置を編集するビューのため、高台下でも常に表示・編集できる）。
-  // 高台 Phase 2D・PART H・L：「待機中の出演者も表示」ON時、高台の後ろに隠れる舞台奥待機の
-  // 出演者（isBackstagePlacementOccludedByPlatform）も同じ入口で除外する。下手袖・上手袖
-  // （stageLeft/stageRight）は対象外（PART N、helper内でarea==="upstageBackstage"のみに
-  // 限定済み）。待機表示OFF時はそもそも舞台奥出演者がvisiblePerformersへ入らないため、
-  // 既存仕様（PART M）は変わらない。
-  // 高台 Phase 2D.1・PART H：袖（stageLeft/stageRight）で、高台の横端すぐ外・奥側にいる
-  // ことで前後関係が紛らわしくなる出演者（isWingPlacementOccludedByPlatform）も同じ入口で
-  // 除外する。isBackstagePlacementOccludedByPlatform()自体は変更しない（対象・条件が別）。
-  // 高台 Phase 2E・PART A・E：通常出演者と遮蔽出演者の分離元となる共通entries。
-  // isPlacementOccludedByPlatform()（3つの既存遮蔽helperをまとめただけの判定）を唯一の
-  // 判定元とし、新しい遮蔽判定ロジックは作らない。
+  // Stage Connector Phase 1H・PART A・M：出演者の表示分類はgetAudiencePerformerDisplayMode()に
+  // 一本化されている。「高台の下にいる出演者を除外する」「舞台奥・袖の出演者を同じ入口で除外する」
+  // という個別のentry-point除外ロジック（旧Phase 2C〜2D.1の設計）はもう存在しない。
+  // Stage Connector Phase 1J.2・PART B・C・AA：isPlacementOccludedByPlatform()は現在
+  // isWaitingAreaPlacementOccludedByPlatform()だけを呼ぶ判定であり、これはwaiting area
+  // （stageLeft/stageRight/upstageBackstage）以外には常にfalseを返す（area gateが先頭に
+  // あるため）。displayMode==="normal"（area==="stage"またはnull）のstage performerに
+  // ついては、この判定は既に恒常的にfalseであり、Phase 1J.2でplatform遮蔽をdepthMergedItems
+  // のPainter's algorithm（platform-front itemとの描画順）へ完全移行したことで、この呼び出し
+  // 自体がdead computationになっていた（reference audit）。そのため下記では単純に
+  // occluded:falseを直接返す（isWaitingAreaPlacementOccludedByPlatform()・
+  // isPlacementOccludedByPlatform()自体は無変更＝waiting area側の判定はそのまま生きている）。
+  const sizeComp = figureMinSizeCompensation(viewState.zoom);
   const audiencePerformerEntries = useMemo(
-    () =>
-      visiblePerformers.map((p) => ({ p, pos: placements[p.id] })).filter((v) => !!v.pos),
-    [visiblePerformers, placements]
+    () => visiblePerformers.map((p) => ({ p, pos: placements[p.id] })).filter((v) => !!v.pos)
+      .map((v) => {
+        const displayMode = getAudiencePerformerDisplayMode(v.pos, showWaiting);
+        return { ...v, displayMode, occluded: false };
+      }),
+    [visiblePerformers, placements, showWaiting]
   );
   const sorted = useMemo(() => {
     const arr = audiencePerformerEntries
-      .filter((v) => !isPlacementOccludedByPlatform(v.pos, platforms))
+      .filter((v) => v.displayMode === "normal" && !v.occluded)
       .sort((a, b) => b.pos.y - a.pos.y);
     const rest = [];
     const selected = [];
     arr.forEach((v) => (selectedIdSet.has(v.p.id) ? selected.push(v) : rest.push(v)));
     return [...rest, ...selected];
   }, [audiencePerformerEntries, selectedIdSet, platforms]);
-  // 高台 Phase 2E・PART E・I：遮蔽対象（isPlacementOccludedByPlatform()がtrueを返す出演者）を
-  // ghost表示用に別配列として保持する。通常出演者（sorted）のsort/select分離やBeam depth統合
-  // には一切混ぜない（PART F・V：ghostはdepth統合の対象外）。
-  const occludedSorted = useMemo(
-    () => audiencePerformerEntries.filter((v) => isPlacementOccludedByPlatform(v.pos, platforms)),
-    [audiencePerformerEntries, platforms]
-  );
+  // Stage Connector Phase 1H・PART B・F・G・K・L：waiting area performer（"ghost"分類）専用の
+  // 一覧。stage performerの遮蔽（isPlacementOccludedByPlatform()===true）はPART Cにより
+  // 単純にhidden（＝どこにも含めない。sorted/waitingAreaGhostEntriesどちらにも入らない）に
+  // なるため、旧occludedSortedのような「stage遮蔽performer専用のGhost配列」はもう作らない
+  // （PART C：stage performerがoccluded===trueならhidden。Ghostにはしない）。
+  const waitingAreaGhostEntries = useMemo(() => {
+    // Stage Connector Phase 1H.0.1・PART N：選択中Ghostが重なっているwaiting Ghost同士でも
+    // 分かりやすいよう、non-selected→selectedの順に並べ替えるだけ（stage normal performerや
+    // Lightingの既存layer order・sort/tie-breakには一切触れない。この配列はBeam depth統合にも
+    // 入らない独立したoverlay layerのため、大きなrender order変更にはならない＝PART M）。
+    const ghosts = audiencePerformerEntries.filter((v) => v.displayMode === "ghost");
+    const rest = [];
+    const selected = [];
+    ghosts.forEach((v) => (selectedIdSet.has(v.p.id) ? selected.push(v) : rest.push(v)));
+    return [...rest, ...selected];
+  }, [audiencePerformerEntries, selectedIdSet]);
 
   // 俯瞰客席ビュー・Beam-Performer depth統合 v1・I章：選択中Performerは既存仕様どおり
   // 常に最前面へ描画する（＝depth比較の対象に含めない）ため、`sorted`（既に「非選択→選択」の
@@ -11153,10 +12867,24 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     return slices;
   }, [showLightingBeams3D, lightingBeams3D, bounds, stage.depth]);
 
+  // Phase 1J.2.2: normal stairs share physical depth ordering; ghost stays separate.
+  const platformStructureOcclusionItems = useMemo(() => {
+    const allItems = buildAudienceStageStructureDrawItems({ platforms, stageConnectors, bounds, stageDepth: stage.depth, stage });
+    const frontItems = allItems.filter((item) => item.kind === "platform-front");
+    const topItems = platforms.flatMap((pl) =>
+      buildPlatformAudienceTopStructureDepthItems({ platform: pl, stageGuide, bounds, stageDepth: stage.depth })
+    );
+    return [...frontItems, ...topItems, ...getNormalAudienceStairsDepthItems(allItems)];
+  }, [platforms, stageConnectors, bounds, stage.depth, stage, stageGuide]);
+
   // 俯瞰客席ビュー・Beam-Performer depth統合 v1・G・H章：非選択Performerと正式Beam v2の
   // depth sliceを、舞台上のy（奥行き）を共通の基準にして1つのrenderItems配列へまとめ、
   // 「奥→手前」の順にソートする。選択中Performerはここには含めず、この後で別途最前面に描画する
   // （I章）。
+  // Stage Connector Phase 1J.2・PART D・G・I、1J.2.1・PART B・R：platform-front・
+  // platform-top-strip・platform-top-grid-line itemも同じ配列へ加え、共有sort関数
+  // sortAudienceDepthMergedItems()（own-platform performer例外込み）で並べ替える。
+  // 以前ここにあった専用のsort関数はsortAudienceDepthMergedItems()へ統合し、二重実装しない。
   const depthMergedItems = useMemo(() => {
     const performerItems = restSorted.map((v) => ({
       kind: "performer",
@@ -11166,20 +12894,9 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
       pos: v.pos,
     }));
     const beamItems = lightingBeam3DSlices.map((s) => ({ kind: "beamSlice", ...s }));
-    const items = [...performerItems, ...beamItems];
-    // H章：Beam sliceとPerformerのdepthYが同じ・非常に近い場合は、視認性のためPerformerを
-    // Beamより前面にする（tie-break）。EPSILON以下の差は「同depth」とみなす。
-    // 本格的な3D交差判定は行わない（R章）。
-    const TIE_BREAK_EPSILON = 1e-6;
-    items.sort((a, b) => {
-      const diff = b.depthY - a.depthY; // 奥（yが大きい）ほど先に描画
-      if (Math.abs(diff) > TIE_BREAK_EPSILON) return diff;
-      if (a.kind === b.kind) return 0;
-      // 同depth：Performer側を配列の後ろ（＝描画が後＝画面上で手前）へ
-      return a.kind === "performer" ? 1 : -1;
-    });
-    return items;
-  }, [restSorted, lightingBeam3DSlices]);
+    const items = [...performerItems, ...beamItems, ...platformStructureOcclusionItems];
+    return sortAudienceDepthMergedItems(items);
+  }, [restSorted, lightingBeam3DSlices, platformStructureOcclusionItems]);
 
   // 俯瞰客席ビュー・Beam-Performer depth統合 v1：Performer本体（FrontFigure）のJSXを
   // 生成する共通関数。従来1箇所だったsorted.map(...)の中身を、depth統合レイヤー・選択中
@@ -11195,7 +12912,11 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     // 既存projectAudiencePoint3D()のz引数へそのまま渡すだけで、高台上の出演者を
     // platform.height分だけ持ち上げて表示する。新しい投影式は作らない。performer.height
     // （出演者自身の身長）とは完全に別の値のため、heightPx計算（下記）には一切混ぜない。
-    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    // Stage Connector Phase 1F・PART B・K：auto performerがstairs矩形内にいる場合は
+    // resolvePlacementEffectiveSurfaceHeight()経由でcontinuous stairs Zを優先する。
+    // Export（renderAudienceFormationExport）と全く同じhelperを使い、screen専用の別判定は
+    // 作らない。manual performerはstairsを一切参照しない従来通りの挙動のまま。
+    const surfaceHeight = resolvePlacementEffectiveSurfaceHeight(pos, platforms, stageConnectors);
     const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
     // 出演者表示サイズ v1.1・PART E：俯瞰客席ビューは「身長 小・中・大」だけで人物サイズ・
     // 身長差を表現する設計のため、performerDisplayScale（平面図専用の表示設定）は
@@ -11208,6 +12929,11 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     const warn = isBeyondAllAreas(pos, zones) || overlapIds.has(p.id);
     const pose = getPlacementPose(pos);
     const isSelected = selectedIdSet.has(p.id);
+    // Stage Connector Phase 1J.2・PART B・S：SVG performer maskはもう使わない。platformの
+    // 客席側front faceは、performerと同じdepthMergedItems配列内でPainter's algorithmにより
+    // 描画順だけで前後関係を表現する（performerが奥ならplatform-frontを後から描く）ため、
+    // performer body側で個別にmaskを作る必要がなくなった（getStagePlacementOccludingPlatforms()・
+    // getPlatformAudienceOcclusionPolygons()は呼ばない）。
     return (
       <g
         key={p.id}
@@ -11238,7 +12964,9 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   const renderOverheadPerformerLabel = (p, pos) => {
     // 高台 Phase 2A・9章：本体（renderPerformerBody）と全く同じsurface高さ・投影方式を
     // 使う。出演者の身体と名前表示が異なる高さにならないようにする（10章）。
-    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    // Stage Connector Phase 1F・PART B・K：renderPerformerBody()と全く同じ
+    // resolvePlacementEffectiveSurfaceHeight()を使い、本体と番号タグの高さがずれないようにする。
+    const surfaceHeight = resolvePlacementEffectiveSurfaceHeight(pos, platforms, stageConnectors);
     const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
     const heightPx = p.height * scale * sizeComp;
     const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
@@ -11247,6 +12975,10 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     const tagY = sy + tagOffsetY;
     const fontSize = performerNumberFontSizeAudience(chestWidth, p.number);
     const isSelected = selectedIdSet.has(p.id);
+    // Stage Connector Phase 1J.2・PART B・Q：bodyと同様、SVG maskはもう参照しない。
+    // 番号labelは本体（renderPerformerBody）と全く同じdepth item（同じReact.Fragment）内で
+    // 連続描画されるため、platform-frontがそのperformerより後（手前）に描かれる場合は
+    // labelもbody同様、platform-front polygonの後に描かれることでのみ前後関係が決まる。
     return (
       <text
         key={`tag-${p.id}`}
@@ -11277,33 +13009,86 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
   // renderOverheadPerformerLabelとは完全に別関数とし（既存の通常出演者描画は分岐を増やさず
   // 一切変更しない＝PART F）、本体（GhostFigure）と番号を1つの<g>にまとめて返す。
   // surface高さ・投影方式は通常出演者と全く同じprojectAudiencePoint3D()をそのまま再利用し、
-  // 新しい投影式は作らない。名前は表示せず、選択強調も行わず、pointerEvents="none"で
-  // クリック選択対象にもしない（PART J：TopViewで編集できるためAudience側からの編集は不要）。
+  // 新しい投影式は作らない。
+  // Stage Connector Phase 1H.0.1・PART B・C・D・E・F・G・H：クリック選択に対応する。
+  //   - selected判定は既存selectedIdSetをそのまま使う（新しいselectedGhostId等は作らない＝PART B）。
+  //   - クリック時の単独選択／複数選択modifierは、renderPerformerBody()と全く同じ
+  //     onSelect(p.id)／e.shiftKeyでのonToggleSelect(p.id)をそのまま呼ぶだけ（PART C・D：
+  //     Ghost専用のselection処理を再実装しない）。
+  //   - dragは一切開始しない（PART E）。renderPerformerBody()自体がOverheadAudienceViewでは
+  //     onDragGroupを呼ばない設計（Audience Viewは選択専用でドラッグ機能を持たない）ため、
+  //     同じonPointerDownパターンをそのまま複製するだけで自動的にドラッグは発生しない。
+  //   - クリックしやすさのため、GhostFigureの線だけでなく透明なhit area rectを重ねる
+  //     （PART F・G：見た目には影響しない。サイズはgetPerformerSelectionOutlineRect()の
+  //     outlineと同じ範囲を再利用する）。
+  //   - 選択中はTHEME.accentの実線outlineをGhost本体の外側に追加するだけで、GhostFigure自体
+  //     （dash・color・opacity・pose geometry）は変更しない（PART H・S）。
   const renderOccludedPerformerGhost = (p, pos) => {
-    const surfaceHeight = resolvePlacementSurfaceHeight(pos, platforms);
+    // Stage Connector Phase 1F・PART B：本体描画と同じeffective height helperを使う
+    // （isPlacementOccludedByPlatform()自体の判定条件・occlusion対象の選定ロジックには
+    // 一切触れない＝PART P。ここは選ばれた後のZ表示のみ）。
+    const surfaceHeight = resolvePlacementEffectiveSurfaceHeight(pos, platforms, stageConnectors);
     const { sx, sy, scale } = projectAudiencePoint3D(bounds, stage.depth, pos.x, pos.y, surfaceHeight);
     const heightPx = p.height * scale * sizeComp;
     const refHeightPx = DEFAULT_PERFORMER_HEIGHT * scale * sizeComp;
     const pose = getPlacementPose(pos);
     const { tagOffsetY, chestWidth } = frontFigureChestMetrics(heightPx, pose, refHeightPx);
     const fontSize = performerNumberFontSizeAudience(chestWidth, p.number);
+    const isSelected = selectedIdSet.has(p.id);
+    const outlineRect = getPerformerSelectionOutlineRect(pose, heightPx, refHeightPx);
     return (
-      <g key={`ghost-${p.id}`} transform={`translate(${sx} ${sy})`} pointerEvents="none" aria-hidden="true">
-        <GhostFigure color={p.color} heightPx={heightPx} pose={pose} refHeightPx={refHeightPx} />
-        <text
-          x={0}
-          y={tagOffsetY}
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fontSize={fontSize}
-          fontWeight="bold"
-          fill={p.color}
-          opacity={0.35}
-          pointerEvents="none"
-          style={{ userSelect: "none", WebkitUserSelect: "none" }}
-        >
-          {p.number}
-        </text>
+      <g
+        key={`ghost-${p.id}`}
+        transform={`translate(${sx} ${sy})`}
+        style={{ cursor: locked ? "default" : "pointer" }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (locked) return; // 再生中は選択操作を無効化（通常performerと同じ挙動＝PART O・P）
+          if (e.shiftKey) {
+            onToggleSelect(p.id);
+            return;
+          }
+          onSelect(p.id);
+        }}
+      >
+        {/* PART F・G：クリックしやすさのための透明hit area。見た目には一切影響しない。 */}
+        <rect
+          x={outlineRect.x}
+          y={outlineRect.y}
+          width={outlineRect.width}
+          height={outlineRect.height}
+          fill="transparent"
+          pointerEvents="all"
+        />
+        <g pointerEvents="none" aria-hidden="true">
+          <GhostFigure color={p.color} heightPx={heightPx} pose={pose} refHeightPx={refHeightPx} />
+          {isSelected && (
+            <rect
+              x={outlineRect.x}
+              y={outlineRect.y}
+              width={outlineRect.width}
+              height={outlineRect.height}
+              rx={outlineRect.rx}
+              fill="none"
+              stroke={THEME.accent}
+              strokeWidth={3}
+            />
+          )}
+          <text
+            x={0}
+            y={tagOffsetY}
+            textAnchor="middle"
+            dominantBaseline="middle"
+            fontSize={fontSize}
+            fontWeight="bold"
+            fill={p.color}
+            opacity={0.35}
+            pointerEvents="none"
+            style={{ userSelect: "none", WebkitUserSelect: "none" }}
+          >
+            {p.number}
+          </text>
+        </g>
       </g>
     );
   };
@@ -11374,7 +13159,6 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
     dragState.current = null;
   };
 
-  const sizeComp = figureMinSizeCompensation(viewState.zoom);
   const groupTransform = viewGroupTransform(viewState, bounds);
 
   return (
@@ -11520,108 +13304,75 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
           />
         </g>
 
-        {/* 高台 Phase 1B：俯瞰客席ビューでの高さ表現。高台は舞台構造物のため、Lighting Area
-            （光）より必ず背面（＝このブロックより後に描画される）になる位置に置く。天面・
-            客席側垂直面の2面だけを描く最小構成で、左右側面・出演者のsurfaceId・Beamとの
-            物理遮蔽はPhase 1Bのスコープ外（調査報告I・Jの通り）。矩形geometryは
-            getPlatformStageRect()（TopView/Exportと共通）、3D投影はgetPlatformAudienceFaces()
-            （新規・既存projectAudiencePoint3Dだけを使う）で計算し、新しい投影式は作らない。
-            複数高台は「platform.yの降順＝奥から先に描画」という、既存depthMergedItemsと
-            同じ考え方で並べる（height順・screen Y順の複雑な比較は行わない）。ドラッグ・
-            リサイズ・クリック選択の対象にはしないため、pointerEvents="none"にする。 */}
-        {platforms.length > 0 &&
+        {/* Stage Connector Phase 1D.1・PART A〜G：高台・stairsを「別々の固定描画ブロック」
+            ではなく、同じ舞台構造物群として奥→手前のPainter's algorithmで統合する。
+            buildAudienceStageStructureDrawItems()・sortAudienceStageStructureItems()
+            （screen/Exportで共有するpure helper＝PART G）に幾何計算・ソートを完全委譲し、
+            getPlatformAudienceFaces()・getStageConnectorAudienceFaces()自体は一切変更しない
+            （PART K・L）。Lighting Areaより必ず先（＝背面）に描く、という既存の重なり方は
+            そのまま維持する（PART H）。ドラッグ・リサイズ・クリック選択の対象にはしないため
+            pointerEvents="none"にする（従来通り）。
+            Stage Connector Phase 1J.2・PART B・G・H、1J.2.1・PART S：platform-frontに加えて
+            platform-top・platform-gridもこのブロックから除外し、performer/beamSliceと同じ
+            depthMergedItems（下記）へ回した（top面もPainter's algorithm比較対象にするため。
+            旧版はtop/gridを常に背面固定にしていたが、それだと奥のperformerが天面の上に
+            貼り付いたように見えてしまっていた）。Phase 1J.2.2ではnormal stairsも統合し、ここにはGhost stairsだけを残す。
+            buildAudienceStageStructureDrawItems()・sortAudienceStageStructureItems()自体
+            （structure同士の相対順・geometry計算）は一切変更していない。 */}
+        {(platforms.length > 0 || stageConnectors.length > 0) &&
           (() => {
-            const platformAudienceColors = getPlatformAudienceColors(floorColorKey);
-            const sortedPlatforms = [...platforms].sort((a, b) => (b.y || 0) - (a.y || 0));
+            const structureColors = getPlatformAudienceColors(floorColorKey);
+            const items = sortAudienceStageStructureItems(
+              buildAudienceStageStructureDrawItems({ platforms, stageConnectors, bounds, stageDepth: stage.depth, stage })
+            ).filter((item) => item.displayMode === "ghost");
             return (
               <g pointerEvents="none" aria-hidden="true">
-                {sortedPlatforms.map((pl) => {
-                  const faces = getPlatformAudienceFaces(pl, bounds, stage.depth);
-                  if (!faces) return null;
-                  const topPoints = faces.top.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
-                  const frontPoints = faces.front.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
-                  return (
-                    <g key={pl.id}>
+                {items.map((item) => {
+                  // stairs-riser / stairs-tread
+                  const pts = item.points.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
+                  const isRiser = item.kind === "stairs-riser";
+                  if (item.displayMode === "ghost") {
+                    // Stage Connector Phase 1D.4・PART F：完全に舞台袖外にあるlateral stairsの
+                    // 参考表示。既存GhostFigure（出演者Ghost）と同じ視覚言語
+                    // （fill="none", strokeDasharray, opacity低め）を踏襲しつつ、stairs用に
+                    // 無彩色（THEME.textDim）のstrokeだけで輪郭を示す。Lightingが当たった
+                    // ような強い面表現（frontFillColor/topFillColor）は使わない。
+                    return (
                       <polygon
-                        points={frontPoints}
-                        fill={platformAudienceColors.frontFillColor}
-                        stroke={THEME.gridLine}
+                        key={item.key}
+                        points={pts}
+                        fill="none"
+                        stroke={THEME.textDim}
                         strokeWidth={1.2}
+                        strokeDasharray="4 3"
+                        opacity={0.35}
                       />
-                      <polygon
-                        points={topPoints}
-                        fill={platformAudienceColors.topFillColor}
-                        stroke={THEME.gridLine}
-                        strokeWidth={1.0}
-                      />
-                    </g>
+                    );
+                  }
+                  return (
+                    <polygon
+                      key={item.key}
+                      points={pts}
+                      fill={isRiser ? structureColors.frontFillColor : structureColors.topFillColor}
+                      stroke={THEME.gridLine}
+                      strokeWidth={1.0}
+                    />
                   );
                 })}
               </g>
             );
           })()}
 
-        {/* 高台 Phase 2C・PART B：高台天面グリッド。新しい独立したグリッド体系は作らず、
-            既存stageGuide（buildAudienceStageGuideGeometryの結果、すぐ上の舞台本体グリッドと
-            全く同じデータ）をgetPlatformTopGridSegments()で高台矩形内だけ切り出し、
-            z=platform.heightへ持ち上げてprojectAudiencePoint3D()で投影する（新しい投影式は
-            作らない）。描画順は「高台front/top→高台天面グリッド→Lighting」で固定し、
-            高台topの塗りに一度隠れた舞台グリッドが、持ち上げられた位置に再び現れるように
-            見せる。出演者・高台枠より目立たない細い線にするため、舞台本体グリッド
-            （THEME.gridLineHalf, opacity 0.7, width 0.8）よりさらに控えめなopacity/widthに
-            する（新しい色テーマは作らない）。 */}
-        {platforms.length > 0 && (
-          <g pointerEvents="none" aria-hidden="true">
-            {platforms.map((pl) => {
-              const gridSegs = getPlatformTopGridSegments(pl, stageGuide);
-              const toScreenSeg = (seg) => ({
-                a: projectAudiencePoint3D(bounds, stage.depth, seg.x1, seg.y1, pl.height),
-                b: projectAudiencePoint3D(bounds, stage.depth, seg.x2, seg.y2, pl.height),
-              });
-              return (
-                <g key={pl.id}>
-                  {gridSegs.vertical.map((seg, i) => {
-                    const { a, b } = toScreenSeg(seg);
-                    return (
-                      <line
-                        key={`ptgv-${pl.id}-${i}`}
-                        x1={a.sx}
-                        y1={a.sy}
-                        x2={b.sx}
-                        y2={b.sy}
-                        stroke={THEME.gridLineHalf}
-                        strokeOpacity={0.5}
-                        strokeWidth={0.6}
-                      />
-                    );
-                  })}
-                  {gridSegs.horizontal.map((seg, i) => {
-                    const { a, b } = toScreenSeg(seg);
-                    return (
-                      <line
-                        key={`ptgh-${pl.id}-${i}`}
-                        x1={a.sx}
-                        y1={a.sy}
-                        x2={b.sx}
-                        y2={b.sy}
-                        stroke={THEME.gridLineHalf}
-                        strokeOpacity={0.5}
-                        strokeWidth={0.6}
-                      />
-                    );
-                  })}
-                </g>
-              );
-            })}
-          </g>
-        )}
-
         {/* Lighting Area v1・W章：照明Areaレイヤー（表示専用。編集・ドラッグ・選択は平面図のみ
             ＝C章）。Areaの舞台座標上の頂点（getLightingAreaStagePoints、TopViewと共通のpure
-            helper＝X章）を、既存のproject()（projectAudiencePoint）へそのまま通すことで、
-            円・楕円（旧rectデータもellipseとして＝Lighting Area整理v1・C・G章）の多角形近似の
-            polygonとして、舞台床に沿って見えるように投影する（W章の要件：単なるscreen上の円
-            ではなく、舞台床上に置かれているように見えること）。投影計算・画角・出演者位置・
+            helper＝X章）自体はx/y専用のまま変更しない（高台 Phase 3C・PART F：新しい物理・
+            geometry計算は作らない）。高台 Phase 3C・PART M：各頂点をprojectAudiencePoint3D()で
+            「そのAreaのsurface高さ」（resolveLightingAreaSurfaceHeight()、通常は0、高台選択なら
+            platform.height）へ持ち上げて投影することで、円・楕円（旧rectデータもellipseとして
+            ＝Lighting Area整理v1・C・G章）の多角形近似のpolygonが、選択した高台天面に沿って
+            見えるようにする（W章の要件：単なるscreen上の円ではなく、舞台床/高台天面上に
+            置かれているように見えること）。area.surfaceIdは既にresolveLightingAreaSurfaceHeight()
+            を通して解決済みのため、ここではsurfaceIdを直接見ない。投影計算・画角・出演者位置・
             待機エリア・目盛り・舞台台形・ラベルには一切手を加えていない。
             Lighting Area整理 v1・G章：俯瞰ビューは表示専用のため、色付きoutlineは出さず
             fillのみにする（選択outlineの概念自体が不要）。 */}
@@ -11630,7 +13381,11 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             {lightingAreas.map((area) => {
               const stagePoints = getLightingAreaStagePoints(area);
               if (stagePoints.length === 0) return null;
-              const pointsAttr = stagePoints.map((p) => project(p.x, p.y)).map((sp) => `${sp.sx},${sp.sy}`).join(" ");
+              const areaSurfaceZ = resolveLightingAreaSurfaceHeight(area, platforms);
+              const pointsAttr = stagePoints
+                .map((p) => projectAudiencePoint3D(bounds, stage.depth, p.x, p.y, areaSurfaceZ))
+                .map((sp) => `${sp.sx},${sp.sy}`)
+                .join(" ");
               const fillColor = lightingAreaColorHex(area.color);
               return (
                 <polygon
@@ -11690,60 +13445,6 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             depth sortへ混ぜず、既存位置＝Beamより後・Performerより前を維持するため、
             ここに置いたまま）。 */}
 
-        {/* 移動軌跡（表示専用レイヤー）：人物本体より背面・非インタラクティブに描画する。
-            平面図と同じ transitionPaths（App側でcomputeTransitionPathsにより毎回計算し直された
-            「開始→終了」の経路・表示専用情報）を、このビュー独自の疑似遠近法project()で
-            投影するだけで済ませる。
-            tp.type === "curve" の場合、開始点・waypoint・終点の3点をそれぞれproject()で
-            投影し、その投影後の3点をそのまま二次ベジェのSVGパスとして描画する（project()は
-            奥行きによって縮尺が変わる非線形の疑似遠近法のため、舞台座標上の曲線を厳密に
-            投影したものとは僅かに異なるが、無理に高度な変換は行わず、平面図と同じ考え方の
-            単純な近似描画に留める＝v1の「無理に複雑な表現へ変更しない」方針を踏襲）。
-            このビューではwaypointのドラッグ編集は行わない（v1では平面図のみ対応）。
-            選択中の出演者の軌跡だけ太く・濃く強調する。 */}
-        {transitionPaths && transitionPaths.length > 0 && (
-          <g pointerEvents="none">
-            {transitionPaths.map((tp) => {
-              const performer = performers.find((p) => p.id === tp.id);
-              const color = (performer && performer.color) || THEME.textDim;
-              const emphasized = selectedIdSet.has(tp.id);
-              const fromProj = project(tp.from.x, tp.from.y);
-              const toProj = project(tp.to.x, tp.to.y);
-              const arrowSize = emphasized ? 12 : 8;
-              const isCurve = tp.type === "curve" && tp.waypoint;
-              const wpProj = isCurve ? project(tp.waypoint.x, tp.waypoint.y) : null;
-              const arrowPts = isCurve
-                ? trajectoryArrowPoints(wpProj.sx, wpProj.sy, toProj.sx, toProj.sy, arrowSize)
-                : trajectoryArrowPoints(fromProj.sx, fromProj.sy, toProj.sx, toProj.sy, arrowSize);
-              return (
-                <g key={`traj-${tp.id}`} opacity={emphasized ? 0.9 : 0.35}>
-                  <circle cx={fromProj.sx} cy={fromProj.sy} r={emphasized ? 4 : 2.5} fill={color} />
-                  {isCurve ? (
-                    <path
-                      d={`M ${fromProj.sx} ${fromProj.sy} Q ${wpProj.sx} ${wpProj.sy} ${toProj.sx} ${toProj.sy}`}
-                      fill="none"
-                      stroke={color}
-                      strokeWidth={emphasized ? 3 : 1.5}
-                      strokeLinecap="round"
-                    />
-                  ) : (
-                    <line
-                      x1={fromProj.sx}
-                      y1={fromProj.sy}
-                      x2={toProj.sx}
-                      y2={toProj.sy}
-                      stroke={color}
-                      strokeWidth={emphasized ? 3 : 1.5}
-                      strokeLinecap="round"
-                    />
-                  )}
-                  {arrowPts && <polygon points={arrowPts} fill={color} />}
-                </g>
-              );
-            })}
-          </g>
-        )}
-
         {/* 俯瞰客席ビュー・番号depth統合 v1（前提はBeam-Performer depth統合 v1・G章と同じ）：
             正式Beam v2のdepth sliceと非選択Performerを、depthMergedItems（舞台上のy＝奥行きで
             「奥→手前」にソート済み）の順にそのまま描画する。以前は番号だけを最後に別途
@@ -11753,7 +13454,15 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             描画することで、番号も本体と同じように奥の人物ごと隠れるようにする
             （Beam sliceはpointerEvents="none"のまま、Performerだけが従来どおりクリック・
             選択操作を受け付ける。番号自体の色・サイズ・位置・フォント等の見た目は
-            renderOverheadPerformerLabelへ切り出しただけで変更していない）。 */}
+            renderOverheadPerformerLabelへ切り出しただけで変更していない）。
+            Stage Connector Phase 1J.2・PART B・G、1J.2.1・PART F・N・O：platform-front
+            （客席側front face）に加えて、platform-top-strip（天面をstage-y方向へ分割した
+            fill片）・platform-top-grid-line（天面visual gridをstrip境界で分割した線分）も
+            このdepth統合配列に含まれる。SVG mask／Canvas clip方式はもう使わず、単に
+            「奥にあるものを先、手前にあるものを後」で描くだけで、重なった部分だけが自然に
+            隠れる（Painter's algorithm）。fill/strokeの色自体は従来のplatform structure描画と
+            全く同じ。top strip同士の内部境界にはstrokeを付けない（PART F：境界線が大量に
+            見えるのを防ぐ）。 */}
         {depthMergedItems.map((item) => {
           if (item.kind === "beamSlice") {
             const pointsAttr = item.points.map((pt) => `${pt.x},${pt.y}`).join(" ");
@@ -11767,6 +13476,52 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
               />
             );
           }
+          if (item.kind === "platform-front" || item.kind === "stairs-riser" || item.kind === "stairs-tread") {
+            const structureColors = getPlatformAudienceColors(floorColorKey);
+            const pts = item.points.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
+            return (
+              <polygon
+                key={item.key}
+                points={pts}
+                fill={item.kind === "stairs-tread" ? structureColors.topFillColor : structureColors.frontFillColor}
+                stroke={THEME.gridLine}
+                strokeWidth={item.kind === "platform-front" ? 1.2 : 1.0}
+                pointerEvents="none"
+              />
+            );
+          }
+          if (item.kind === "platform-top-strip") {
+            // Stage Connector Phase 1J.2.1・PART F：strip同士の内部境界にstrokeを付けると
+            // 大量の横線が見えてしまうため、fillのみにする（platform outer strokeは既存の
+            // stairs/front同様、visual外枠が必要な場合は別途PART Fの通り検討対象だが、今回は
+            // fillだけでも天面の立体感・前後関係は十分伝わるため追加のoutline描画はしない）。
+            const structureColors = getPlatformAudienceColors(floorColorKey);
+            const pts = item.points.map((pt) => `${pt.sx},${pt.sy}`).join(" ");
+            return (
+              <polygon
+                key={item.key}
+                points={pts}
+                fill={structureColors.topFillColor}
+                pointerEvents="none"
+              />
+            );
+          }
+          if (item.kind === "platform-top-grid-line" || item.kind === "platform-top-outline-line") {
+            const isOutline = item.kind === "platform-top-outline-line";
+            return (
+              <line
+                key={item.key}
+                x1={item.a.sx}
+                y1={item.a.sy}
+                x2={item.b.sx}
+                y2={item.b.sy}
+                stroke={isOutline ? THEME.gridLine : THEME.gridLineHalf}
+                strokeOpacity={isOutline ? 1 : 0.5}
+                strokeWidth={isOutline ? 1.0 : 0.6}
+                pointerEvents="none"
+              />
+            );
+          }
           return (
             <React.Fragment key={`depth-performer-${item.key}`}>
               {renderPerformerBody(item.p, item.pos)}
@@ -11774,6 +13529,50 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
             </React.Fragment>
           );
         })}
+
+        {/* Phase 1J.2.4: editing guide after physical scene, before selected performers. */}
+        {/* Stage Connector Phase 1I・PART C・F・K・L・M・N・O・P・Q・R・S・T・U：Audience
+            3D trajectory。TopViewと同じtransitionPaths（誰の軌跡を描くか・静止出演者は
+            描かないという既存skipルール）はそのまま流用しつつ、実際のXY形状・高さは
+            trajectorySource（raw fromPlacements/toPlacements/pathConfig）から
+            buildAudienceTrajectoryScreenPoints()で毎回サンプリングし直す。この関数が
+            interpolatePlacementsWithPaths()（straight/curve・area・surfaceMode・surfaceIdの
+            解決を含む）→resolvePlacementEffectiveSurfaceHeight()（stairs/platform
+            continuous height）→projectAudiencePoint3D()という既存要素だけを順に通すため、
+            performer本人のTransition経路・高さと完全に一致する（新しいZ補間式・新しい
+            曲線定義は作らない）。waiting area performerがGhost表示でも、trajectory自体は
+            通常のガイド線のまま描く（PART P・Q：Ghost化・点線化はしない）。platform/stairsに
+            よる遮蔽判定は行わず、常に見えるoverlayのまま（PART R）。描画順・depth統合対象外・
+            色/opacity/選択強調は元の実装から変更していない（PART S・U）。矢印は最後の2つの
+            screen sample点から向きを求める（PART T）。 */}
+        {transitionPaths && transitionPaths.length > 0 && trajectorySource && (
+          <g pointerEvents="none">
+            {transitionPaths.map((tp) => {
+              const performer = performers.find((p) => p.id === tp.id);
+              const color = (performer && performer.color) || THEME.textDim;
+              const emphasized = selectedIdSet.has(tp.id);
+              const fromPos = trajectorySource.fromPlacements[tp.id];
+              const toPos = trajectorySource.toPlacements[tp.id];
+              const points = buildAudienceTrajectoryScreenPoints(
+                tp.id, fromPos, toPos, trajectorySource.pathConfig, platforms, zones, stageConnectors, bounds, stage.depth
+              );
+              if (points.length < 2) return null; // PART AB：既存の非表示条件を踏襲する安全策
+              const arrowSize = emphasized ? 12 : 8;
+              const last = points[points.length - 1];
+              const prev = points[points.length - 2];
+              const arrowPts = trajectoryArrowPoints(prev.sx, prev.sy, last.sx, last.sy, arrowSize);
+              const d = audienceTrajectoryPointsToPathD(points);
+              const first = points[0];
+              return (
+                <g key={`traj-${tp.id}`} opacity={emphasized ? 0.9 : 0.35}>
+                  <circle cx={first.sx} cy={first.sy} r={emphasized ? 4 : 2.5} fill={color} />
+                  <path d={d} fill="none" stroke={color} strokeWidth={emphasized ? 3 : 1.5} strokeLinecap="round" strokeLinejoin="round" />
+                  {arrowPts && <polygon points={arrowPts} fill={color} />}
+                </g>
+              );
+            })}
+          </g>
+        )}
 
         {/* 俯瞰客席ビュー・Beam-Performer depth統合 v1・I章：選択中Performer（複数可）は、
             depth順とは独立に必ず最前面へ描画する既存仕様を維持する。Beam sliceより後ろに
@@ -11785,16 +13584,19 @@ const OverheadAudienceView = forwardRef(function OverheadAudienceView(
         {selectedSorted.map(({ p, pos }) => renderPerformerBody(p, pos))}
         {selectedSorted.map(({ p, pos }) => renderOverheadPerformerLabel(p, pos))}
 
-        {/* 高台 Phase 2E・PART I・J：高台裏ゴースト表示レイヤー。showOccludedPerformerGhosts
-            （defaultはfalse＝完全非表示、現在のPhase 2D.1fと完全に同じ見え方を維持）がtrueの
-            時だけ、occludedSorted（isPlacementOccludedByPlatform()で判定した遮蔽対象）を
-            薄い点線シルエット＋番号で描画する。通常出演者（restSorted/selectedSorted・
-            depthMergedItems・Beam depth統合）より後に描画するだけの単純な追加レイヤーとし、
-            Beamのdepth統合には一切加えない（ghostは「客席から見える実体」ではなく舞台裏
-            情報を示す補助オーバーレイのため）。pointerEvents="none"でクリック選択対象にも
-            しない（PART J：TopViewで編集できるためAudience側からの選択操作は不要）。 */}
-        {showOccludedPerformerGhosts &&
-          occludedSorted.map(({ p, pos }) => renderOccludedPerformerGhost(p, pos))}
+        {/* Stage Connector Phase 1H・PART B・F・G・K・L：waiting area（stageLeft/stageRight/
+            upstageBackstage）performerのGhost表示レイヤー。「待機中の出演者もこのビューに
+            表示する」（showWaiting）がONの時だけvisiblePerformers経由でここへ来るperformerを、
+            area分類だけでGhostへ回す（platform occlusion判定は一切行わない＝PART B）。
+            既存renderOccludedPerformerGhost()（GhostFigure・resolvePlacementEffectiveSurfaceHeight()
+            を含む、Phase 1Fで既にstairs対応済み。Phase 1H.0.1でクリック選択・選択outlineにも
+            対応済み）をそのまま再利用し、新しいGhost表現は作らない（PART F・G）。通常出演者
+            （restSorted/selectedSorted・depthMergedItems・Beam depth統合）より後に描画するだけの
+            単純な追加レイヤーとし、Beamのdepth統合には一切加えない（PART L）。
+            Stage Connector Phase 1H.1・PART B：旧「高台裏をゴースト表示」toggle
+            （showOccludedPerformerGhosts）はrender behaviorから既に切り離した上、reference
+            auditでどこからも参照されなくなったことを確認し、state自体も削除済み。 */}
+        {waitingAreaGhostEntries.map(({ p, pos }) => renderOccludedPerformerGhost(p, pos))}
       </g>
     </svg>
   );
@@ -11922,6 +13724,10 @@ export default function App() {
   // 古いworkにこのfieldが存在しないケースをこの1箇所のヘルパーだけに集約するため。
   const platforms = getPlatforms(work);
 
+  // Stage Connector Phase 1A：work.stageConnectorsを常にgetStageConnectors()経由で読み出す。
+  // platformsと全く同じ理由（古いworkにこのfieldが存在しないケースをこの1箇所へ集約）。
+  const stageConnectors = getStageConnectors(work);
+
   // このプロジェクトの実際のBPM。work.projectが無い（BPM機能実装前の古いデータ）場合や
   // project.bpmが数値でない場合はDEFAULT_BPMへfallbackする（getProjectBpm参照）。
   // 再生計算（countsToDurationMs）には、以降このprojectBpmだけを渡し、DEFAULT_BPMを
@@ -11977,10 +13783,12 @@ export default function App() {
   const [showBackstage, setShowBackstage] = useState(true);
   // 俯瞰客席ビューで待機中の出演者も表示するかどうか
   const [showWaitingInOverhead, setShowWaitingInOverhead] = useState(false);
-  // 高台 Phase 2E・2E.1・PART A：俯瞰客席ビュー専用の「高台裏をゴースト表示」チェック。
-  // work/Project/slides/localStorage/Backupには一切保存しない、UndoRedo対象外の画面表示専用
-  // state。Phase 2E.1でdefaultをfalse→trueへ変更（実機確認の結果、常時ONの方が自然だったため）。
-  const [showOccludedPerformerGhosts, setShowOccludedPerformerGhosts] = useState(true);
+  // Stage Connector Phase 1H.1・PART B：旧「高台裏をゴースト表示」チェック用state
+  // （showOccludedPerformerGhosts/setShowOccludedPerformerGhosts）は、Phase 1HでUI
+  // checkboxを削除し、waitingAreaGhostEntriesの描画がこのtoggleへ依存しないよう変更した後、
+  // OverheadAudienceViewへのprop受け渡しも含めてどこからも参照されなくなったことをreference
+  // auditで確認したため削除した。work/Project/schemaには元々保存していない画面表示専用state
+  // だったため、後方互換の懸念もない。
   // Lighting v0・M章：「Lighting表示ON/OFF」は作品データではなく一時的なUI state。
   // Lighting機能そのもののON/OFF（work.project.lightingEnabled）とは別物で、
   // 「照明データは残すが舞台上の照明表示だけ一時的に消す」ためのもの。今回はまだArea/Beamを
@@ -12098,12 +13906,17 @@ export default function App() {
   // （helpOpen・globalSettingsOpen等と全く同じ方針）。初期状態は開いた状態にする。
   const [lightingAreaSectionOpen, setLightingAreaSectionOpen] = useState(true);
   const [lightingBeam3DSectionOpen, setLightingBeam3DSectionOpen] = useState(true);
-  // 「？ ヘルプ」パネルの開閉状態。表示のON/OFFだけの一時的なUI stateであり、
-  // 作品データ（work）には含めないため履歴（Undo/Redo）の対象外。初期状態は閉じておく。
+  // Help v2：ヘッダーの「📖 使い方」（旧「？ ヘルプ」から文言のみ変更）パネルの開閉状態。
+  // 表示のON/OFFだけの一時的なUI stateであり、作品データ（work）には含めないため
+  // 履歴（Undo/Redo）の対象外。初期状態は閉じておく（開閉ロジック自体は既存のまま流用）。
   const [helpOpen, setHelpOpen] = useState(false);
   // 右編集パネルの整理 v1（PART D・新規）：「全体の設定」「構成ごとの設定」2グループの開閉状態。
   // 折りたたみ状態は作品データではなく表示のON/OFFだけの一時的なUI stateのため、
   // work（Undo/Redo対象）には含めない（21章）。PC・タブレットでの初期状態はどちらも開いた状態（20章）。
+  // 新規Project作成時の初期開閉状態（新規）：以下の各SectionOpen系stateはこのuseState初期値
+  // （＝アプリ起動直後の値）に加えて、「＋ 新しいプロジェクト」実行時（createNewProject内）でも
+  // 明示的に同じ値へ設定し直している。既存Projectへの切替（switchProject）ではこれらのstateへ
+  // 一切触れないため、開閉状態は維持される。
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(true);
   const [slideSettingsOpen, setSlideSettingsOpen] = useState(true);
   // 全体設定UI整理・2階層目accordion導入（新規）：「全体の設定」内の「ステージ設定」
@@ -12115,6 +13928,8 @@ export default function App() {
   // 高台 Phase 1A・10-3章：「▶ 高台・段差」の開閉状態。stageSettingsOpen等と全く同じ方針
   // （work対象外・UI専用state）。要件通り初期状態は閉じる。
   const [platformsSectionOpen, setPlatformsSectionOpen] = useState(false);
+  // Stage Connector Phase 1A・PART C：高台と同じ「初期状態は閉じる」nested accordion。
+  const [stageConnectorsSectionOpen, setStageConnectorsSectionOpen] = useState(false);
   const [musicSettingsOpen, setMusicSettingsOpen] = useState(true);
   // Lighting UI整理 v1・C章：「全体の設定」「構成ごとの設定」と同じ階層の独立グループとして
   // 「照明の設定」を新設する。開閉状態の管理方法は既存2グループと完全に同じ（work対象外・
@@ -12143,11 +13958,14 @@ export default function App() {
       return nextOpen;
     });
   }, []);
-  // Manual v1.1：「はじめての方へ」「機能から探す」内の各項目「ショートカット」の
-  // 開閉状態をまとめて持つ。helpOpenと全く同じ方針（表示のON/OFFだけの一時的なUI state。
-  // workへ保存せず、Undo/Redo対象外）。「はじめての方へ」はManualの主役のため、
-  // 初期状態だけgettingStarted:trueにして開いた状態にする（他キーは未設定＝閉じた状態）。
-  const [helpManualSectionsOpen, setHelpManualSectionsOpen] = useState({ gettingStarted: true });
+  // Help v2：「🌱 はじめての方へ」「✨ やりたいことから探す」（＋その中の各項目）
+  // 「🔍 機能から探す」内の各項目「⌨️ ショートカット」の開閉状態をまとめて持つ。
+  // helpOpenと全く同じ方針（表示のON/OFFだけの一時的なUI state。workへ保存せず、
+  // Undo/Redo対象外）。
+  // Help v2.2（新規）：「🌱 はじめての方へ」は初期状態をCLOSEDへ変更した（「✨ やりたいことから探す」は
+  // 現状どおりOPENを維持）。Helpを開いた瞬間に🌱／✨／🔍／⌨️の4層構造を一覧しやすくする狙い。
+  // 「はじめての方へ」の内容自体は削除せず、必要な人が開けるaccordionとして残す。
+  const [helpManualSectionsOpen, setHelpManualSectionsOpen] = useState({ wantToDo: true });
   const toggleHelpManualSection = useCallback((key) => {
     setHelpManualSectionsOpen((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
@@ -14055,7 +15873,7 @@ export default function App() {
   // 解決する。Formation A/B・transition progressから新しい補間計算は一切作らず、出演者表示に
   // 既に使われているこの値をそのまま再利用するだけ（8章）。resolveLightingBeam3DTarget()の
   // 判定を1箇所に集約するため、Top View用・Audience View用で別々に解決しない（14章）。
-  const effectiveLightingBeams3DForDisplay = resolveLightingBeams3DForDisplay(effectiveLightingBeams3D, displayPlacementsWithScrub, platforms);
+  const effectiveLightingBeams3DForDisplay = resolveLightingBeams3DForDisplay(effectiveLightingBeams3D, displayPlacementsWithScrub, platforms, stageConnectors);
 
   // CompositionBarに渡す再生状況ラベル。単体/連続・move/keepフェーズの文字列組み立てをここに
   // 集約し、CompositionBar側は「もらった内容をそのまま表示する（nullならidle時の通常表示に
@@ -14196,6 +16014,19 @@ export default function App() {
     // 経路データを二重に保存する必要がない。
     const pathConfig = (effectiveTransitionPathConfig && effectiveTransitionPathConfig[ref.fromSlideId]) || null;
     return computeTransitionPaths(ref.fromPlacements, ref.toPlacements, pathConfig);
+  }, [showTrajectory, trajectoryMode, slides, currentSlideIndex, effectiveTransitionPathConfig]);
+
+  // Stage Connector Phase 1I・PART C・G・H・I・J：Audience Viewの3D trajectory sampling
+  // だけに使う、raw placements（area/surfaceMode/surfaceId込み）とpathConfig。上のtransitionPaths
+  // （TopView用、x/yだけに間引かれた表示専用データ）とは全く別に、同じgetTrajectoryPlacements()
+  // 参照ロジックで独立して求めるだけで、TopView用のtransitionPaths自体は一切変更しない
+  // （PART B：TopView trajectory完全保護）。
+  const audienceTrajectorySource = useMemo(() => {
+    if (!showTrajectory) return null;
+    const ref = getTrajectoryPlacements({ slides, currentSlideIndex, mode: trajectoryMode });
+    if (!ref) return null;
+    const pathConfig = (effectiveTransitionPathConfig && effectiveTransitionPathConfig[ref.fromSlideId]) || null;
+    return { fromPlacements: ref.fromPlacements || {}, toPlacements: ref.toPlacements || {}, pathConfig };
   }, [showTrajectory, trajectoryMode, slides, currentSlideIndex, effectiveTransitionPathConfig]);
 
   // ------------------------------------------------------------
@@ -15354,12 +17185,12 @@ export default function App() {
   // 独立させる。実際に描画へ反映するのはrenderTopFormationExportのみで、俯瞰客席ビュー側の
   // renderAudienceFormationExportへは常に渡さない（9・14章：常に名前非表示という確定仕様）。
   const [exportShowPerformerNames, setExportShowPerformerNames] = useState(false);
-  // 高台 Phase 2E・2E.1・PART C・L：Export Center専用の「高台裏をゴースト表示」設定。
-  // exportShowPerformerNames等と全く同じ考え方（work/Project/slides/Backup/localStorageには
-  // 一切保存しない、Undo/Redo対象外のExport専用UI state）。default OFF（編集画面側は
-  // Phase 2E.1でdefault trueへ変更したが、Export側はfalseのまま維持）。俯瞰客席ビュー出力時
-  // だけ意味を持つ（平面図出力時はUI自体を非表示にする）。
-  const [exportShowOccludedPerformerGhosts, setExportShowOccludedPerformerGhosts] = useState(false);
+  // Stage Connector Phase 1H.1・PART C：Export Center専用の旧「高台裏をゴースト表示」設定
+  // （exportShowOccludedPerformerGhosts/setExportShowOccludedPerformerGhosts）は、Phase 1Hで
+  // UI checkboxを削除し、俯瞰客席ビューのwaiting performer Ghost表示がshowWaitingAreasだけで
+  // 決まるよう変更した後、renderer側のoption転送も含めてどこからも参照されなくなったことを
+  // reference auditで確認したため削除した。work/Project/slides/Backup/localStorageには元々
+  // 保存していない画面表示専用stateだったため、後方互換の懸念もない。
   // P-03 第一段階「選択出演者を強調して出力」・2章：Export Center専用の「選択中の出演者を
   // 強調して出力」チェックボックス。exportShowPerformerNames等と全く同じ考え方（work/Project
   // schema/localStorage/Backup/Undo/Redoには一切保存しないExport専用UI state）。初期値OFF。
@@ -15679,6 +17510,9 @@ export default function App() {
           // 高台 Phase 2E.2・PART E：通常Formation Exportや編集画面ですでに使っている
           // 現在Projectのplatformsをそのまま渡す（新しいgetPlatforms()呼び出しは作らない）。
           platforms,
+          // Stage Connector Phase 1A.1・PART 1：通常Formation Exportと同じ現在Projectの
+          // stageConnectorsをそのまま渡す（新しいgetStageConnectors()呼び出しは作らない）。
+          stageConnectors,
         });
         if (models.length === 0) {
           setPngExportError("出力対象の照明キューが見つかりませんでした。");
@@ -15694,9 +17528,6 @@ export default function App() {
           showWaitingAreas: exportShowWaitingAreas,
           showPerformerNames: exportShowPerformerNames,
           displayScale: exportDisplayScale,
-          // 高台 Phase 2E・PART N：Lighting Cue Export側でも通常Formation Export側と同じ
-          // optionを渡す（renderFormationExportToCanvas側で"audience"の時だけ使われる）。
-          showOccludedPerformerGhosts: exportShowOccludedPerformerGhosts,
         };
         if (exportFormat === "pdf") {
           // 17・30章：既存PDF出力（pdf-lib）を1Cue=1ページとしてそのまま再利用する。
@@ -15862,6 +17693,10 @@ export default function App() {
         highlightedPerformerId: exportHighlightSelectedPerformer && selectedIds.length === 1 ? selectedIds[0] : null,
         // 高台 Phase 1A・10-7章：通常Formation Exportの俯瞰図にも高台を反映する。
         platforms,
+        // Stage Connector Phase 1A・PART J：通常Formation Export（平面図）にも階段を反映する。
+        // buildLightingCueExportModels()側は変更していないため、Lighting Cue Exportには
+        // 渡らず影響しない（PART Q）。
+        stageConnectors,
       });
       if (models.length === 0) {
         setPngExportError("出力対象の構成が見つかりませんでした。");
@@ -15876,9 +17711,6 @@ export default function App() {
         // Export表示倍率 v1・PART G・H：viewModeがtop/audienceどちらでも同じ値を渡す
         // （renderFormationExportToCanvas側で両rendererへ共通して適用される）。
         displayScale: exportDisplayScale,
-        // 高台 Phase 2E・PART N：viewModeが"audience"の場合だけrenderFormationExportToCanvas側で
-        // 実際に使われる（"top"の場合はrenderOptionsに含めても無視される＝PART O）。
-        showOccludedPerformerGhosts: exportShowOccludedPerformerGhosts,
       };
 
       if (exportFormat === "pdf") {
@@ -17195,6 +19027,21 @@ export default function App() {
     [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
+  // Phase 3F-B: one existing commit changes mode/selection; auto preserves surfaceId.
+  const setLightingAreaSurfaceCommit = useCallback(
+    (areaId, selectedValue) => {
+      const patch = selectedValue === "__auto__"
+        ? { surfaceMode: "auto" }
+        : { surfaceMode: "manual", surfaceId: selectedValue || null };
+      commitWork((prev) => {
+        const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
+        if (!targetSlideId) return prev;
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "area", areaId, patch);
+      });
+    },
+    [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
+  );
+
   // width / height（サイドバーの数値/＋−操作。P章：v1ではドラッグリサイズは実装しない）。
   // I章：circleの場合はwidth/heightどちらを変更しても両方同じ値へ更新する。
   const setLightingAreaSizeCommit = useCallback(
@@ -17417,21 +19264,17 @@ export default function App() {
     [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
   );
 
-  // 高台 Phase 3A・PART I：Beamの「照射面」（targetSurfaceId）を手動で切り替えるcommit。
-  // 既存のcommitWork→applyActiveLightingUpdate経路をそのまま再利用し、新しいUndo機構は
-  // 作らない。selectedValue===""（＝UIの「通常舞台」選択）の場合はtargetSurfaceIdをnullへ
-  // 戻す。target.x/y/z・source・width・color・intensity・followPerformerId・logicalBeamId等の
-  // 他フィールドには一切触れない（PART I：targetSurfaceIdだけを更新）。auto surfaceのような
-  // モード概念（targetSurfaceMode）は追加しない（PART Y：常に明示選択のみ）。
+  // Phase 3F-A: one existing commit updates the mode and manual selection.
+  // Auto preserves the saved targetSurfaceId and target.z for subsequent manual use.
   const setLightingBeam3DTargetSurfaceCommit = useCallback(
     (beamId, selectedValue) => {
-      const normalized = selectedValue ? selectedValue : null;
+      const patch = selectedValue === "__auto__"
+        ? { targetSurfaceMode: "auto" }
+        : { targetSurfaceMode: "manual", targetSurfaceId: selectedValue || null };
       commitWork((prev) => {
         const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
         if (!targetSlideId) return prev;
-        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, {
-          targetSurfaceId: normalized,
-        });
+        return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, patch);
       });
     },
     [commitWork, activeLightingCueSelectionForEdit, isEditingNextFormationLightingBase]
@@ -17532,7 +19375,7 @@ export default function App() {
         const targetSlideId = resolveActiveLightingTargetSlideId(prev, isEditingNextFormationLightingBase);
         if (!targetSlideId) return prev;
         return applyActiveLightingUpdate(prev, targetSlideId, activeLightingCueSelectionForEdit, "beam3d", beamId, (b) => {
-          if (b.followPerformerId) return {}; // STEP4：追尾中は反転禁止（安全側no-op）
+          if (isLightingBeam3DDirectionFlipDisabled(b)) return {}; // Match the UI guard, including auto.
           return {
             source: { ...b.target },
             target: { ...b.source },
@@ -19171,6 +21014,100 @@ export default function App() {
     [commitWork]
   );
 
+  // 高台 Phase 1C・PART A・B：既存duplicateLightingArea()/duplicateLightingBeam3D()と全く同じ
+  // 思想（1回のcommitWork→sourceを取得→spread copy→新しいid→配列末尾へ追加）を再利用する。
+  // Lighting固有のlogicalAreaId/logicalBeamId（Formation/Cue間の論理的同一性を追跡するための
+  // 概念）はplatformには存在しない概念のため追加しない。x座標だけ小さくoffsetし
+  // （PART D：複製したことが視覚的に分かるように）、必ずclampPlatformGeometry()を通して
+  // stage外へはみ出さないようにする（既存の座標編集commitと同じ安全策）。name/height/
+  // width/depthはそのままコピーし、区別のため名前だけ「 コピー」を付与する（PART E：新しい
+  // name管理systemは作らない。既存の「pl.name || "高台"」というfallback表示パターンを
+  // そのまま複製名のベースにも使う）。
+  const duplicatePlatform = useCallback(
+    (platformId) => {
+      commitWork((prev) => {
+        const existing = getPlatforms(prev);
+        const source = existing.find((pl) => pl.id === platformId);
+        if (!source) return prev;
+        const baseName = typeof source.name === "string" && source.name.trim() ? source.name : "高台";
+        const duplicated = clampPlatformGeometry(prev.stage, {
+          ...source,
+          id: makeId("platform"),
+          name: `${baseName} コピー`,
+          x: (Number.isFinite(source.x) ? source.x : 0) + 0.5,
+        });
+        return { ...prev, platforms: [...existing, duplicated] };
+      });
+    },
+    [commitWork]
+  );
+
+  // Stage Connector Phase 1A・PART C・N：platformのadd/update/deleteと全く同じパターン。
+  // commitWork経由なので1操作=1 Undoになり、Undo/Redo engine本体には一切触れない。
+  const addStageConnector = useCallback(() => {
+    commitWork((prev) => {
+      const existing = getStageConnectors(prev);
+      const newConnector = createDefaultStageConnector(prev.stage, getPlatforms(prev), existing.length);
+      return { ...prev, stageConnectors: [...existing, newConnector] };
+    });
+  }, [commitWork]);
+
+  const updateStageConnectorCommit = useCallback(
+    (id, patch) => {
+      commitWork((prev) => ({
+        ...prev,
+        // clampStageConnectorGeometry()を通すことで、x/y/width/depthのどれを編集しても
+        // 矩形全体が必ずstage内に収まるようにする（clampPlatformGeometryと同じ考え方）。
+        // name/facing/fromSurfaceId/toSurfaceId等の非geometry fieldはここでは一切変更されない。
+        stageConnectors: getStageConnectors(prev).map((c) =>
+          c.id === id ? clampStageConnectorGeometry(prev.stage, { ...c, ...patch }) : c
+        ),
+      }));
+    },
+    [commitWork]
+  );
+  const updateStageConnectorLive = useCallback(
+    (id, patch) => {
+      updateWorkLive((prev) => ({
+        ...prev,
+        stageConnectors: getStageConnectors(prev).map((c) => (c.id === id ? { ...c, ...patch } : c)),
+      }));
+    },
+    [updateWorkLive]
+  );
+
+  const deleteStageConnector = useCallback(
+    (id) => {
+      commitWork((prev) => ({
+        ...prev,
+        stageConnectors: getStageConnectors(prev).filter((c) => c.id !== id),
+      }));
+    },
+    [commitWork]
+  );
+
+  // Stage Connector Phase 1C・PART A・C：duplicatePlatform()と全く同じ思想。fromSurfaceId/
+  // toSurfaceIdはspreadでそのままコピーされる（PART H：接続関係を自動で付け替えない）。
+  // platform側の複製とstairs側の複製は完全に独立した操作で、互いに連動しない（PART I）。
+  const duplicateStageConnector = useCallback(
+    (connectorId) => {
+      commitWork((prev) => {
+        const existing = getStageConnectors(prev);
+        const source = existing.find((c) => c.id === connectorId);
+        if (!source) return prev;
+        const baseName = typeof source.name === "string" && source.name.trim() ? source.name : "階段";
+        const duplicated = clampStageConnectorGeometry(prev.stage, {
+          ...source,
+          id: makeId("stageConnector"),
+          name: `${baseName} コピー`,
+          x: (Number.isFinite(source.x) ? source.x : 0) + 0.5,
+        });
+        return { ...prev, stageConnectors: [...existing, duplicated] };
+      });
+    },
+    [commitWork]
+  );
+
   // ==============================================================
   // Keyboard Editing v1 PART B：Delete / Backspaceによる削除（優先順位付きディスパッチ）
   // ==============================================================
@@ -19446,33 +21383,20 @@ export default function App() {
     [updateSlidePlacementsCommit, isTransitionActive]
   );
 
-  const returnToStage = (id) => {
-    const pos = placements[id];
-    if (!pos) return;
-    const halfW = stage.width / 2;
-    setPlacementCommit(id, clamp(pos.x, -halfW, halfW), clamp(pos.y, 0, stage.depth), true);
-  };
+  // Phase 3E: one selection action, one existing work commit. Selection is untouched.
+  const setSelectedPlacementSurfaceCommit = useCallback((mode, platformId) => {
+    if (isTransitionActive || selectedIds.length < 2) return;
+    updateSlidePlacementsCommit((prev, prevWork) => applySurfaceSettingToSelectedPlacements({
+      placements: prev, selectedIds, mode, platformId, platforms: getPlatforms(prevWork),
+    }));
+  }, [selectedIds, updateSlidePlacementsCommit, isTransitionActive]);
 
-  const returnAllToStage = () => {
-    if (isTransitionActive) return; // 再生中は座標入力を無効化
-    const halfW = stage.width / 2;
-    updateSlidePlacementsCommit((prev, prevWork) => {
-      const zonesNow = computeZones(prevWork.stage);
-      const next = { ...prev };
-      performers.forEach((p) => {
-        const pos = next[p.id];
-        if (pos && isBeyondAllAreas(pos, zonesNow)) {
-          next[p.id] = {
-            ...pos,
-            x: clamp(pos.x, -halfW, halfW),
-            y: clamp(pos.y, 0, stage.depth),
-            area: "stage",
-          };
-        }
-      });
-      return next;
-    });
-  };
+  // Stage Connector Phase 1H.2.1・PART F・G・W：旧「すべてステージ内に戻す」
+  // （returnAllToStage）・旧「ステージ内に戻す」（returnToStage）は、対応するUIボタンを
+  // 削除した後、reference auditの結果どこからも呼ばれなくなったことを確認したため削除した。
+  // 範囲外配置はPhase 1H.2以降ユーザーの意図した状態として正式に許容されるため、一括／個別の
+  // 強制補正は行わない。performerを戻す方法はdrag・X/Y入力・area変更・Undoとして既に存在する
+  // （PART V：新しい代替buttonは追加しない）。
 
   // 選択中の複数出演者を、つかんだ人からの相対移動量(dx, dy)を保ったまま一括移動する。
   // TopView から呼ばれ、ドラッグ中は常に見た目だけの更新（履歴を増やさない）。
@@ -20390,6 +22314,21 @@ export default function App() {
     });
     restoreMusicForProject(newProject);
     setProjectMenuOpen(false);
+    // 右編集パネル初期開閉状態（新規Project作成時のみ・新規）：これらはwork（Undo/Redo対象）
+    // には含まれないUI専用stateのため、上記のresetWork/setWorkspaceだけでは変化しない
+    // （＝直前に開いていたProjectの開閉状態をそのまま引き継いでしまう）。switchProject()は
+    // 意図的にこれらへ触れない（既存Projectを切り替えるたびに強制リセットしないため）のに対し、
+    // 「＋ 新しいプロジェクト」だけは新規作品の初回案内として毎回同じ開閉状態から始めたいため、
+    // ここでだけ明示的に設定する。Undo/Redo履歴（commitWork等）は一切通さない。
+    setGlobalSettingsOpen(true);
+    setStageSettingsOpen(true);
+    setSlideSettingsOpen(true);
+    setPlatformsSectionOpen(false);
+    setStageConnectorsSectionOpen(false);
+    setMusicSettingsOpen(false);
+    setLightingSettingsOpen(false);
+    setLightingAreaSectionOpen(false);
+    setLightingBeam3DSectionOpen(false);
   }, [isTransitionActive, workspace.projects.length, stopRuntimeForProjectSwitch, resetWork, work, restoreMusicForProject]);
 
   // 現在Projectの複製（deep copy）。JSON.parse(JSON.stringify(...))は、work内が
@@ -20695,8 +22634,8 @@ export default function App() {
           <button
             onClick={toggleHelp}
             aria-pressed={helpOpen}
-            title="ヘルプを表示／非表示"
-            aria-label="ヘルプを表示／非表示"
+            title="使い方を表示／非表示"
+            aria-label="使い方を表示／非表示"
             style={{
               background: helpOpen ? THEME.accent : THEME.panelBg2,
               color: helpOpen ? "#141318" : THEME.text,
@@ -20704,7 +22643,7 @@ export default function App() {
             }}
             className="px-3 py-1.5 rounded-lg text-sm font-bold"
           >
-            ？ ヘルプ
+            📖 使い方
           </button>
           <button
             onClick={toggleSidebar}
@@ -20789,16 +22728,6 @@ export default function App() {
                   onChange={(e) => setShowWaitingInOverhead(e.target.checked)}
                 />
                 待機中の出演者もこのビューに表示する
-              </label>
-            )}
-            {viewMode === "front" && (
-              <label className="flex items-center gap-1.5 cursor-pointer select-none" title="高台の下・後ろ・横に隠れている出演者を、薄い点線のゴーストとして確認します">
-                <input
-                  type="checkbox"
-                  checked={showOccludedPerformerGhosts}
-                  onChange={(e) => setShowOccludedPerformerGhosts(e.target.checked)}
-                />
-                高台裏をゴースト表示
               </label>
             )}
             <label className="flex items-center gap-1.5 cursor-pointer select-none" title="現在の構成を基準にした移動軌跡を表示します">
@@ -21003,6 +22932,7 @@ export default function App() {
             onFitStage={() => activeViewRef.current && activeViewRef.current.fitStage()}
             onFitSelected={() => activeViewRef.current && activeViewRef.current.fitSelected()}
             selectedDisabled={selectedIds.length === 0}
+            outOfRangeCount={outOfRangeCount}
           />
 
           <div
@@ -21031,6 +22961,7 @@ export default function App() {
                 performers={performers}
                 placements={displayPlacementsWithScrub}
                 platforms={platforms}
+                stageConnectors={stageConnectors}
                 selectedIds={selectedIds}
                 onSelect={selectOnly}
                 onToggleSelect={toggleSelect}
@@ -21087,14 +23018,15 @@ export default function App() {
                 onToggleSelect={toggleSelect}
                 overlapIds={overlapIds}
                 showWaiting={showWaitingInOverhead}
-                showOccludedPerformerGhosts={showOccludedPerformerGhosts}
                 viewState={activeViewState}
                 onViewStateChange={handleViewStateChange}
                 width={containerSize.width}
                 height={containerSize.height}
                 locked={isTransitionActive || presentationMode}
                 transitionPaths={transitionPaths}
+                trajectorySource={audienceTrajectorySource}
                 platforms={platforms}
+                stageConnectors={stageConnectors}
                 floorColorKey={stageAppearance.floorColor}
                 backdropColorKey={stageAppearance.backdropColor}
                 lightingAreas={effectiveLightingAreas}
@@ -21275,23 +23207,13 @@ export default function App() {
             markersInteractive={!isTransitionActive}
           />
 
-          {/* 警告バー */}
-          {(overlapIds.size > 0 || outOfRangeCount > 0) && (
+          {/* 警告バー：位置の重なりだけを扱う（Stage Connector Phase 1H.2.1・PART F・L：
+              範囲外(out-of-bounds)の告知は、layoutを押し広げない小さなstatusへ移行し
+              （ZoomToolbar側のoutOfRangeCount表示を参照）、この専用<div>ブロックからは
+              完全に外した。重なり警告はスコープ外のため既存のまま無変更。 */}
+          {overlapIds.size > 0 && (
             <div className="mt-3 flex flex-wrap items-center gap-3 text-sm shrink-0" style={{ color: THEME.danger }}>
-              {overlapIds.size > 0 && <span>⚠ 位置が重なっている出演者がいます</span>}
-              {outOfRangeCount > 0 && (
-                <span className="flex items-center gap-2">
-                  ⚠ ステージ・袖・待機エリアの外側に出ている出演者が {outOfRangeCount} 人います
-                  <button
-                    onClick={returnAllToStage}
-                    disabled={isTransitionActive}
-                    style={{ background: THEME.accent, color: "#141318", opacity: isTransitionActive ? 0.5 : 1 }}
-                    className="px-2 py-0.5 rounded font-bold text-xs"
-                  >
-                    すべてステージ内に戻す
-                  </button>
-                </span>
-              )}
+              <span>⚠ 位置が重なっている出演者がいます</span>
             </div>
           )}
           </>
@@ -21499,9 +23421,10 @@ export default function App() {
             ステージ領域を最大限広く使う）。 */}
         {!presentationMode && (
         <aside className="slsim-sidebar">
-          {/* Manual v1：ヘッダーの「？ ヘルプ」で開閉。ステージのサイズには影響しない。
-              helpOpenの条件・サイドバー内の表示位置は既存のまま維持し、中身だけを
-              「アプリ概要／はじめての方へ／機能から探す／ショートカット」の新Manualへ置き換える。 */}
+          {/* Help v2：ヘッダーの「📖 使い方」（旧「？ ヘルプ」）で開閉。ステージのサイズには
+              影響しない。helpOpenの条件・サイドバー内の表示位置・開閉ロジックは既存のまま
+              流用し、中身だけを「アプリ概要／🌱 はじめての方へ／✨ やりたいことから探す／
+              🔍 機能から探す／⌨️ ショートカット」の4層構造へ整理する。 */}
           {helpOpen && (
             <HelpManual
               sectionsOpen={helpManualSectionsOpen}
@@ -21655,9 +23578,17 @@ export default function App() {
                       onChange={(e) => updatePlatformLive(pl.id, { name: e.target.value })}
                       onBlur={endEdit}
                       onKeyDown={commitOnEnter}
-                      style={inputStyle}
-                      className="flex-1 rounded px-2 py-1 text-sm"
+                      style={{ ...inputStyle, minWidth: 0 }}
+                      className="flex-1 min-w-0 rounded px-2 py-1 text-sm"
                     />
+                    <button
+                      type="button"
+                      onClick={() => duplicatePlatform(pl.id)}
+                      style={{ background: THEME.panelBg, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                      className="rounded-lg px-2 py-1 text-xs font-bold shrink-0"
+                    >
+                      複製
+                    </button>
                     <button
                       type="button"
                       onClick={() => deletePlatform(pl.id)}
@@ -21714,7 +23645,6 @@ export default function App() {
                     max={PLATFORM_MAX_HEIGHT}
                     step={PLATFORM_HEIGHT_STEP}
                     allowDecimal
-                    suffix={`= ${pl.height * UNIT_CM}cm`}
                     onCommit={(v) => updatePlatformCommit(pl.id, { height: v })}
                   />
                 </div>
@@ -21726,6 +23656,165 @@ export default function App() {
                 className="w-full rounded-lg py-1.5 text-xs font-bold"
               >
                 ＋ 高台を追加
+              </button>
+            </div>
+          </section>
+          </CollapsibleGroup>
+
+          {/* Stage Connector Phase 1A・PART C：「高台・段差」と全く同じnested CollapsibleGroup
+              パターンを再利用する。今回はstairsのみ（typeは選ばせない）。canvas上のドラッグ・
+              リサイズ・回転ハンドルは作らず、高台と同じくside panel数値入力中心にする。
+              初期状態は高台と同じく閉じる。 */}
+          <CollapsibleGroup
+            title="階段"
+            icon="🪜"
+            open={stageConnectorsSectionOpen}
+            onToggle={() => setStageConnectorsSectionOpen((v) => !v)}
+            nested
+          >
+          <section>
+            <SectionTitle>階段</SectionTitle>
+            <div className="flex flex-col gap-2 mt-2">
+              {stageConnectors.length === 0 && (
+                <p style={{ color: THEME.textDim }} className="text-xs">階段はまだありません</p>
+              )}
+              {stageConnectors.map((connector, idx) => (
+                <div
+                  key={connector.id}
+                  style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}` }}
+                  className="rounded-lg p-2 flex flex-col gap-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={connector.name || ""}
+                      placeholder={`階段${idx + 1}`}
+                      onFocus={beginEdit}
+                      onChange={(e) => updateStageConnectorLive(connector.id, { name: e.target.value })}
+                      onBlur={endEdit}
+                      onKeyDown={commitOnEnter}
+                      style={{ ...inputStyle, minWidth: 0 }}
+                      className="flex-1 min-w-0 rounded px-2 py-1 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => duplicateStageConnector(connector.id)}
+                      style={{ background: THEME.panelBg, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                      className="rounded-lg px-2 py-1 text-xs font-bold shrink-0"
+                    >
+                      複製
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteStageConnector(connector.id)}
+                      style={{ background: THEME.panelBg, border: `1px solid ${THEME.danger}`, color: THEME.danger }}
+                      className="rounded-lg px-2 py-1 text-xs font-bold shrink-0"
+                    >
+                      削除
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <DraftNumberField
+                      label="X"
+                      value={connector.x}
+                      min={zones.stageLeft.xMin + connector.width / 2}
+                      max={zones.stageRight.xMax - connector.width / 2}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updateStageConnectorCommit(connector.id, { x: v })}
+                    />
+                    <DraftNumberField
+                      label="Y"
+                      value={connector.y}
+                      min={connector.depth / 2}
+                      max={zones.upstageBackstage.yMax - connector.depth / 2}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updateStageConnectorCommit(connector.id, { y: v })}
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <DraftNumberField
+                      label="横幅"
+                      value={connector.width}
+                      min={STAGE_CONNECTOR_MIN_SIZE}
+                      max={stage.width}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updateStageConnectorCommit(connector.id, { width: v })}
+                    />
+                    <DraftNumberField
+                      label="奥行"
+                      value={connector.depth}
+                      min={STAGE_CONNECTOR_MIN_SIZE}
+                      max={stage.depth}
+                      step={0.5}
+                      allowDecimal
+                      onCommit={(v) => updateStageConnectorCommit(connector.id, { depth: v })}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">上る方向</label>
+                    <select
+                      value={getStageConnectorFacing(connector)}
+                      onChange={(e) => updateStageConnectorCommit(connector.id, { facing: e.target.value })}
+                      style={inputStyle}
+                      className="w-full rounded px-2 py-1 text-sm"
+                    >
+                      {STAGE_CONNECTOR_FACINGS.map((f) => (
+                        <option key={f} value={f}>
+                          {STAGE_CONNECTOR_FACING_LABELS[f]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {/* PART D：通常舞台/高台Nのselect。既存placement舞台面selectと同じ
+                      「現在のplatforms内に実在するIDだけを有効値として解決し、削除済みIDが
+                      残っていてもクラッシュせず安全に『通常舞台』表示にする」パターンを再利用する。
+                      UIを開いただけでは一切onChangeが発火しないため、データを書き換えない。
+                      今回はheight resolve・performer z・遮蔽・Lighting等へは一切接続しない
+                      （表示・構造情報としてのみ保持＝PART M）。 */}
+                  <div className="flex items-center gap-2">
+                    <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">接続元</label>
+                    <select
+                      value={platforms.some((pl) => pl.id === connector.fromSurfaceId) ? connector.fromSurfaceId : ""}
+                      onChange={(e) => updateStageConnectorCommit(connector.id, { fromSurfaceId: e.target.value || null })}
+                      style={inputStyle}
+                      className="w-full rounded px-2 py-1 text-sm"
+                    >
+                      <option value="">通常舞台</option>
+                      {platforms.map((pl) => (
+                        <option key={pl.id} value={pl.id}>
+                          {pl.name || "高台"}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">接続先</label>
+                    <select
+                      value={platforms.some((pl) => pl.id === connector.toSurfaceId) ? connector.toSurfaceId : ""}
+                      onChange={(e) => updateStageConnectorCommit(connector.id, { toSurfaceId: e.target.value || null })}
+                      style={inputStyle}
+                      className="w-full rounded px-2 py-1 text-sm"
+                    >
+                      <option value="">通常舞台</option>
+                      {platforms.map((pl) => (
+                        <option key={pl.id} value={pl.id}>
+                          {pl.name || "高台"}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addStageConnector}
+                style={{ background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }}
+                className="w-full rounded-lg py-1.5 text-xs font-bold"
+              >
+                ＋ 階段を追加
               </button>
             </div>
           </section>
@@ -22803,6 +24892,7 @@ export default function App() {
             {isMultiSelect && (() => {
               const areaSet = new Set(selectedIds.map((id) => (placements[id] ? placements[id].area : null)));
               const commonArea = areaSet.size === 1 ? [...areaSet][0] : "";
+              const commonSurface = getSelectedPlacementSurfaceValue(placements, selectedIds, platforms);
               const selectedXs = new Set(selectedIds.map((id) => (placements[id] ? placements[id].x : null)));
               const selectedYs = new Set(selectedIds.map((id) => (placements[id] ? placements[id].y : null)));
               const commonX = selectedXs.size === 1 ? [...selectedXs][0] : null;
@@ -22880,6 +24970,32 @@ export default function App() {
                         <span style={{ color: THEME.textDim }} className="text-[11px]">（複数の値）</span>
                       )}
                     </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="bulk-performer-surface" style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">舞台面</label>
+                    <select
+                      id="bulk-performer-surface"
+                      aria-label="選択中の出演者の舞台面"
+                      value={commonSurface}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        if (!value) return;
+                        setSelectedPlacementSurfaceCommit(
+                          value === "__auto__" ? "auto" : "manual",
+                          value === "__auto__" || value === "__stage__" ? null : value
+                        );
+                      }}
+                      disabled={isTransitionActive}
+                      style={inputStyle}
+                      className="w-full rounded px-2 py-1 text-sm"
+                    >
+                      <option value="" disabled>混在</option>
+                      <option value="__auto__">自動</option>
+                      <option value="__stage__">通常舞台</option>
+                      {platforms.map((pl, index) => (
+                        <option key={pl.id} value={pl.id}>{pl.name || `高台${index + 1}`}</option>
+                      ))}
+                    </select>
                   </div>
                   {/* 姿勢 v1：現在の構成に限り、選択中の全員へまとめて反映する（1回のcommitWork＝Undo 1件）。
                       将来の身長3段階化に備え、身長ボタン列と同じ幅感のシンプルな2択に留める。 */}
@@ -23358,19 +25474,11 @@ export default function App() {
                   </select>
                 </div>
 
-                {isBeyondAllAreas(selectedPos, zones) && (
-                  <div style={{ color: THEME.danger }} className="text-xs flex items-center justify-between gap-2">
-                    <span>⚠ ステージ・袖・待機エリアの外側です</span>
-                    <button
-                      onClick={() => returnToStage(selectedPerformer.id)}
-                      disabled={isTransitionActive}
-                      style={{ background: THEME.danger, color: "#141318", opacity: isTransitionActive ? 0.5 : 1 }}
-                      className="px-2 py-1 rounded font-bold"
-                    >
-                      ステージ内に戻す
-                    </button>
-                  </div>
-                )}
+                {/* Stage Connector Phase 1H.2.1・PART H：個別panel側の範囲外warning行
+                    （「ステージ内に戻す」ボタン含む）は削除した。panel高さが範囲内/範囲外で
+                    変化しないようにするため。範囲外かどうかはToolbar側の小さなstatus
+                    （⚠ 範囲外 N人）で十分把握できる（PART I：warningから特定performerへの
+                    自動focus機能も追加しない）。 */}
                 {overlapIds.has(selectedPerformer.id) && (
                   <div style={{ color: THEME.danger }} className="text-xs">⚠ 他の出演者と位置が重なっています</div>
                 )}
@@ -24729,6 +26837,34 @@ export default function App() {
                             </div>
                           )}
 
+                          {/* Phase 3F-B: auto derives height from the current center; manual keeps explicit selection. */}
+                          <div className="flex items-center gap-2">
+                            <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">
+                              照射面
+                            </label>
+                            <select
+                              value={
+                                getLightingAreaSurfaceMode(selectedLightingArea) === "auto"
+                                  ? "__auto__"
+                                  : platforms.some((pl) => pl.id === getLightingAreaSurfaceId(selectedLightingArea))
+                                  ? selectedLightingArea.surfaceId
+                                  : ""
+                              }
+                              onChange={(e) => setLightingAreaSurfaceCommit(selectedLightingArea.id, e.target.value)}
+                              aria-label="照明エリアの照射面"
+                              style={inputStyle}
+                              className="w-full rounded px-2 py-1.5 text-xs font-bold"
+                            >
+                              <option value="__auto__">自動</option>
+                              <option value="">通常舞台</option>
+                              {platforms.map((pl, idx) => (
+                                <option key={pl.id} value={pl.id}>
+                                  {pl.name || `高台${idx + 1}`}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
                           {/* Lighting個別コピー v2・G・P章：「複製」＝同一Formation内で即座に
                               増やす、「コピー」＝別Formationへ持っていくためclipboardへ保存、
                               という役割の違いをボタン文言で明確にする。コピー中（このAreaが
@@ -25021,22 +27157,31 @@ export default function App() {
                                 targetSurfaceIdが現在のplatforms内に存在しない場合（削除済み等）
                                 は、データを書き換えずUI上だけ「通常舞台」へ安全にfallbackする
                                 （PART J：migrationはしない）。target x/yを高台外へドラッグしても
-                                この選択は自動で変わらない（PART Y：auto surfaceは実装しない）。 */}
+                                この選択は自動で変わらない（PART Y：auto surfaceは実装しない）。
+                                高台 Phase 3B・PART F：追尾中（followPerformerIdあり）はこのselect
+                                をdisabledにする。追尾中は出演者自身の舞台面が自動優先され
+                                （PART B）、このselectの値を変えても現在表示には反映されない
+                                ため。ただしselect自体・保存値（targetSurfaceId）は削除せず、
+                                追尾解除時にそのまま有効へ戻る（PART E・G）。 */}
                             <div className="flex items-center gap-2">
                               <label style={{ color: THEME.textDim }} className="text-xs w-16 shrink-0">
                                 照射面
                               </label>
                               <select
                                 value={
-                                  platforms.some((pl) => pl.id === getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D))
+                                  getLightingBeam3DTargetSurfaceMode(selectedLightingBeam3D) === "auto"
+                                    ? "__auto__"
+                                    : platforms.some((pl) => pl.id === getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D))
                                     ? selectedLightingBeam3D.targetSurfaceId
                                     : ""
                                 }
                                 onChange={(e) => setLightingBeam3DTargetSurfaceCommit(selectedLightingBeam3D.id, e.target.value)}
+                                disabled={!!selectedLightingBeam3D.followPerformerId}
                                 aria-label="照明ビームの照射面"
                                 style={inputStyle}
                                 className="w-full rounded px-2 py-1.5 text-xs font-bold"
                               >
+                                <option value="__auto__">自動</option>
                                 <option value="">通常舞台</option>
                                 {platforms.map((pl, idx) => (
                                   <option key={pl.id} value={pl.id}>
@@ -25045,6 +27190,11 @@ export default function App() {
                                 ))}
                               </select>
                             </div>
+                            {selectedLightingBeam3D.followPerformerId && (
+                              <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                                追尾中は出演者の舞台面に自動追従します
+                              </div>
+                            )}
                           </div>
 
                           <div>
@@ -25325,9 +27475,9 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => flipLightingBeam3DDirectionCommit(selectedLightingBeam3D.id)}
-                              disabled={!!selectedLightingBeam3D.followPerformerId || !!getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D)}
+                              disabled={isLightingBeam3DDirectionFlipDisabled(selectedLightingBeam3D)}
                               style={
-                                selectedLightingBeam3D.followPerformerId || getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D)
+                                isLightingBeam3DDirectionFlipDisabled(selectedLightingBeam3D)
                                   ? { background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, color: THEME.textDim, opacity: 0.5 }
                                   : { background: THEME.panelBg2, border: `1px solid ${THEME.border}`, color: THEME.text }
                               }
@@ -25337,12 +27487,12 @@ export default function App() {
                             </button>
                             {selectedLightingBeam3D.followPerformerId && (
                               <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
-                                追尾を解除すると入れ替えられます
+                                追尾を解除し、照射面を通常舞台にすると入れ替えられます
                               </div>
                             )}
-                            {!selectedLightingBeam3D.followPerformerId && getLightingBeam3DTargetSurfaceId(selectedLightingBeam3D) && (
+                            {!selectedLightingBeam3D.followPerformerId && isLightingBeam3DDirectionFlipDisabled(selectedLightingBeam3D) && (
                               <div style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
-                                高台照射を通常舞台に戻すと入れ替えられます
+                                照射面を通常舞台にすると入れ替えられます
                               </div>
                             )}
                           </div>
@@ -25412,6 +27562,8 @@ export default function App() {
           別々の入口のため）。 */}
       {(slideListOpen || exportSlidePickerOpen) && (
         <SlideListModal
+          stageConnectors={stageConnectors}
+          platforms={platforms}
           mode={exportSlidePickerOpen ? "export-selection" : "normal"}
           slides={slides}
           performers={performers}
@@ -25476,9 +27628,6 @@ export default function App() {
           onShowLightingTrackingPathsChange={setExportShowLightingTrackingPaths}
           showPerformerNames={exportShowPerformerNames}
           onShowPerformerNamesChange={setExportShowPerformerNames}
-          showOccludedPerformerGhosts={exportShowOccludedPerformerGhosts}
-          onShowOccludedPerformerGhostsChange={setExportShowOccludedPerformerGhosts}
-          showOccludedPerformerGhostsVisible={resolveExportRenderViewMode() === "audience"}
           showMusicTime={exportShowMusicTime}
           onShowMusicTimeChange={setExportShowMusicTime}
           highlightSelectedPerformer={exportHighlightSelectedPerformer}
@@ -25666,72 +27815,249 @@ function CollapsibleGroup({ title, icon, open, onToggle, children, nested = fals
 }
 
 // ------------------------------------------------------------------
-// Manual v1（初見ユーザー向けヘルプ）
+// Help v2（初見ユーザー向けHelp・使い方）
 // ------------------------------------------------------------------
-// ヘッダーの「？ ヘルプ」（helpOpen）を入口とする簡易マニュアル。
-// 「アプリ概要」「はじめての方へ」（常時展開・Manualの主役）「機能から探す」（accordion）
-// 「ショートカット」の4階層構成。ここに書く内容はすべて最新App.jsxの実装を調査して
-// 確定したものであり、未実装の機能（AI関連・Playback強化・自動チェック等）は含めない。
-// 既存Formation/Project/Playback/Music/Lighting/Export等のengineには一切触れない、
-// 表示専用の静的コンテンツ。
+// ヘッダーの「📖 使い方」（helpOpen、旧「？ ヘルプ」から文言のみ変更・開閉ロジックは
+// 既存のまま流用）を入口とする簡易マニュアル。「アプリ概要」に続けて、
+// 「🌱 はじめての方へ」（常時展開・主役）「✨ やりたいことから探す」（新規・常時展開、
+// 中の各項目はaccordion）「🔍 機能から探す」（accordion・中の各項目もaccordion）
+// 「⌨️ ショートカット」の4層構成。ここに書く内容はすべて最新App.jsxの実装を調査して
+// 確定したものであり、未実装の機能（AI関連・Playback強化・自動チェック・動画/GIF等）は
+// 含めない。既存Formation/Project/Playback/Music/Lighting/Export等のengineには
+// 一切触れない、表示専用の静的コンテンツ。
 
-// 「はじめての方へ」：作業順（1〜7）だけを短く示す。全機能の説明はしない。
+// 「はじめての方へ」冒頭の導入文（Help v2・新規、Help v2.2で内容整理）。番号付き手順の前に置く短い前置き。
+const HELP_MANUAL_GETTING_STARTED_INTRO = [
+  "まずは出演者を置いて、2つの構成を作り、動かしてみるのがおすすめです。高台・階段や音楽・照明などの機能は、必要になったときに追加できます。",
+];
+
+// 「はじめての方へ」：作業順（1〜7）だけを短く示す。全機能の説明はしない（Help v2で内容更新）。
 const MANUAL_GETTING_STARTED_STEPS = [
   {
-    title: "1. ステージを設定",
+    title: "1. ステージの大きさを決める",
     lines: [
-      "「全体の設定 → ステージ設定」で舞台の幅・奥行を設定します。",
-      "1マス＝90cmです。舞台上の位置を確認するための目盛り（バミリ）として使用できます。",
+      "「全体の設定 → ステージ設定」で、舞台の幅と奥行を設定します。",
+      "1マスは90cmです。劇場の舞台図面に合わせて設定すると、実際の舞台に近い配置を作れます。",
     ],
   },
   {
-    title: "2. 出演者を配置",
+    title: "2. 出演者を追加する",
     lines: [
-      "「出演者の追加」から出演者を追加し、平面図上でドラッグして配置します。",
-      "位置は0.25マス単位で設定できます。",
-      "出演者ごとに番号・名前・色・身長を設定できます。",
+      "「出演者を追加」から出演者を作ります。",
+      "平面図上でドラッグして、立ち位置を決めます。俯瞰客席ビューでは、客席から見た高さや重なり方を確認できます。",
+      "名前・色・身長なども設定できます。",
     ],
   },
   {
-    title: "3. 音楽を設定",
+    title: "3. 最初の構成を作る",
     lines: [
-      "使用する音源を読み込み、楽曲セクションごとにBPMを設定します。",
-      "BPMは自動解析されないため、数値を手動で設定してください。",
-      "曲中でBPMやカウントの基準が変わる場合は、「楽曲セクション」を追加して区間ごとに設定します。",
+      "出演者を配置した状態が「構成」になります。",
+      "立ち位置だけでなく、立ち／片膝などの姿勢も構成ごとに設定できます。",
     ],
   },
   {
-    title: "4. 構成を作成",
+    title: "4. 次の構成を追加する",
     lines: [
-      "出演者を配置したら、次の構成を追加します。",
-      "各構成では、出演者の位置と姿勢（立ち／片膝）を個別に設定できます。",
+      "画面下の「＋」から次の構成を作り、出演者を次の位置へ動かします。",
+      "再生すると、現在の構成から次の構成までの移動を確認できます。",
     ],
   },
   {
-    title: "5. キープ・移動時間を設定",
+    title: "5. 移動の速さや経路を調整する",
     lines: [
-      "各構成の「キープ」と、次の構成までの「移動時間」を設定します。",
-      "必要に応じて出演者ごとの移動経路も編集できます。",
+      "「移動時間」で、次の構成へ移動するカウント数を設定します。",
+      "必要に応じて移動軌跡を表示したり、直線ではなく曲線で移動させたりできます。",
     ],
   },
   {
-    title: "6. 音楽位置を合わせる",
+    title: "6. 必要なら音楽を読み込む",
     lines: [
-      "各構成が音楽上のどこに対応するかを「音楽位置」で設定します。",
-      "基準位置を手動で設定すると、以降はキープ・移動時間から自動計算できます。",
+      "画面下の「ファイルを選択」から音源を読み込みます。",
+      "BPMや各構成の音楽位置を設定すると、音楽と構成を合わせて再生できます。",
     ],
   },
   {
-    title: "7. 再生して確認",
+    title: "7. 確認・共有する",
     lines: [
-      "通常再生と音楽同期再生で、構成と移動を確認できます。",
-      "平面図・俯瞰客席ビューの切り替え、プレゼンモードも利用できます。",
+      "「プレゼン」では編集画面を隠して構成を見せられます。",
+      "「出力」からは、平面図や俯瞰客席ビューをPNG・PDFにできます。",
+    ],
+  },
+];
+
+// 「やりたいことから探す」（Help v2・新規）：機能名ではなく「何をしたいか」を入口にした
+// リファレンス。各項目はparagraphs（本文段落）＋useCases（「こんなときに使います」の
+// 箇条書き・無い項目も可）を持つ。「機能から探す」と役割が重ならないよう、こちらは
+// 目的から関連機能への導線に徹する（詳細な操作一覧は「機能から探す」側に残す）。
+// Help v2.1（新規）：先頭に音楽2項目を追加し、「舞台全体を色で照らしたい」は
+// Lighting全体の入口となる「💡 照明を当てたい」へ置き換えた。既存項目の本文は
+// この置換以外は変更していない（並び順のみ変更）。
+const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
+  {
+    key: "want_musicSync",
+    icon: "🎵",
+    title: "音楽に合わせて構成を作りたい",
+    paragraphs: [
+      "音源を読み込むと、曲を流しながら構成のキープや移動を確認できます。",
+      "BPMを設定すると、「この構成を8カウント見せる」「次の位置まで4カウントで移動する」といった設定を、実際の音楽の速さに合わせて再生できます。",
+      "BPMは、使っている楽曲に合わせて設定してください。曲の途中で別の楽曲に切り替わったり、テンポが変わったりする場合は、「楽曲セクション」を追加して、その区間ごとにBPMを設定できます。",
+      "BPMは自動では決まらないため、それぞれの楽曲に合った数値を入力してください。",
+    ],
+    useCases: [
+      "実際の曲を流しながらフォーメーションを確認したい",
+      "「8カウントキープ → 4カウント移動」のように振付の時間を管理したい",
+      "BPMの違う複数の楽曲をつないだ音源で構成を作りたい",
+      "曲のどの部分でどの構成になるのか確認したい",
+    ],
+  },
+  {
+    key: "want_musicPosition",
+    icon: "⏱",
+    title: "構成と曲の位置を合わせたい",
+    paragraphs: [
+      "各構成の「音楽位置」を設定すると、その構成が曲の何分何秒あたりに対応するのかを決められます。",
+      "最初の構成など、基準にしたい場所の音楽位置を設定すると、そのあとの構成は「キープ」と「移動時間」から自動で音楽位置がつながっていきます。",
+      "途中から曲の別の場所に合わせ直したいときは、「手動に固定」で新しい基準位置を作れます。",
+      "💡 たとえば「この構成はサビの頭から8カウント」「そこから4カウントで次の構成へ」と設定していくと、後ろの構成も曲の時間に沿ってつながっていきます。",
+    ],
+  },
+  {
+    key: "want_platformStairs",
+    icon: "🧱",
+    title: "高台・階段を作りたい",
+    paragraphs: [
+      "「全体の設定 → 高台・段差」から高台を追加できます。",
+      "高台は、位置・大きさ・高さを設定できます。",
+      "高台へ上がる階段は「階段」から追加します。",
+      "階段の位置と大きさを決めたら、どちら側から上る階段なのかと、どの舞台面とどの舞台面をつなぐのかを設定します。",
+      "たとえば、通常の舞台から高さ4の高台へ上がる場合は、階段の片側を「通常舞台」、もう片側をその高台にします。",
+      "出演者の高さを1段ずつ設定する必要はありません。",
+      "出演者の「舞台面」を「自動」にしておけば、階段の上を通ると位置に合わせて少しずつ高くなり、高台に着くと高台の高さになります。",
+    ],
+    useCases: [
+      "舞台セットの高台を再現したい",
+      "階段を上りながら移動する振付を確認したい",
+      "客席から出演者がどのように見えるか確認したい",
+    ],
+  },
+  {
+    key: "want_performerOnPlatform",
+    icon: "🪜",
+    title: "出演者を高台へ乗せたい",
+    paragraphs: [
+      "高台を作ったあと、出演者を高台の上へ移動します。",
+      "通常は、出演者の「舞台面」を「自動」にしておくのがおすすめです。",
+      "「自動」では、出演者がいる位置を見て、通常舞台・高台・階段のどこにいるかを自動で判断します。",
+      "特定の高台に固定したい場合は、「舞台面」からその高台を直接選ぶこともできます。",
+    ],
+  },
+  {
+    key: "want_lightingIntro",
+    icon: "💡",
+    title: "照明を当てたい",
+    paragraphs: [
+      "「照明の設定」では、舞台に照明を追加して、構成と一緒に見え方を確認できます。",
+      "照明には、大きく分けて2つあります。",
+      "照明エリア：舞台上の範囲を、色や明るさをつけて照らします。舞台全体を青くしたり、特定のエリアだけ色を変えたりするときに使います。",
+      "照明ビーム：ライトの発光元から照射先へ、光の筋を表示します。スポットライトを当てたり、出演者をライトで追いかけたりするときに使います。",
+      "まずは「照明エリア」と「照明ビーム」のどちらがやりたいことに近いか選んで追加してみてください。",
+    ],
+  },
+  {
+    key: "want_spotlight",
+    icon: "🔦",
+    title: "スポットライトを当てたい",
+    paragraphs: [
+      "「照明の設定」を開き、「照明ビーム」を追加します。",
+      "発光元はライトが置かれている位置、照射先はライトを当てたい位置です。",
+      "平面図では発光元と照射先を動かして位置を決められ、俯瞰客席ビューではライトがどのように見えるか確認できます。",
+      "色・明るさ・光の太さ・高さも調整できます。",
+    ],
+    useCases: [
+      "センターにスポットライトを当てたい",
+      "高台の上だけを照らしたい",
+      "出演者が登場する場所を目立たせたい",
+    ],
+  },
+  {
+    key: "want_trackingLight",
+    icon: "🎯",
+    title: "ライトを出演者に追尾させたい",
+    paragraphs: [
+      "照明ビームの「追尾する出演者」を選ぶと、ライトの照射先がその出演者についていきます。",
+      "出演者が移動するとライトも一緒に動きます。",
+      "高台へ上がったり階段を上り下りしたりするときも、出演者の高さに合わせてライトが追いかけます。",
+      "「追尾スポット軌跡」を表示すると、ライトがどの経路を追うかも確認できます。",
+    ],
+  },
+  {
+    key: "want_lightingCueTiming",
+    icon: "⏱",
+    title: "曲の途中で照明を変えたい",
+    paragraphs: [
+      "1つの構成の途中でも、好きなカウントで照明を変えられます。",
+      "たとえば、構成1の最初 → 舞台を青くする、4カウント目 → センターのスポットライトを点ける、8カウント目 → 舞台を赤くする、といった設定ができます。",
+      "この「照明を切り替えるタイミング」が照明キューです。",
+      "「キープ中」は、出演者がその構成にとどまっている間の照明変化です。「移動中」は、次の構成へ移動している間の照明変化です。",
+      "たとえば、ポーズを8カウントキープしている途中でライトを点けるのは「キープ中」、次の立ち位置へ移動している途中で色を変えるのは「移動中」と考えると分かりやすいです。",
+    ],
+  },
+  {
+    key: "want_lightingFade",
+    icon: "🌓",
+    title: "照明をゆっくり変えたい",
+    paragraphs: [
+      "照明キューを切り替えた瞬間にパッと変えるだけでなく、何カウントかかけてゆっくり変えることもできます。",
+      "たとえば、明るさを0から100へ少しずつ上げる、スポットライトをゆっくり消す、といった変化には「フェード」を使います。",
+      "フェードのカウント数を設定すると、その時間を使って明るさが変化します。",
+    ],
+  },
+  {
+    key: "want_lightingMove",
+    icon: "🚶",
+    title: "ライトそのものを動かしたい",
+    paragraphs: [
+      "ライトの明るさを変えるだけでなく、照らす場所そのものを移動させることもできます。",
+      "たとえば、舞台左側を照らしていたライトを、4カウントかけて中央へ移動させる、といった使い方です。",
+      "フェード → ライトが明るくなる・暗くなる、移動 → ライトの位置や照らす場所が動く、と考えると分かりやすいです。",
+    ],
+  },
+  {
+    key: "want_lightingCopy",
+    icon: "📋",
+    title: "同じ照明を別の場所でも使いたい",
+    paragraphs: [
+      "同じ照明を作り直す必要はありません。",
+      "1つの照明エリアや照明ビームだけをコピーすることも、現在の照明全体をまとめてコピーすることもできます。",
+      "別の構成や別の照明キューへ移動して「貼り付け」を使います。",
+      "前の構成とほぼ同じ照明から始めたい場合は、「← 前の構成から引き継ぐ」を使うと簡単です。",
+    ],
+  },
+  {
+    key: "want_presentation",
+    icon: "🎤",
+    title: "作った構成を人に見せたい",
+    paragraphs: [
+      "ヘッダーの「プレゼン」を押すと、編集用のパネルを隠して、構成を見ることに集中できる画面へ切り替わります。",
+      "前後の構成への移動や再生・一時停止ができ、全画面表示にもできます。",
+      "振付の説明や、練習中にメンバーへ構成を見せるときに便利です。",
+    ],
+  },
+  {
+    key: "want_export",
+    icon: "🖼",
+    title: "画像やPDFにしたい",
+    paragraphs: [
+      "「出力」から、作った構成をPNGまたはPDFにできます。",
+      "平面図／俯瞰客席ビューを選べるほか、必要に応じて、移動軌跡・出演者名・追尾スポット軌跡・音源内時間などを表示できます。",
+      "複数の構成をまとめて出力したり、照明キューごとの状態を書き出したり、出演者一覧だけを出力することもできます。",
     ],
   },
 ];
 
 // 「機能から探す」：作業順ではなく、機能単位のリファレンス。10分類で固定する
-// （出演者と構成、再生と表示はそれぞれ独立させる＝統合しない）。
+// （出演者と構成、再生と表示はそれぞれ独立させる＝統合しない）。Help v2でも内容は
+// 変更せず、表示位置と（新規に追加した）開閉可能な外枠だけを変更する。
 const HELP_MANUAL_FUNCTION_SECTIONS = [
   {
     key: "stage",
@@ -25742,7 +28068,11 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
       "1マス＝90cm。舞台グリッドは画面上0.5マス刻みで表示されます。",
       "舞台上の位置を確認するための目盛り（バミリ）として使用できます。",
       "横方向は中央が0、下手が−、上手が＋。奥行は舞台前端が0です。",
-      "「全体の設定 → 舞台の外観」で床・壁の色を設定できます。",
+      "「全体の設定 → ステージ設定 → 舞台の外観」で床・壁の色を設定できます。",
+      "「高台・段差」から、舞台上に高さのある場所（高台）を追加できます。位置・大きさ・高さを設定でき、複数の高台を作ることもできます。",
+      "高台の上にいる出演者や、高台に設定した照明は、俯瞰客席ビューでもその高さを含めて表示されます。",
+      "「階段」では、通常舞台と高台、または高台同士をつなぐ階段を作れます。位置・大きさ・上る方向を設定し、「接続元」「接続先」でどの舞台面同士をつなぐか指定します。",
+      "出演者の「舞台面」が「自動」の場合、階段の上を移動すると位置に合わせて高さも変化します。再生中やスクラバーでも、階段を上り下りしている途中の状態を確認できます。",
     ],
   },
   {
@@ -25757,6 +28087,9 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
       "平面図上のドラッグで移動できます。位置は0.25マス単位で設定されます（数値入力欄でも同じ単位です）。",
       "選択中の1人をドラッグすると、選択中全員が相対位置を保ったまま一緒に移動します。",
       "Delete／Backspaceで削除できます（出演者選択時）。",
+      "出演者ごとに「舞台面」を設定できます。通常は「自動」のままで、出演者の位置に合わせて通常舞台・高台・階段のどこにいるかを自動で判断します。通常舞台から階段を通って高台へ移動する場合も、高さを1つずつ設定する必要はありません。",
+      "高台と同じ位置にいても、必ず高台の上にいるとは限りません。高台の下を通る表現にしたい場合は、「舞台面」を「自動」から「通常舞台」に変更すると、高台と位置が重なっていても通常舞台の高さとして扱えます。逆に、特定の高台の上に固定したい場合は、「舞台面」からその高台を直接選択できます。",
+      "複数の出演者を選択して、「選択中の出演者の舞台面」からまとめて変更することもできます。",
     ],
     note: "姿勢（立ち・片膝）は出演者本体の設定ではなく、構成ごとの設定です。「構成」の項目を参照してください。",
   },
@@ -25805,10 +28138,12 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
     icon: "💡",
     title: "照明",
     bullets: [
-      "照明エリアを追加・編集できます。",
-      "照明ビームを追加できます。選択中の出演者への追尾ビームも設定できます。",
-      "照明キューで、構成を維持している間・移動している間の照明を設定できます。",
-      "キューごとにフェード時間を設定できます。",
+      "照明エリアは、舞台上の範囲を色や明るさで照らすときに使います。「照射面」を設定すると、通常舞台だけでなく高台の上にも配置でき、高台を選んだ場合は俯瞰客席ビューでもその高さに合わせて表示されます。",
+      "照明ビームは、発光元から照射先へ向かう光を表現します。「照射面」を設定すると、通常舞台だけでなく高台を照らすこともでき、高台を選んだ場合はその高さを含めてビームの向きが表示されます。",
+      "照明ビームは「追尾する出演者」を設定して、特定の出演者を追いかけることもできます。追尾中は出演者の移動に合わせて照射先も動き、通常舞台から階段を上って高台へ移動する場合も、出演者の高さに合わせて照射先が変化します。",
+      "追尾中は、照射面を個別に設定する必要はありません。追尾する出演者の位置と高さに合わせて自動的に変化します。",
+      "照明キューで、構成を維持している間（キープ中）・次の構成へ移動している間（移動中）の照明を設定できます。",
+      "キューごとにフェード時間を設定できます。「フェード」は明るさなどの変化、「移動」は照らす位置の変化です。照明キューでは、照明エリアやビームの位置を移動させることもできます。",
       "「照明を表示」チェックボックスで、編集画面上の表示だけをON/OFFできます（データは消えません）。",
     ],
   },
@@ -25820,6 +28155,7 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
       "通常再生：単発の移動、または連続再生ができます。",
       "音楽同期再生（♫▶）：音楽位置を基準に、音楽と構成アニメーションを同時に開始します。",
       "再生中は一時停止・再開ができます。",
+      "スクラバーを動かすと、再生しなくても、構成間の移動途中の状態を好きな位置で確認できます。曲線移動や、階段を上り下りしている途中の位置・高さを確認したいときにも便利です。",
       "構成バーから任意の構成へ直接切り替えられます。",
     ],
   },
@@ -25830,6 +28166,7 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
     bullets: [
       "平面図（真上）と俯瞰客席ビューを切り替えられます。",
       "プレゼンモードでは編集用のUIを隠し、再生に専念できます。",
+      "プレゼンモードでは全画面表示も利用できます。",
       "出演者名の表示・非表示を切り替えられます。",
       "待機エリアの表示・非表示を切り替えられます。",
       "移動軌跡の表示・非表示を切り替えられます。",
@@ -25846,6 +28183,7 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
       "ビューは現在のビュー／平面図／俯瞰客席ビューから選べます。",
       "移動軌跡・追尾スポット軌跡・出演者名・音源内時間の表示をそれぞれON/OFFできます。",
       "照明キューごとの出力にも対応しています。",
+      "PDFでは、出演者一覧を先頭ページに付けて出力することもできます。",
       "出演者一覧のみの出力にも対応しています。",
     ],
   },
@@ -25878,26 +28216,29 @@ const HELP_MANUAL_SHORTCUTS = [
 ];
 
 // HelpManual本体：既存THEME・SectionTitle・Divider・CollapsibleGroupのみを再利用し、
-// 新しいデザイン体系・新しいCSSクラスは作らない。Manual v1.1：「はじめての方へ」「機能から探す」
-// 「ショートカット」の3ブロックはすべてCollapsibleGroupで統一する（見た目の一貫性のため）。
-// 「はじめての方へ」はManualの主役のため初期状態OPEN、「ショートカット」は必要な時だけ開く
-// ものとして初期状態CLOSEDにする（開閉状態はsectionsOpen.gettingStarted / .shortcutsで管理、
-// 「機能から探す」内の10項目はsectionsOpenの各key（stage/performers/...）で管理する＝
-// 3ブロックとも同じ1つのstateオブジェクトを共有する）。
+// 新しいUI基盤・新しいデザイン体系・新しいCSSクラスは作らない。Help v2：「🌱 はじめての方へ」
+// 「✨ やりたいことから探す」「🔍 機能から探す」「⌨️ ショートカット」の4ブロックすべてを
+// CollapsibleGroupで統一する（見た目の一貫性のため）。「はじめての方へ」「やりたいことから
+// 探す」は初見ユーザーが最初に見てほしいブロックのため初期状態OPEN、「機能から探す」
+// 「ショートカット」は必要な時だけ開くものとして初期状態CLOSEDにする（開閉状態は
+// sectionsOpen.gettingStarted / .wantToDo / .functions / .shortcutsで管理、
+// 「やりたいことから探す」内の各項目はsectionsOpenの各key（want_...）で、「機能から探す」
+// 内の10項目はsectionsOpenの各key（stage/performers/...）でそれぞれ個別に管理する＝
+// 4ブロックとも同じ1つのstateオブジェクトを共有する）。
 function HelpManual({ sectionsOpen, onToggleSection }) {
   return (
     <section
       style={{ background: THEME.panelBg2, border: `1px solid ${THEME.borderSoft}`, borderRadius: 12, padding: "12px 14px" }}
       className="flex flex-col gap-3"
     >
-      {/* アプリ概要：長い前置きは置かない */}
+      {/* アプリ概要：長い前置きは置かない（Help v2.2で本文を短く整理した） */}
       <div>
         <h2 style={{ color: THEME.text }} className="text-sm font-bold">ダンス舞台シミュレーター</h2>
         <p style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-1">
           構成・移動・音楽・照明を、ひとつの時間軸で設計するツール。
         </p>
         <p style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-1">
-          出演者の立ち位置だけでなく、構成間の移動経路、音楽との同期、照明キューまで設定できます。
+          移動経路、音楽との同期、照明キューまで設定できます。
           作成した構成は、再生してアニメーションで確認。
           平面図・俯瞰客席ビューをPNG／PDFで出力できます。
         </p>
@@ -25905,15 +28246,24 @@ function HelpManual({ sectionsOpen, onToggleSection }) {
 
       <Divider />
 
-      {/* はじめての方へ：Manualの主役。CollapsibleGroupだが初期状態はOPEN（gettingStarted:true）。 */}
+      {/* 🌱 はじめての方へ：CollapsibleGroup。Help v2.2で初期状態をCLOSEDへ変更した
+          （sectionsOpen.gettingStarted未設定＝falsy）。「📖 使い方」を開いた直後に
+          🌱／✨／🔍／⌨️の4層構造を一覧しやすくする狙いで、内容自体は削除していない。 */}
       <CollapsibleGroup
         title="はじめての方へ"
-        icon="🔰"
+        icon="🌱"
         open={!!sectionsOpen.gettingStarted}
         onToggle={() => onToggleSection("gettingStarted")}
         nested
       >
         <div className="flex flex-col gap-3">
+          <div>
+            {HELP_MANUAL_GETTING_STARTED_INTRO.map((line, i) => (
+              <p key={i} style={{ color: THEME.textDim }} className="text-[11.5px] leading-relaxed mt-0.5">
+                {line}
+              </p>
+            ))}
+          </div>
           {MANUAL_GETTING_STARTED_STEPS.map((step) => (
             <div key={step.title}>
               <h3 style={{ color: THEME.text }} className="text-xs font-bold">{step.title}</h3>
@@ -25929,10 +28279,65 @@ function HelpManual({ sectionsOpen, onToggleSection }) {
 
       <Divider />
 
-      {/* 機能から探す：作業順ではなく機能単位のリファレンス。10項目のaccordion（現状維持）。 */}
-      <div>
-        <SectionTitle>機能から探す</SectionTitle>
-        <div className="flex flex-col gap-2 mt-2">
+      {/* ✨ やりたいことから探す（Help v2・新規）：初期状態OPEN（wantToDo:true）。
+          中の各項目は個別accordion・初期状態はすべてCLOSED（want_...キーが未設定＝falsy）。 */}
+      <CollapsibleGroup
+        title="やりたいことから探す"
+        icon="✨"
+        open={!!sectionsOpen.wantToDo}
+        onToggle={() => onToggleSection("wantToDo")}
+        nested
+      >
+        <div className="flex flex-col gap-2">
+          {HELP_MANUAL_WANT_TO_DO_SECTIONS.map((sec) => (
+            <CollapsibleGroup
+              key={sec.key}
+              title={sec.title}
+              icon={sec.icon}
+              open={!!sectionsOpen[sec.key]}
+              onToggle={() => onToggleSection(sec.key)}
+              nested
+            >
+              <div className="flex flex-col gap-1">
+                {sec.paragraphs.map((p, i) => (
+                  <p key={i} style={{ color: THEME.textDim }} className="text-[11px] leading-relaxed">
+                    {p}
+                  </p>
+                ))}
+              </div>
+              {sec.useCases && sec.useCases.length > 0 && (
+                <div
+                  style={{ borderLeft: `2px solid ${THEME.borderSoft}` }}
+                  className="pl-2 mt-1"
+                >
+                  <p style={{ color: THEME.text }} className="text-[11px] font-bold">こんなときに使います</p>
+                  <ul className="flex flex-col gap-0.5 pl-4 mt-0.5" style={{ listStyle: "disc", color: THEME.textDim }}>
+                    {sec.useCases.map((u, i) => (
+                      <li key={i} className="text-[11px] leading-relaxed">
+                        {u}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </CollapsibleGroup>
+          ))}
+        </div>
+      </CollapsibleGroup>
+
+      <Divider />
+
+      {/* 🔍 機能から探す：作業順ではなく機能単位のリファレンス。10項目のaccordion（内容は現状維持）。
+          Help v2で外枠自体もCollapsibleGroup化し、初期状態CLOSEDにした
+          （sectionsOpen.functions未設定＝falsy）。 */}
+      <CollapsibleGroup
+        title="機能から探す"
+        icon="🔍"
+        open={!!sectionsOpen.functions}
+        onToggle={() => onToggleSection("functions")}
+        nested
+      >
+        <div className="flex flex-col gap-2">
           {HELP_MANUAL_FUNCTION_SECTIONS.map((sec) => (
             <CollapsibleGroup
               key={sec.key}
@@ -25960,14 +28365,14 @@ function HelpManual({ sectionsOpen, onToggleSection }) {
             </CollapsibleGroup>
           ))}
         </div>
-      </div>
+      </CollapsibleGroup>
 
       <Divider />
 
-      {/* ショートカット：初期状態CLOSED（shortcuts:未設定＝falsy）。必要な時だけ開く想定。 */}
+      {/* ⌨️ ショートカット：初期状態CLOSED（shortcuts:未設定＝falsy）。必要な時だけ開く想定（現状維持）。 */}
       <CollapsibleGroup
         title="ショートカット"
-        icon="⌨"
+        icon="⌨️"
         open={!!sectionsOpen.shortcuts}
         onToggle={() => onToggleSection("shortcuts")}
         nested
@@ -26342,7 +28747,7 @@ function ProjectBackupMessageModal({ tone, text, onClose }) {
   );
 }
 
-// 各設定パネル内の「説明を見る」トグル（PART E・新規）。ヘッダーの「？ ヘルプ」（アプリ全体の
+// 各設定パネル内の「説明を見る」トグル（PART E・新規）。ヘッダーの「📖 使い方」（アプリ全体の
 // 操作方法）とは役割を分け、こちらは「その設定固有の意味」だけを扱う小さなボタン（28章）。
 // 押すたびに開閉するだけのシンプルな見た目に留め、常時大きく表示しない（25章）。
 function InfoToggle({ open, onToggle }) {
@@ -26438,7 +28843,7 @@ function UndoRedoButton({ direction, onClick, disabled, title }) {
 
 // 拡大縮小・表示位置のためのツールバー。
 // 出演者データやステージ設定には一切触れず、viewState（表示専用の状態）だけを操作する。
-function ZoomToolbar({ zoom, onZoomIn, onZoomOut, onReset100, onFitAll, onFitStage, onFitSelected, selectedDisabled }) {
+function ZoomToolbar({ zoom, onZoomIn, onZoomOut, onReset100, onFitAll, onFitStage, onFitSelected, selectedDisabled, outOfRangeCount }) {
   const zoomPercent = Math.round(zoom * 100);
   const smallBtn = {
     background: THEME.panelBg2,
@@ -26490,6 +28895,18 @@ function ZoomToolbar({ zoom, onZoomIn, onZoomOut, onReset100, onFitAll, onFitSta
       >
         選択中の出演者へフォーカス
       </button>
+      {/* Stage Connector Phase 1H.2.1・PART C・D・E・L：範囲外(ステージ・袖・待機エリアの
+          いずれにも属さない)performerの人数を、押しボタンを伴わない小さなstatusとして
+          既存toolbar行にそのまま追加するだけ。この行は常に描画されているため、
+          outOfRangeCountが0↔1以上を行き来しても、行自体の出現/消滅によるレイアウト高さの
+          変化は起きない（旧「警告バー」のような専用<div>ブロックの出現/消滅を廃止した＝
+          PART L）。placementやviewStateを変更するボタンは持たない、純粋な状態表示
+          （PART J・K）。新しい色は作らず既存THEME.dangerを再利用する（PART E）。 */}
+      {outOfRangeCount > 0 && (
+        <span style={{ color: THEME.danger }} className="font-bold">
+          ⚠ 範囲外 {outOfRangeCount}人
+        </span>
+      )}
     </div>
   );
 }
@@ -28061,6 +30478,8 @@ function SlideCard({ index, slide, active, onClick, locked, dragging, onDragStar
 // カード本来の自然な高さ（FormationThumbnailのaspect-ratio 4:3で決まる高さ＋
 // 番号・構成名の行の高さ）のまま並び、ListViewport側が縦スクロールを担当する。
 function SlideListModal({
+  stageConnectors = [],
+  platforms = [],
   mode = "normal", // "normal"（従来通り：クリック→goToSlide→閉じる）| "export-selection"（Export Center v1）
   slides,
   performers,
@@ -28592,7 +31011,7 @@ function SlideListModal({
                 thumbnailLightingAreas = getLightingAreas(thumbnailScene);
                 // 高台 Phase 3A・PART S：Top View/Audience/Exportと同じplatformsを渡すだけ。
                 // Thumbnail自体の見た目（2D表示）は変更しない。
-                thumbnailLightingBeams3D = resolveLightingBeams3DForDisplay(getLightingBeams3D(thumbnailScene), slide.placements || {}, platforms);
+                thumbnailLightingBeams3D = resolveLightingBeams3DForDisplay(getLightingBeams3D(thumbnailScene), slide.placements || {}, platforms, stageConnectors);
               }
               return (
                 <React.Fragment key={slide.id}>
@@ -29026,14 +31445,6 @@ function ExportCenterModal({
   onShowLightingTrackingPathsChange,
   showPerformerNames,
   onShowPerformerNamesChange,
-  // 高台 Phase 2E・2E.1・PART D：「高台裏をゴースト表示」チェックボックス用。他の表示オプション
-  // （showPerformerNames等）と全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。
-  // visibleがfalseの間（平面図出力時）はUI自体を非表示にする（新しいモーダル・サブメニューは
-  // 作らず、既存の表示オプションセクション内に条件付きレンダリングとして追加するだけ）。
-  // Phase 2E.1で表示位置を「待機エリア」の直後へ移動したが、独立したbooleanのまま統合はしない。
-  showOccludedPerformerGhosts,
-  onShowOccludedPerformerGhostsChange,
-  showOccludedPerformerGhostsVisible,
   // Export音楽位置・音源内時間 v1：「音源内時間を表示」チェックボックス用。他の表示オプション
   // （showWaitingAreas等）と全く同じパターン（App側でstateを持ち、propsで受け渡すだけ）。
   showMusicTime,
@@ -29252,22 +31663,6 @@ function ExportCenterModal({
               <input type="checkbox" checked={showWaitingAreas} onChange={(e) => onShowWaitingAreasChange(e.target.checked)} />
               待機エリア
             </label>
-
-            {/* 高台 Phase 2E.1・PART D：待機エリア（袖・舞台裏の表示領域そのもの）とは意味が
-                異なる別state（exportShowOccludedPerformerGhosts）のまま、UI上だけ待機エリアの
-                直後へ配置する。待機エリアON/OFFとは連動させない。俯瞰客席ビュー出力時だけ
-                表示する（showOccludedPerformerGhostsVisibleで判定、平面図出力時は項目自体を
-                非表示のまま）。 */}
-            {showOccludedPerformerGhostsVisible && (
-              <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: THEME.text }}>
-                <input
-                  type="checkbox"
-                  checked={showOccludedPerformerGhosts}
-                  onChange={(e) => onShowOccludedPerformerGhostsChange(e.target.checked)}
-                />
-                高台裏をゴースト表示
-              </label>
-            )}
 
             <div className="flex flex-col" style={{ gap: 4 }}>
               <div className="flex items-center gap-2 flex-wrap">

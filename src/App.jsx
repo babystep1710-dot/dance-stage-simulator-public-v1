@@ -607,8 +607,57 @@ const LIGHTING_AREA_COLOR_LABELS = {
   green: "緑",
 };
 function lightingAreaColorHex(colorKey) {
+  // 照明フェード v1.2（same-id Cue Fade colorの連続補間・STEP A）：保存されるcolorは
+  // 従来通りpreset key（white/red/pink/blue等）のみだが、Cue Fade中のsame-id補間
+  // （interpolateLightingColor()）が表示専用の一時的なHEX文字列（例："#a1b2c3"）を
+  // 返すことがあるため、この解決関数だけをsafeに拡張し、HEX文字列もそのまま受け付ける
+  // ようにした。保存schema（work state側のcolorフィールド）は一切変更していない。
+  // Area・Beamのどちらの描画（TopView/OverheadAudienceView/Canvas export）もこの
+  // 1関数を共通で使っているため、拡張はここ1箇所だけで両方に自然に反映される。
+  if (typeof colorKey === "string" && /^#[0-9a-fA-F]{6}$/.test(colorKey)) {
+    return colorKey;
+  }
   return LIGHTING_AREA_COLOR_PRESETS[colorKey] || LIGHTING_AREA_COLOR_PRESETS.white;
 }
+
+// HEX文字列（#rrggbb）を{r,g,b}（0〜255の整数）へ分解する小さなpure helper。
+// 照明フェード v1.2のためだけに追加した内部ヘルパーで、他のcolor systemとは独立している。
+// 解決できない場合はnullを返す（呼び出し側で安全にfallbackするため）。
+function parseHexColorToRgb(hex) {
+  const match = typeof hex === "string" && /^#([0-9a-fA-F]{6})$/.exec(hex);
+  if (!match) return null;
+  const intValue = parseInt(match[1], 16);
+  return { r: (intValue >> 16) & 255, g: (intValue >> 8) & 255, b: intValue & 255 };
+}
+
+// {r,g,b}（0〜255）をHEX文字列（#rrggbb）へ戻す小さなpure helper（parseHexColorToRgbと対）。
+function rgbToHexColor(r, g, b) {
+  const toHexByte = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0");
+  return `#${toHexByte(r)}${toHexByte(g)}${toHexByte(b)}`;
+}
+
+// 照明フェード v1.2：Cue Fadeでsame-id（同一Area/Beam）のcolorをintensityと同じprogressで
+// 連続補間するためのpure helper。fromColor/toColorは既存のプリセットkey（white/red/pink/
+// blue等）を想定するが、lightingAreaColorHex()自体がHEX文字列もsafeに解決できるため、
+// 将来HEXが渡ってきても壊れない。返り値は表示専用の一時的なHEX文字列であり、work state
+// （Cue snapshot自体の保存color）へは一切保存しない。呼び出し側（resolveLightingCueState系）
+// が生成する一時objectのcolorフィールドにだけ使われる。
+// 新しい色preset体系・巨大color systemは作らず、既存のlightingAreaColorHex()だけを
+// 再利用してpreset→HEX解決を行う（Area/Beamで重複実装しない）。
+// 解決できない場合（不正な色値等）はfromColorをそのまま返す＝視覚的な破綻より
+// 「元の色のまま」を優先する安全なfallback。
+function interpolateLightingColor(fromColor, toColor, t) {
+  const safeT = clamp(Number.isFinite(t) ? t : 0, 0, 1);
+  const fromRgb = parseHexColorToRgb(lightingAreaColorHex(fromColor));
+  const toRgb = parseHexColorToRgb(lightingAreaColorHex(toColor));
+  if (!fromRgb || !toRgb) return fromColor;
+  return rgbToHexColor(
+    lerp(fromRgb.r, toRgb.r, safeT),
+    lerp(fromRgb.g, toRgb.g, safeT),
+    lerp(fromRgb.b, toRgb.b, safeT)
+  );
+}
+
 const LIGHTING_AREA_SHAPES = ["circle", "ellipse"];
 const LIGHTING_AREA_SHAPE_LABELS = { circle: "円", ellipse: "楕円" };
 
@@ -1212,6 +1261,26 @@ const THEME = {
   stageFloor: "#1a1720",
   gridLine: "#454050",
   gridLineHalf: "#332f3b",
+};
+
+// Help Short動画 共通style（Phase 4B）：「高台・階段Short」「Beam追尾Short」など、Help内
+// 「やりたいことから探す」の各項目に埋め込む短尺動画の見た目を共通化するための定数。
+// 動画ごとに元の解像度・アスペクト比が異なる（例：高台Shortは1200×632、Beam Shortは
+// 1460×550）ため、aspectRatioは固定せず、width:100%・height:autoで各動画自身の
+// intrinsic ratioをそのまま尊重する。コンテナ側の見た目（中央寄せ・maxWidth・border・
+// borderRadius・overflow hidden）はPhase 3Bの高台Short実装をそのまま踏襲している。
+const HELP_SHORT_VIDEO_CONTAINER_STYLE = {
+  marginTop: 8,
+  maxWidth: 800,
+  border: `1px solid ${THEME.borderSoft}`,
+  borderRadius: 10,
+  overflow: "hidden",
+};
+const HELP_SHORT_VIDEO_STYLE = {
+  width: "100%",
+  maxWidth: "100%",
+  height: "auto",
+  display: "block",
 };
 
 // ------------------------------------------------------------------
@@ -4433,13 +4502,20 @@ function getLightingSceneCues(scene) {
   return scene && Array.isArray(scene.cues) ? scene.cues : [];
 }
 
-// 照明フェード v1・STEP 7〜10：Cue snapshot間のintensityだけを補間する小さなpure helper。
-// 責務はArea/Beam 3DのintensityフィールドのlerpだけでStep 4の対象外field（color・位置・
-// 形状・source/target・followPerformerId等）には一切触れない。同じidのArea/Beam同士だけを
-// 対応付け（STEP 8）、構造的な配列（要素数・並び・id構成）はfromState側を基準にする
-// （STEP 9：fade中の追加/削除アニメーションはv1では実装しない。Cue地点へ到達した時点で
-// resolveLightingCueState側がtoState（Cue snapshot）へ丸ごと切り替える）。既存object群は
-// 一切mutationせず、新しい配列/objectだけを返す。
+// 照明フェード v1・STEP 7〜10：Cue snapshot間のintensityを補間する小さなpure helper。
+// 照明フェード v1.2でsame-id（Area/Beamとも同一id同士）の場合に限りcolorも同じprogressで
+// 連続補間するよう拡張した（interpolateLightingColor()を使用。詳細は同関数のコメント参照）。
+// from-only／to-only（Cue切り替え時にArea/Beamが増減するケース）のcolorは従来通り
+// 一切変更しない（from側またはto側の値をそのまま使う）。位置・形状・source/target・
+// followPerformerId等、color/intensity以外のfieldには一切触れない（この点は変更なし）。
+// 関数名は既存のまま維持する：呼び出し箇所が3箇所（同一Formation内keep Cue Fade・
+// Boundary Fade・Formation間開始フェード）あり、名前を変えると影響範囲の確認コストに対して
+// 得られる利益が小さいため、「intensity」という名前のまま責務が広がったことをこの
+// コメントで明記するにとどめた（不要な大規模renameを避けるv1.2の判断）。
+// 同じidのArea/Beam同士だけを対応付け（STEP 8）、構造的な配列（要素数・並び・id構成）は
+// fromState側を基準にする（STEP 9：fade中の追加/削除アニメーションはv1では実装しない。
+// Cue地点へ到達した時点でresolveLightingCueState側がtoState（Cue snapshot）へ丸ごと
+// 切り替える）。既存object群は一切mutationせず、新しい配列/objectだけを返す。
 function interpolateLightingIntensityState(fromAreas, fromBeams3D, toAreas, toBeams3D, progress) {
   const t = clamp(Number.isFinite(progress) ? progress : 0, 0, 1);
   const fromAreaList = Array.isArray(fromAreas) ? fromAreas : [];
@@ -4448,12 +4524,17 @@ function interpolateLightingIntensityState(fromAreas, fromBeams3D, toAreas, toBe
   fromAreaList.forEach((fromArea) => {
     const toArea = toAreaList.find((a) => a.id === fromArea.id);
     if (toArea) {
-      // both：既存v1と完全に同じ。intensityだけをfrom→toでlerpし、それ以外のfieldは
-      // from側objectをそのまま使う（color/geometry等は今回も補間しない）。
+      // both（same-id）：intensityに加え、照明フェード v1.2でcolorも同じprogressで
+      // 連続補間する（interpolateLightingColor()。位置・形状等それ以外のfieldは
+      // 引き続きfrom側objectをそのまま使う）。
       if (typeof toArea.intensity !== "number" || typeof fromArea.intensity !== "number") {
         areas.push(fromArea);
       } else {
-        areas.push({ ...fromArea, intensity: lerp(fromArea.intensity, toArea.intensity, t) });
+        areas.push({
+          ...fromArea,
+          intensity: lerp(fromArea.intensity, toArea.intensity, t),
+          color: interpolateLightingColor(fromArea.color, toArea.color, t),
+        });
       }
       return;
     }
@@ -4485,10 +4566,15 @@ function interpolateLightingIntensityState(fromAreas, fromBeams3D, toAreas, toBe
   fromBeamList.forEach((fromBeam) => {
     const toBeam = toBeamList.find((b) => b.id === fromBeam.id);
     if (toBeam) {
+      // both（same-id）：Areaと同じく、照明フェード v1.2でcolorも連続補間する。
       if (typeof toBeam.intensity !== "number" || typeof fromBeam.intensity !== "number") {
         beams3D.push(fromBeam);
       } else {
-        beams3D.push({ ...fromBeam, intensity: lerp(fromBeam.intensity, toBeam.intensity, t) });
+        beams3D.push({
+          ...fromBeam,
+          intensity: lerp(fromBeam.intensity, toBeam.intensity, t),
+          color: interpolateLightingColor(fromBeam.color, toBeam.color, t),
+        });
       }
       return;
     }
@@ -27814,6 +27900,154 @@ function CollapsibleGroup({ title, icon, open, onToggle, children, nested = fals
   );
 }
 
+// Help Short動画 共通コンポーネント（UX改善Phase）：8本のHelp Short動画（高台・階段／Beam追尾／
+// Lighting Cue／Lighting Fade／Lighting Move／Lighting Copy／Presentation／Export）が
+// それぞれ個別に持っていた「<div style={HELP_SHORT_VIDEO_CONTAINER_STYLE}><video .../></div>」
+// という完全に同一の構造を1箇所へ集約したもの。propsはsrc／ariaLabelの2つのみ。動画ごとの
+// 表示条件（sec.key判定。高台・階段／出演者を高台へ乗せたいのOR条件を含む）は呼び出し側の
+// JSXにそのまま残し、このコンポーネント自身はsec.keyを一切知らない（疎結合を保つ）。
+// 一時停止／再生・動画を隠す／再表示のUI状態はコンポーネント内部のuseStateのみで完結し、
+// HelpManual側やlocalStorage等へは持ち上げない（今回のHelp用途では永続化不要と判断）。
+// 親のCollapsibleGroup（すぐ上で定義）が閉じている間は、既存仕様通りchildren自体が
+// renderされない（{open && (...)}）ため、このコンポーネントごとReactツリーからunmountされる。
+// 再度開いたときは必ずhidden=false・paused=falseの初期状態から新規mountされるため、
+// 追加のcleanup処理は不要。
+// 「動画を隠す」はvideo要素そのものをunmount（条件付きレンダリングで丸ごと外す）する方式とし、
+// display:none／visibility:hiddenは使わない。理由は、隠している間の再生を確実に止めること、
+// DOMを軽くすること、そして再表示時に新しいvideo要素をautoPlayでそのまま0秒から自動再生させる
+// ことの3点で、この方式が最も単純かつ確実なため。前回の再生位置（currentTime）の保存・復元は
+// 行わない。
+// 共通style（HELP_SHORT_VIDEO_CONTAINER_STYLE／HELP_SHORT_VIDEO_STYLE）・video属性
+// （autoPlay/loop/muted/playsInline/preload="metadata"）は既存の値をそのまま流用しており、
+// 見た目・自動再生の既定挙動そのものは変更していない。video自身のaria-labelもprops経由で
+// そのまま渡すだけで、8本とも一切変更していない。
+// 操作ボタンのplay()/pause()はこのvideo要素だけに閉じており、アプリ本体のPlayback
+// （Formation再生等）とは一切共有しない。
+function HelpShortVideo({ src, ariaLabel }) {
+  const videoRef = useRef(null);
+  const [paused, setPaused] = useState(false);
+  const [hidden, setHidden] = useState(false);
+
+  // play()はPromiseを返す仕様のため、連続クリック等で前の呼び出しが解決する前に
+  // pause()が呼ばれるとAbortErrorが発生し得る。ここで確実に握りつぶし、unhandled
+  // rejectionにしない。
+  // 分岐条件は実DOMのvideo.pausedではなく、Reactのpaused state（＝UIに提示している
+  // 操作状態）を正とする。mount直後はautoplayの開始タイミングにより、UI表示が
+  // 「⏸ 一時停止」（paused=false）のままvideo.pausedが一瞬trueのままになる区間が
+  // あり得るため、video.pausedを条件にするとその瞬間にクリックした際、表示と逆の
+  // 操作（一時停止のつもりがplay()）になってしまう。pausedを正とすることで、
+  // 「⏸ 一時停止」と表示されている間は必ずpause()、「▶ 再生」と表示されている間は
+  // 必ずplay()となり、UIと実際の操作結果が常に一致する。
+  function togglePause() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (paused) {
+      const playPromise = video.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {});
+      }
+      setPaused(false);
+    } else {
+      video.pause();
+      setPaused(true);
+    }
+  }
+
+  function hideVideo() {
+    setHidden(true);
+  }
+
+  // 再表示時：hidden=falseにするとvideo要素が新規mountされ、autoPlay属性により
+  // 0秒から自動的に再生が始まる。pausedも明示的にfalseへ戻し、隠す前が一時停止中で
+  // あっても再表示後は必ず再生中から始まるようにする（前回状態を引き継がない）。
+  function showVideo() {
+    setHidden(false);
+    setPaused(false);
+  }
+
+  if (hidden) {
+    return (
+      <div style={{ maxWidth: 800, margin: "0 auto" }}>
+        <button
+          type="button"
+          onClick={showVideo}
+          title="動画を見る"
+          aria-label="動画を見る"
+          style={{
+            background: THEME.panelBg2,
+            color: THEME.textDim,
+            border: `1px solid ${THEME.border}`,
+          }}
+          className="px-2 py-1 rounded text-xs"
+        >
+          ▶ 動画を見る
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div style={HELP_SHORT_VIDEO_CONTAINER_STYLE} className="mx-auto">
+        <video
+          ref={videoRef}
+          src={src}
+          // autoPlay属性は常時trueにせず!pausedと連動させる。理由：一時停止後、
+          // React rerenderが起きた際にJSX上autoPlayがtrueのまま残っていると、
+          // ブラウザやmedia load/autoplayのタイミングによってpause()した直後に
+          // 再生が再開してしまうrace（Test A/Bで検出済み）があるため。pausedと
+          // 連動させることで、一時停止中は必ずautoPlay=falseとなり、rerenderが
+          // 起きても再開しない。
+          autoPlay={!paused}
+          loop
+          muted
+          playsInline
+          preload="metadata"
+          aria-label={ariaLabel}
+          style={HELP_SHORT_VIDEO_STYLE}
+        />
+      </div>
+      <div style={{ maxWidth: 800, margin: "0 auto", display: "flex", gap: 8, marginTop: 6 }}>
+        <button
+          type="button"
+          onClick={togglePause}
+          aria-pressed={paused}
+          title={paused ? "再生" : "一時停止"}
+          aria-label={paused ? "再生" : "一時停止"}
+          style={{
+            background: THEME.panelBg2,
+            color: THEME.textDim,
+            border: `1px solid ${THEME.border}`,
+          }}
+          className="px-2 py-1 rounded text-xs"
+        >
+          {paused ? "▶ 再生" : "⏸ 一時停止"}
+        </button>
+        {/* 「動画を隠す/動画を見る」は状態を持つトグルではなく単発のshow/hideコマンドとして
+            扱う（表示中はhide、非表示中はshowという別々のボタンとして描画されるため、
+            同一ボタンのon/off切り替えを表すaria-pressedを付けるのは意味論上不自然と判断し、
+            付けていない）。一時停止/再生ボタンは同一ボタンのon/off切り替えのためaria-pressed
+            が適切だが、こちらは片方のボタンしかDOMに存在しない時点でstateはvisible text
+            自体（動画を隠す／動画を見る）で十分に伝わる。 */}
+        <button
+          type="button"
+          onClick={hideVideo}
+          title="動画を隠す"
+          aria-label="動画を隠す"
+          style={{
+            background: THEME.panelBg2,
+            color: THEME.textDim,
+            border: `1px solid ${THEME.border}`,
+          }}
+          className="px-2 py-1 rounded text-xs"
+        >
+          動画を隠す
+        </button>
+      </div>
+    </>
+  );
+}
+
 // ------------------------------------------------------------------
 // Help v2（初見ユーザー向けHelp・使い方）
 // ------------------------------------------------------------------
@@ -27896,29 +28130,36 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
   {
     key: "want_musicSync",
     icon: "🎵",
-    title: "音楽に合わせて構成を作りたい",
+    title: "音楽に合わせて構成を作りたい①",
     paragraphs: [
-      "音源を読み込むと、曲を流しながら構成のキープや移動を確認できます。",
-      "BPMを設定すると、「この構成を8カウント見せる」「次の位置まで4カウントで移動する」といった設定を、実際の音楽の速さに合わせて再生できます。",
-      "BPMは、使っている楽曲に合わせて設定してください。曲の途中で別の楽曲に切り替わったり、テンポが変わったりする場合は、「楽曲セクション」を追加して、その区間ごとにBPMを設定できます。",
+      "まず、音源を読み込み、曲のテンポを設定します。",
+      "画面下の「音楽 → ファイルを選択」から、使用する音源を読み込みます。",
+      "「音楽設定」の「基準BPM」に楽曲のBPMを設定すると、構成のキープや移動に設定したカウントを、実際の曲の速さに合わせて再生できます。",
+      "曲の途中で別の楽曲に切り替わったり、テンポが変わったりする場合は、「楽曲セクション」を追加して、その区間ごとにBPMを設定できます。",
       "BPMは自動では決まらないため、それぞれの楽曲に合った数値を入力してください。",
     ],
     useCases: [
-      "実際の曲を流しながらフォーメーションを確認したい",
-      "「8カウントキープ → 4カウント移動」のように振付の時間を管理したい",
       "BPMの違う複数の楽曲をつないだ音源で構成を作りたい",
-      "曲のどの部分でどの構成になるのか確認したい",
+      "曲のテンポに合わせた速さで構成を再生したい",
+      "曲ごと／区間ごとにテンポを設定したい",
     ],
   },
   {
     key: "want_musicPosition",
-    icon: "⏱",
-    title: "構成と曲の位置を合わせたい",
+    icon: "🎵",
+    title: "音楽に合わせて構成を作りたい②",
     paragraphs: [
-      "各構成の「音楽位置」を設定すると、その構成が曲の何分何秒あたりに対応するのかを決められます。",
-      "最初の構成など、基準にしたい場所の音楽位置を設定すると、そのあとの構成は「キープ」と「移動時間」から自動で音楽位置がつながっていきます。",
-      "途中から曲の別の場所に合わせ直したいときは、「手動に固定」で新しい基準位置を作れます。",
-      "💡 たとえば「この構成はサビの頭から8カウント」「そこから4カウントで次の構成へ」と設定していくと、後ろの構成も曲の時間に沿ってつながっていきます。",
+      "次に、各構成が曲のどの位置に対応するかを設定し、音楽と同期して確認します。",
+      "各構成の「音楽位置」で、その構成が曲の何曲目・何エイト目・何カウント目に対応するかを設定できます。",
+      "前の構成からカウントをつないで自動計算することも、必要な位置を手動で設定することもできます。",
+      "音源を読み込んだ状態で「音楽と同期して再生」を押すと、設定した音楽位置から曲と構成を一緒に再生できます。",
+      "同期再生中は、現在のカウントと音楽の進行を確認できます。",
+    ],
+    useCases: [
+      "「8カウントキープ → 4カウント移動」のように振付の時間を管理したい",
+      "実際の曲を流しながらフォーメーションを確認したい",
+      "曲のどの部分でどの構成になるのか確認したい",
+      "特定の歌詞や音のタイミングに構成を合わせたい",
     ],
   },
   {
@@ -27926,13 +28167,11 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
     icon: "🧱",
     title: "高台・階段を作りたい",
     paragraphs: [
-      "「全体の設定 → 高台・段差」から高台を追加できます。",
-      "高台は、位置・大きさ・高さを設定できます。",
+      "「全体の設定 → 高台・段差」から高台を追加でき、位置・大きさ・高さを設定できます。",
       "高台へ上がる階段は「階段」から追加します。",
       "階段の位置と大きさを決めたら、どちら側から上る階段なのかと、どの舞台面とどの舞台面をつなぐのかを設定します。",
       "たとえば、通常の舞台から高さ4の高台へ上がる場合は、階段の片側を「通常舞台」、もう片側をその高台にします。",
-      "出演者の高さを1段ずつ設定する必要はありません。",
-      "出演者の「舞台面」を「自動」にしておけば、階段の上を通ると位置に合わせて少しずつ高くなり、高台に着くと高台の高さになります。",
+      "出演者の高さを1段ずつ設定する必要はなく、「舞台面」を「自動」にしておけば、階段の上を通ると位置に合わせて少しずつ高くなり、高台に着くと高台の高さになります。",
     ],
     useCases: [
       "舞台セットの高台を再現したい",
@@ -27968,10 +28207,10 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
     icon: "🔦",
     title: "スポットライトを当てたい",
     paragraphs: [
-      "「照明の設定」を開き、「照明ビーム」を追加します。",
-      "発光元はライトが置かれている位置、照射先はライトを当てたい位置です。",
-      "平面図では発光元と照射先を動かして位置を決められ、俯瞰客席ビューではライトがどのように見えるか確認できます。",
-      "色・明るさ・光の太さ・高さも調整できます。",
+      "出演者を選択して、「照明の設定」から「選択中の出演者を照らす」を押すと、その出演者の位置にスポットライトを追加できます。",
+      "追加されたライトは、出演者の真上からその位置を照らす固定の照明ビームです。",
+      "平面図で位置を調整し、俯瞰客席ビューで客席からの見え方を確認できます。",
+      "色・明るさ・光の太さも、あとから調整できます。",
     ],
     useCases: [
       "センターにスポットライトを当てたい",
@@ -27984,7 +28223,7 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
     icon: "🎯",
     title: "ライトを出演者に追尾させたい",
     paragraphs: [
-      "照明ビームの「追尾する出演者」を選ぶと、ライトの照射先がその出演者についていきます。",
+      "照明ビームを選択し、「🎯 追尾」から追尾する出演者を選ぶと、ライトの照射先がその出演者についていきます。",
       "出演者が移動するとライトも一緒に動きます。",
       "高台へ上がったり階段を上り下りしたりするときも、出演者の高さに合わせてライトが追いかけます。",
       "「追尾スポット軌跡」を表示すると、ライトがどの経路を追うかも確認できます。",
@@ -27993,11 +28232,10 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
   {
     key: "want_lightingCueTiming",
     icon: "⏱",
-    title: "曲の途中で照明を変えたい",
+    title: "好きなカウントで照明を変えたい",
     paragraphs: [
       "1つの構成の途中でも、好きなカウントで照明を変えられます。",
       "たとえば、構成1の最初 → 舞台を青くする、4カウント目 → センターのスポットライトを点ける、8カウント目 → 舞台を赤くする、といった設定ができます。",
-      "この「照明を切り替えるタイミング」が照明キューです。",
       "「キープ中」は、出演者がその構成にとどまっている間の照明変化です。「移動中」は、次の構成へ移動している間の照明変化です。",
       "たとえば、ポーズを8カウントキープしている途中でライトを点けるのは「キープ中」、次の立ち位置へ移動している途中で色を変えるのは「移動中」と考えると分かりやすいです。",
     ],
@@ -28009,7 +28247,7 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
     paragraphs: [
       "照明キューを切り替えた瞬間にパッと変えるだけでなく、何カウントかかけてゆっくり変えることもできます。",
       "たとえば、明るさを0から100へ少しずつ上げる、スポットライトをゆっくり消す、といった変化には「フェード」を使います。",
-      "フェードのカウント数を設定すると、その時間を使って明るさが変化します。",
+      "「照明の変化（キュー）」でキューを選び、「フェード」からカウント数を設定すると、その時間を使って明るさが変化します。",
     ],
   },
   {
@@ -28019,6 +28257,7 @@ const HELP_MANUAL_WANT_TO_DO_SECTIONS = [
     paragraphs: [
       "ライトの明るさを変えるだけでなく、照らす場所そのものを移動させることもできます。",
       "たとえば、舞台左側を照らしていたライトを、4カウントかけて中央へ移動させる、といった使い方です。",
+      "「照明エリア」または「照明ビーム」を選択し、「移動」欄から移動にかけるカウント数を設定します。",
       "フェード → ライトが明るくなる・暗くなる、移動 → ライトの位置や照らす場所が動く、と考えると分かりやすいです。",
     ],
   },
@@ -28145,6 +28384,7 @@ const HELP_MANUAL_FUNCTION_SECTIONS = [
       "照明キューで、構成を維持している間（キープ中）・次の構成へ移動している間（移動中）の照明を設定できます。",
       "キューごとにフェード時間を設定できます。「フェード」は明るさなどの変化、「移動」は照らす位置の変化です。照明キューでは、照明エリアやビームの位置を移動させることもできます。",
       "「照明を表示」チェックボックスで、編集画面上の表示だけをON/OFFできます（データは消えません）。",
+      "「開始フェード」を設定すると、直前の照明から、その構成の開始時の照明へ徐々に変化します。",
     ],
   },
   {
@@ -28305,6 +28545,19 @@ function HelpManual({ sectionsOpen, onToggleSection }) {
                   </p>
                 ))}
               </div>
+              {/* 「照明キュー」定義の強調：want_lightingCueTiming専用。「この『照明を
+                  切り替えるタイミング』が照明キューです。」という一文は通常paragraphから
+                  削除し、「照明キュー＝照明を切り替えるタイミング」という定義文だけを独立
+                  した1行として差し込む。他の「やりたいことから探す」項目と見た目の形式を
+                  揃えるため、背景色・左アクセント線・borderRadius・カード風paddingは持たせず、
+                  通常本文と同じcolor（THEME.text）・同じtext-[11px] leading-relaxedのまま
+                  font-boldだけを加えたシンプルな<p>1つに留める（HELP_MANUAL_WANT_TO_DO_
+                  SECTIONSの共通スキーマは変更せず、sec.keyで限定した専用JSXのみ）。 */}
+              {sec.key === "want_lightingCueTiming" && (
+                <p style={{ color: THEME.text }} className="text-[11px] leading-relaxed font-bold">
+                  照明キュー ＝ 照明を切り替えるタイミング
+                </p>
+              )}
               {sec.useCases && sec.useCases.length > 0 && (
                 <div
                   style={{ borderLeft: `2px solid ${THEME.borderSoft}` }}
@@ -28319,6 +28572,153 @@ function HelpManual({ sectionsOpen, onToggleSection }) {
                     ))}
                   </ul>
                 </div>
+              )}
+              {/* Help動画：「音楽に合わせて構成を作りたい①」（want_musicSync）。
+                  music-help-01-short.mp4（音源読み込み〜基準BPM／楽曲セクション設定の
+                  静止画スライドショー）を、共通HelpShortVideoコンポーネントで表示する。
+                  他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。 */}
+              {sec.key === "want_musicSync" && (
+                <HelpShortVideo
+                  src="/help-videos/music-help-01-short.mp4"
+                  ariaLabel="音源を読み込み、基準BPMと楽曲セクションを設定する流れの例"
+                />
+              )}
+              {/* Help動画：「音楽に合わせて構成を作りたい②」（want_musicPosition）。①と対に
+                  なるスライドショー版動画（music-help-02-short.mp4）を、同じくHelpShortVideo
+                  共通コンポーネントで表示する。構造・mount/unmount方針・共通styleは①と
+                  完全に同一。 */}
+              {sec.key === "want_musicPosition" && (
+                <HelpShortVideo
+                  src="/help-videos/music-help-02-short.mp4"
+                  ariaLabel="音楽位置を設定し、音楽と同期して再生する流れの例"
+                />
+              )}
+              {/* want_platformStairs（🧱 高台・階段を作りたい）／want_performerOnPlatform
+                  （🪜 出演者を高台へ乗せたい）用Help動画。両項目とも同じ
+                  platform-stairs-short.mp4（冒頭「高台・階段はここ」の入口スライド＋
+                  高台・階段の完成状態→出演者が階段を上って高台へ到達する結果）を、
+                  共通HelpShortVideoコンポーネントで表示する。sec.keyの条件は2項目とも
+                  独立したまま維持しており（将来別動画に分ける場合に備えてOR条件へは
+                  戻していない）、srcの値だけが一致している。旧stairs-to-platform-short.mp4は
+                  現在どのHelp項目からも参照していないが、削除はせず保全している。 */}
+              {sec.key === "want_platformStairs" && (
+                <HelpShortVideo
+                  src="/help-videos/platform-stairs-short.mp4"
+                  ariaLabel="高台・階段の追加場所から、階段を接続して出演者が高台へ移動するまでの操作例"
+                />
+              )}
+              {sec.key === "want_performerOnPlatform" && (
+                <HelpShortVideo
+                  src="/help-videos/platform-stairs-short.mp4"
+                  ariaLabel="高台を作成し、階段を接続して出演者が高台へ移動する操作例"
+                />
+              )}
+              {/* Lighting Intro Short：「照明を当てたい」の説明文の後にだけ追加する
+                  （useCasesが無いため説明文の直後）。他Shortと同じ構造・mount/unmount方針
+                  （sec.keyでの項目限定、親CollapsibleGroupが閉じている間は自動unmount）を
+                  再利用している。動画内容：俯瞰客席ビューで1枚目に青い照明エリア、2枚目に
+                  左右2本の照明ビームを見せる約7.3秒の無音スライドショー（字幕「照明エリア」
+                  「照明ビーム」付き）。 */}
+
+              {sec.key === "want_lightingIntro" && (
+                <HelpShortVideo
+                  src="/help-videos/lighting-intro-short.mp4"
+                  ariaLabel="照明エリアと照明ビームの違いを俯瞰客席ビューで比較する例"
+                />
+              )}
+              {/* Spotlight Short：「スポットライトを当てたい」の説明文→useCasesの後にだけ
+                  追加する。他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  冒頭「出演者を照らす」の入口スライド（対象ボタンを黄色枠＋擬似カーソルで
+                  強調）→出演者へ固定の白いBeamが当たった完成結果、という構成。 */}
+              {sec.key === "want_spotlight" && (
+                <HelpShortVideo
+                  src="/help-videos/spotlight-short.mp4"
+                  ariaLabel="選択中の出演者へ固定されたスポットライトを当てる例"
+                />
+              )}
+              {/* Beam追尾Short：「ライトを出演者に追尾させたい」の説明文の後にだけ追加する。
+                  他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  「まず照明ビームを選ぶ」「追尾する出演者を選ぶ」の2枚の入口スライド→
+                  出演者の移動に照明ビームが追尾し続ける結果、という構成。 */}
+              {sec.key === "want_trackingLight" && (
+                <HelpShortVideo
+                  src="/help-videos/beam-follow-short.mp4"
+                  ariaLabel="出演者の移動に合わせて照明ビームが追尾する操作例"
+                />
+              )}
+              {/* Lighting Cue Short：「好きなカウントで照明を変えたい」（internal keyは
+                  want_lightingCueTimingのまま）の説明文の後にだけ追加する。他Shortと同じ
+                  構造・mount/unmount方針（sec.keyでの項目限定、親CollapsibleGroupが閉じて
+                  いる間は自動unmount）を再利用している。動画内容：冒頭「照明キューはここ」の
+                  入口スライド→キープ中／移動中を通じて照明の色が変化する結果、という構成。 */}
+              {sec.key === "want_lightingCueTiming" && (
+                <HelpShortVideo
+                  src="/help-videos/lighting-cue-short.mp4"
+                  ariaLabel="照明キューの場所を確認し、好きなカウントで照明を切り替える例"
+                />
+              )}
+              {/* Lighting Fade Short：「照明をゆっくり変えたい」の説明文の後にだけ追加する。
+                  他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  「まずキューを選ぶ」「フェードはここ」の2枚の入口スライド→照明が白く
+                  フェードイン→青へ変化→ゆっくりフェードアウトする結果、という構成。 */}
+              {sec.key === "want_lightingFade" && (
+                <HelpShortVideo
+                  src="/help-videos/lighting-fade-short.mp4"
+                  ariaLabel="照明キューでフェード時間を設定し、明るさがゆっくり変化する例"
+                />
+              )}
+              {/* Lighting Move Short：「ライトそのものを動かしたい」の説明文の後にだけ追加する。
+                  他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  平面図で照明ビームの照射先をドラッグして動かす操作（字幕「照らす場所を
+                  ドラッグ」）→ハードカット→俯瞰客席ビューでライトが滑らかに移動する結果、
+                  という構成。 */}
+              {sec.key === "want_lightingMove" && (
+                <HelpShortVideo
+                  src="/help-videos/lighting-move-short.mp4"
+                  ariaLabel="照明の照らす場所をドラッグし、再生時にライトが移動する例"
+                />
+              )}
+              {/* Lighting Copy Short：「同じ照明を別の場所でも使いたい」の説明文の後にだけ
+                  追加する。他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画は
+                  1520×850（16:9ではないが、共通styleが動画自身の比率をそのまま尊重するため
+                  追加調整は不要）。他Shortと異なり「コピー→構成切替→貼り付け」という操作
+                  そのものを5カット構成・擬似カーソル（後編集のみで実装、production側の変更
+                  なし）で見せる。字幕は動画側にも本文側にも無い。 */}
+              {sec.key === "want_lightingCopy" && (
+                <HelpShortVideo
+                  src="/help-videos/lighting-copy-short.mp4"
+                  ariaLabel="照明状態をコピーし、次の構成へ切り替えて同じ照明状態を貼り付ける操作例"
+                />
+              )}
+              {/* Presentation Mode Short：「作った構成を人に見せたい」の説明文の後にだけ
+                  追加する。他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  冒頭「プレゼンモード」の入口スライド（「🎬 プレゼン」ボタンを黄色枠＋
+                  擬似カーソルで強調）→ハードカット→Presentation Modeでの構成の移動再生、
+                  という構成（1920×1080）。 */}
+              {sec.key === "want_presentation" && (
+                <HelpShortVideo
+                  src="/help-videos/presentation-short.mp4"
+                  ariaLabel="通常編集画面からプレゼンモードへ切り替え、構成の移動を再生する例"
+                />
+              )}
+              {/* Export Center Short：「画像やPDFにしたい」の説明文の後にだけ追加する。
+                  他Shortと同じ構造・mount/unmount方針（sec.keyでの項目限定、親
+                  CollapsibleGroupが閉じている間は自動unmount）を再利用している。動画内容：
+                  冒頭「出力はここ」の入口スライド（下部操作バーの出力ボタンを黄色枠＋
+                  擬似カーソルで強調）→ハードカット→Export Centerでの設定操作→PDF出力→
+                  生成されたPDF（構成1〜3の3ページ）を確認、という構成（1920×1080）。 */}
+              {sec.key === "want_export" && (
+                <HelpShortVideo
+                  src="/help-videos/export-short.mp4"
+                  ariaLabel="平面図の複数構成をPDFとして出力し、生成されたPDFを確認する例"
+                />
               )}
             </CollapsibleGroup>
           ))}

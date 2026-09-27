@@ -11,9 +11,11 @@ const names=['resolvePlacementEffectiveSurfaceHeight','getPlacementSurfaceMode',
  'cloneLightingStateSnapshot','cloneLightingItemDataByType','remapLightingStateForCrossFormationPaste',
  'interpolateLightingIntensityState','resolveLightingCueState','interpolateLightingAreaPositionState',
  'getLightingAreaPositionMoveCounts','findMatchingLightingArea','getLightingAreaLogicalId',
- 'cloneLightingSceneContentForSlide','getLightingAreas','getLightingBeams','getLightingBeams3D','getLightingSceneCues'];
+ 'cloneLightingSceneContentForSlide','getLightingAreas','getLightingBeams','getLightingBeams3D','getLightingSceneCues',
+ 'lightingAreaColorHex','parseHexColorToRgb','rgbToHexColor','interpolateLightingColor'];
 const constants=['PLATFORM_MIN_SIZE','DEFAULT_LIGHTING_BEAM_3D_INTENSITY','DEFAULT_LIGHTING_BEAM_3D_SOURCE_WIDTH',
- 'DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH','LIGHTING_BEAM_3D_MIN_Z','LIGHTING_BEAM_3D_MAX_Z','LIGHTING_AREA_POSITION_MOVE_MODES'];
+ 'DEFAULT_LIGHTING_BEAM_3D_TARGET_WIDTH','LIGHTING_BEAM_3D_MIN_Z','LIGHTING_BEAM_3D_MAX_Z','LIGHTING_AREA_POSITION_MOVE_MODES',
+ 'LIGHTING_AREA_COLOR_PRESETS'];
 const code=constants.map(n=>source.match(new RegExp(`const ${n} = [\\s\\S]*?;`))[0]).join('\n')+'\n'+
  names.map(n=>source.match(new RegExp(`function ${n}\\([^]*?\\n\\}`))[0]).join('\n');
 const context=vm.createContext({});
@@ -81,6 +83,26 @@ test('Fade preserves mode for both, from-only and to-only',()=> {
  expect(h.interpolateLightingIntensityState([], [from], [], [to],0.5).beams3D[0]).toMatchObject({targetSurfaceMode:'auto',intensity:0.5});
  expect(h.interpolateLightingIntensityState([], [from], [], [],0.5).beams3D[0].targetSurfaceMode).toBe('auto');
  expect(h.interpolateLightingIntensityState([], [], [], [to],0.5).beams3D[0].targetSurfaceMode).toBe('manual');
+});
+// 照明フェード v1.2：same-idはcolorも連続補間するが、from-only/to-onlyは従来通りcolorに
+// 一切触れない（保存されたpreset keyのままfromまたはtoの値を維持する）ことを確認する。
+function midHex(fromHex,toHex,t) {
+ const fv=parseInt(fromHex.slice(1),16),tv=parseInt(toHex.slice(1),16);
+ const fr=(fv>>16)&255,fg=(fv>>8)&255,fb=fv&255,tr=(tv>>16)&255,tg=(tv>>8)&255,tb=tv&255;
+ const mix=(a,b)=>Math.round(a+(b-a)*t).toString(16).padStart(2,'0');
+ return `#${mix(fr,tr)}${mix(fg,tg)}${mix(fb,tb)}`;
+}
+test('Fade color: same-id interpolates, from-only/to-only keep original preset key',()=> {
+ const from=beam({color:'white',intensity:1}),to=beam({color:'blue',intensity:1});
+ expect(h.interpolateLightingIntensityState([],[from],[],[to],0.5).beams3D[0]).toMatchObject({color:midHex('#ffffff','#4d7cff',0.5),intensity:1});
+ expect(h.interpolateLightingIntensityState([],[from],[],[],0.5).beams3D[0].color).toBe('white'); // from-only：fromのpreset keyのまま
+ expect(h.interpolateLightingIntensityState([],[],[],[to],0.5).beams3D[0].color).toBe('blue'); // to-only：toのpreset keyのまま
+});
+test('Fade color+intensity: same-id changes both together (white/30% -> blue/100%)',()=> {
+ const from=beam({color:'white',intensity:0.3}),to=beam({color:'blue',intensity:1});
+ const result=h.interpolateLightingIntensityState([],[from],[],[to],0.5).beams3D[0];
+ expect(result.intensity).toBeCloseTo(0.65,5);
+ expect(result.color).toBe(midHex('#ffffff','#4d7cff',0.5));
 });
 test('snapshot and same/cross Formation clipboard preserve mode without derived z',()=> {
  const b=beam();

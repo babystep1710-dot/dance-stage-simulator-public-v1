@@ -9,9 +9,11 @@ const names=['getLightingAreaSurfaceMode','getLightingAreaSurfaceId','resolveLig
  'interpolateLightingBeam3DPositionState','findMatchingLightingBeam','getLightingBeamLogicalId','getLightingBeam3DPositionMoveCounts',
  'cloneLightingStateSnapshot','cloneLightingItemDataByType','remapLightingStateForCrossFormationPaste','cloneLightingSceneContentForSlide',
  'getLightingAreas','getLightingBeams','getLightingBeams3D','getLightingSceneCues','findLightingSceneBySlideId',
- 'projectAudiencePoint','projectAudiencePoint3D'];
+ 'projectAudiencePoint','projectAudiencePoint3D',
+ 'lightingAreaColorHex','parseHexColorToRgb','rgbToHexColor','interpolateLightingColor'];
 const constants=['PLATFORM_MIN_SIZE','LIGHTING_AREA_MIN_SIZE','LIGHTING_AREA_MAX_SIZE','DEFAULT_LIGHTING_AREA_WIDTH',
- 'DEFAULT_LIGHTING_AREA_HEIGHT','DEFAULT_LIGHTING_AREA_INTENSITY','LIGHTING_AREA_POSITION_MOVE_MODES','LIGHTING_AREA_ELLIPSE_SEGMENTS','UNIT_CM','PERSPECTIVE'];
+ 'DEFAULT_LIGHTING_AREA_HEIGHT','DEFAULT_LIGHTING_AREA_INTENSITY','LIGHTING_AREA_POSITION_MOVE_MODES','LIGHTING_AREA_ELLIPSE_SEGMENTS','UNIT_CM','PERSPECTIVE',
+ 'LIGHTING_AREA_COLOR_PRESETS'];
 const code=constants.map(n=>source.match(new RegExp(`const ${n} = [\\s\\S]*?;`))[0]).join('\n')+'\n'+names.map(n=>source.match(new RegExp(`function ${n}\\([^]*?\\n\\}`))[0]).join('\n');
 const h=vm.runInNewContext(`const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));const lerp=(a,b,t)=>a+(b-a)*t;let serial=0;const makeId=p=>p+(++serial);${code}\n({${names.join(',')}})`);
 const pl={id:'p',x:0,y:5,width:2,depth:2,height:8};
@@ -57,6 +59,26 @@ test('Fade preserves both/from-only/to-only mode',()=> {
  expect(h.interpolateLightingIntensityState([a],[],[b],[],0.5).areas[0]).toMatchObject({surfaceMode:'auto',intensity:0.5});
  expect(h.interpolateLightingIntensityState([a],[],[],[],0.5).areas[0].surfaceMode).toBe('auto');
  expect(h.interpolateLightingIntensityState([],[],[b],[],0.5).areas[0].surfaceMode).toBe('manual');
+});
+// 照明フェード v1.2：same-idはcolorも連続補間するが、from-only/to-onlyは従来通りcolorに
+// 一切触れない（保存されたpreset keyのままfromまたはtoの値を維持する）ことを確認する。
+function midHex(fromHex,toHex,t) {
+ const fv=parseInt(fromHex.slice(1),16),tv=parseInt(toHex.slice(1),16);
+ const fr=(fv>>16)&255,fg=(fv>>8)&255,fb=fv&255,tr=(tv>>16)&255,tg=(tv>>8)&255,tb=tv&255;
+ const mix=(a,b)=>Math.round(a+(b-a)*t).toString(16).padStart(2,'0');
+ return `#${mix(fr,tr)}${mix(fg,tg)}${mix(fb,tb)}`;
+}
+test('Fade color: same-id interpolates, from-only/to-only keep original preset key',()=> {
+ const from=area({color:'white',intensity:1}),to=area({color:'red',intensity:1});
+ expect(h.interpolateLightingIntensityState([from],[],[to],[],0.5).areas[0]).toMatchObject({color:midHex('#ffffff','#ff4d4d',0.5),intensity:1});
+ expect(h.interpolateLightingIntensityState([from],[],[],[],0.5).areas[0].color).toBe('white'); // from-only：fromのpreset keyのまま
+ expect(h.interpolateLightingIntensityState([],[],[to],[],0.5).areas[0].color).toBe('red'); // to-only：toのpreset keyのまま
+});
+test('Fade color+intensity: same-id changes both together (white/30% -> blue/100%)',()=> {
+ const from=area({color:'white',intensity:0.3}),to=area({color:'blue',intensity:1});
+ const result=h.interpolateLightingIntensityState([from],[],[to],[],0.5).areas[0];
+ expect(result.intensity).toBeCloseTo(0.65,5);
+ expect(result.color).toBe(midHex('#ffffff','#4d7cff',0.5));
 });
 test('snapshot clipboard and Formation clone retain mode and saved ID',()=> {
  const a=area();const sc=h.cloneLightingSceneContentForSlide({areas:[a],beams3D:[],cues:[{id:'c',count:2,areas:[a],beams3D:[]}]},'new');
